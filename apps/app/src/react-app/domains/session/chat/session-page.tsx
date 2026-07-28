@@ -2,7 +2,7 @@
 import type { CSSProperties } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePanelRef } from "react-resizable-panels";
-import { Cloud, FileText, Globe, Mic2, PanelRight, TextSearch, Zap } from "lucide-react";
+import { Cloud, FileText, Globe, Mic2, Network, PanelRight, TextSearch, Zap } from "lucide-react";
 
 import { resolveExtensionIconSrc } from "@/react-app/design-system/extension-icon-src";
 import { t } from "../../../../i18n";
@@ -66,6 +66,12 @@ import { isCollectibleArtifactTarget, isLocalhostBrowserTarget, isOpenableFileTa
 import type { OpenTargetOptions } from "@/lib/target-provider";
 import { VoicePanel } from "../voice/voice-panel";
 import { SidePanel } from "../panel/side-panel";
+import {
+  openOrFocusDrawioTab,
+  readDrawioTabId,
+  resolveDrawioEditorUrl,
+} from "../panel/drawio-panel";
+import { getElectronBrowser } from "../panel/utils";
 import { TerminalDock } from "../terminal/terminal-dock";
 import { useActivePanelTab, usePanelTabStore, useSessionPanelState } from "../panel/panel-tab-store";
 import { useWorkspaceShellLayout } from "../../../shell/workspace-shell-layout";
@@ -341,6 +347,11 @@ export function SessionPage(props: SessionPageProps) {
   const sidePanelOpen = activeSidePanel !== null;
   const panelRailActive = activeSidePanel === "panel";
   const voiceRailActive = activeSidePanel === "voice";
+  const drawioRailActive = panelRailActive && Boolean(
+    props.selectedSessionId &&
+    typeof window !== "undefined" &&
+    activePanelTab?.id === readDrawioTabId(window.localStorage, props.selectedSessionId),
+  );
   const voiceExtension = useMemo(
     () => OPENWORK_EXTENSION_CATALOG.find((entry) => getExtensionId(entry) === "openwork-voice") ?? null,
     [],
@@ -526,6 +537,32 @@ export function SessionPage(props: SessionPageProps) {
     // panel that forces the user to click "+".
     toggleCurrentSidePanel("panel");
   }, [hasBrowserTabs, toggleCurrentSidePanel]);
+  const openDrawioPanel = useCallback(async () => {
+    if (!props.selectedSessionId) return { action: "unavailable" };
+
+    return openOrFocusDrawioTab({
+      sessionId: props.selectedSessionId,
+      tabs: usePanelTabStore.getState().sessions[props.selectedSessionId]?.tabs ?? [],
+      editorUrl: resolveDrawioEditorUrl(
+        typeof window === "undefined" ? null : window.localStorage,
+        import.meta.env.VITE_OPENWORK_DRAWIO_URL,
+      ),
+      browser: getElectronBrowser(),
+      storage: typeof window === "undefined" ? null : window.localStorage,
+      openPanel: () => setCurrentSidePanel("panel"),
+    });
+  }, [props.selectedSessionId, setCurrentSidePanel]);
+  const openDrawioPanelControlAction = useMemo<OpenworkControlAction | null>(() => (
+    import.meta.env.DEV && props.selectedSessionId && isElectronRuntime() ? {
+      id: "drawio.panel.open",
+      label: "Open Draw.io panel",
+      description: "Open or focus the current session's Draw.io editor in the right side panel.",
+      effects: { data: "none", ui: "layout", external: true },
+      sideEffect: "navigation",
+      execute: openDrawioPanel,
+    } : null
+  ), [openDrawioPanel, props.selectedSessionId]);
+  useControlAction(openDrawioPanelControlAction);
   const openBrowserUrlControlAction = useMemo<OpenworkControlAction>(() => ({
     id: "browser.open_url",
     label: "Open URL in built-in browser",
@@ -1423,6 +1460,24 @@ export function SessionPage(props: SessionPageProps) {
             ) : null}
           </ResizablePanelGroup>
           <aside className="flex w-9 shrink-0 flex-col items-center gap-1 px-0.5 py-2 text-muted-foreground mac:titlebar-no-drag">
+            {isElectronRuntime() ? (
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                className={cn(
+                  "rounded-xl transition-colors hover:bg-muted hover:text-foreground",
+                  drawioRailActive && "bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary",
+                )}
+                onClick={() => void openDrawioPanel()}
+                title="Draw.io"
+                aria-label="Open Draw.io"
+                aria-pressed={drawioRailActive}
+                data-testid="drawio-panel-trigger"
+                disabled={!props.selectedSessionId}
+              >
+                <Network size={15} />
+              </Button>
+            ) : null}
             {isElectronRuntime() ? (
               <Button
                 variant="ghost"
