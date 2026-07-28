@@ -32,6 +32,7 @@ import { createUiControlServer } from "./ui-control-server.mjs";
 import { createApplicationMenu } from "./app-menu.mjs";
 import { applyBrandAppName } from "./brand-app-name.mjs";
 import { createBrowserPanel } from "./browser-panel.mjs";
+import { createDrawioBridge } from "./drawio-bridge.mjs";
 import { createWorkspaceStore } from "./workspace-store.mjs";
 import {
   buildNukeManifest,
@@ -971,6 +972,9 @@ const browserPanel = createBrowserPanel({
   remoteDebugPort,
   getWindow: () => mainWindow,
   onDeepLink: (urls) => queueDeepLinks(urls),
+});
+const drawioBridge = createDrawioBridge({
+  storageDir: path.join(app.getPath("userData"), "drawio-bridge"),
 });
 
 const workspaceStore = createWorkspaceStore({
@@ -2464,6 +2468,7 @@ ipcMain.handle("openwork:terminal:kill", (event, terminalId) => {
 });
 
 browserPanel.registerIpc(ipcMain);
+ipcMain.handle("openwork:drawio:state", () => drawioBridge.getState());
 
 registerMigrationIpc({ app, ipcMain });
 const { ensureAutoUpdater } = registerUpdaterIpc({
@@ -2496,7 +2501,11 @@ or use: pnpm dev:worktree`);
     event.preventDefault();
     if (runtimeDisposeInProgress) return;
     showShutdownScreen();
-    void Promise.all([disposeRuntimeBeforeQuit(), uiControlServer.stop()]).finally(() => app.quit());
+    void Promise.all([
+      disposeRuntimeBeforeQuit(),
+      uiControlServer.stop(),
+      drawioBridge.stop(),
+    ]).finally(() => app.quit());
   });
 
   app.on("second-instance", async (_event, argv) => {
@@ -2522,6 +2531,11 @@ or use: pnpm dev:worktree`);
 
   app.whenReady().then(async () => {
     installMediaPermissionHandlers(session, () => mainWindow);
+    await drawioBridge.start().then((bridgeState) => {
+      process.env.OPENWORK_DRAWIO_BRIDGE_URL = bridgeState.baseUrl;
+    }).catch((error) => {
+      console.warn("[drawio] bridge failed to start", error);
+    });
     await runPendingNukeCleanup({
       env: process.env,
       homedir: os.homedir(),

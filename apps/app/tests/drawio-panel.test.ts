@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   DEFAULT_DRAWIO_EDITOR_URL,
   DRAWIO_EDITOR_URL_STORAGE_KEY,
+  drawioEditorUrlForSession,
   drawioTabStorageKey,
   openOrFocusDrawioTab,
   resolveDrawioEditorUrl,
@@ -38,6 +39,20 @@ describe("Draw.io editor URL resolution", () => {
       .toBe("http://127.0.0.1:4567/");
     expect(resolveDrawioEditorUrl(invalidOverride, "file:///tmp/drawio.html"))
       .toBe(DEFAULT_DRAWIO_EDITOR_URL);
+  });
+
+  test("prefers the managed bridge and scopes it to the OpenWork session", () => {
+    const storage = memoryStorage({
+      [DRAWIO_EDITOR_URL_STORAGE_KEY]: "https://drawio.internal/editor",
+    });
+    const bridge = resolveDrawioEditorUrl(
+      storage,
+      "https://drawio.example.test",
+      "http://127.0.0.1:43123/",
+    );
+
+    expect(drawioEditorUrlForSession(bridge, "session/a"))
+      .toBe("http://127.0.0.1:43123/?sessionId=session%2Fa");
   });
 });
 

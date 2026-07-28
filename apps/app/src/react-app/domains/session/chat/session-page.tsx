@@ -67,6 +67,7 @@ import type { OpenTargetOptions } from "@/lib/target-provider";
 import { VoicePanel } from "../voice/voice-panel";
 import { SidePanel } from "../panel/side-panel";
 import {
+  drawioEditorUrlForSession,
   openOrFocusDrawioTab,
   readDrawioTabId,
   resolveDrawioEditorUrl,
@@ -539,21 +540,26 @@ export function SessionPage(props: SessionPageProps) {
   }, [hasBrowserTabs, toggleCurrentSidePanel]);
   const openDrawioPanel = useCallback(async () => {
     if (!props.selectedSessionId) return { action: "unavailable" };
+    const bridgeState = await window.__OPENWORK_ELECTRON__?.drawio?.getState?.();
+    const editorUrl = resolveDrawioEditorUrl(
+      typeof window === "undefined" ? null : window.localStorage,
+      import.meta.env.VITE_OPENWORK_DRAWIO_URL,
+      bridgeState?.editorUrl,
+    );
 
     return openOrFocusDrawioTab({
       sessionId: props.selectedSessionId,
       tabs: usePanelTabStore.getState().sessions[props.selectedSessionId]?.tabs ?? [],
-      editorUrl: resolveDrawioEditorUrl(
-        typeof window === "undefined" ? null : window.localStorage,
-        import.meta.env.VITE_OPENWORK_DRAWIO_URL,
-      ),
+      editorUrl: bridgeState
+        ? drawioEditorUrlForSession(editorUrl, props.selectedSessionId)
+        : editorUrl,
       browser: getElectronBrowser(),
       storage: typeof window === "undefined" ? null : window.localStorage,
       openPanel: () => setCurrentSidePanel("panel"),
     });
   }, [props.selectedSessionId, setCurrentSidePanel]);
   const openDrawioPanelControlAction = useMemo<OpenworkControlAction | null>(() => (
-    import.meta.env.DEV && props.selectedSessionId && isElectronRuntime() ? {
+    props.selectedSessionId && isElectronRuntime() ? {
       id: "drawio.panel.open",
       label: "Open Draw.io panel",
       description: "Open or focus the current session's Draw.io editor in the right side panel.",

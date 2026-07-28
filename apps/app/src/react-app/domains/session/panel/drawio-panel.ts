@@ -52,12 +52,20 @@ function writeStorage(storage: DrawioStorage | null, key: string, value: string)
 export function resolveDrawioEditorUrl(
   storage: DrawioStorage | null,
   viteEditorUrl?: string,
+  managedBridgeUrl?: string,
 ) {
   return (
+    validHttpUrl(managedBridgeUrl) ??
     validHttpUrl(readStorage(storage, DRAWIO_EDITOR_URL_STORAGE_KEY)) ??
     validHttpUrl(viteEditorUrl) ??
     DEFAULT_DRAWIO_EDITOR_URL
   );
+}
+
+export function drawioEditorUrlForSession(editorUrl: string, sessionId: string) {
+  const url = new URL(editorUrl);
+  url.searchParams.set("sessionId", sessionId);
+  return url.toString();
 }
 
 export function drawioTabStorageKey(sessionId: string) {

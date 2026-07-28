@@ -133,6 +133,13 @@ declare global {
         download?: () => Promise<{ ok: boolean; reason?: string }>;
         installAndRestart?: () => Promise<{ ok: boolean; reason?: string }>;
       };
+      drawio?: {
+        getState?: () => Promise<{
+          baseUrl: string;
+          editorUrl: string;
+          port: number;
+        } | null>;
+      };
       browser?: {
         show?: (bounds: { x: number; y: number; width: number; height: number }) => Promise<void>;
         hide?: () => Promise<void>;
