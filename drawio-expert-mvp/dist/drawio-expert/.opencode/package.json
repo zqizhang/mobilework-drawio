@@ -1,0 +1,7 @@
+{
+  "type": "module",
+  "dependencies": {
+    "fast-xml-parser": "^5.0.0",
+    "pako": "^2.1.0"
+  }
+}

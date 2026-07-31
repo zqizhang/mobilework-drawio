@@ -1,0 +1,26 @@
+{
+  "agent": {
+    "drawio-expert": {
+      "mode": "primary",
+      "description": "直接完成 Draw.io 图表的需求理解、语义建模、创建、读取和结构校验，并提供可复查的验证证据。",
+      "permission": {
+        "read": "allow",
+        "edit": "allow",
+        "bash": {
+          "*": "deny",
+          "git status*": "allow",
+          "git diff*": "allow"
+        },
+        "webfetch": "ask",
+        "skill": {
+          "*": "deny",
+          "drawio-expert-common": "allow",
+          "drawio-expert-drawio-expert": "allow"
+        },
+        "task": {
+          "*": "deny"
+        }
+      }
+    }
+  }
+}

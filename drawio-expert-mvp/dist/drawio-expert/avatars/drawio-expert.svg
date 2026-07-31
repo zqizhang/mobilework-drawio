@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Draw.io 绘图专家">
+  <rect width="256" height="256" rx="48" fill="#c2410c"/>
+  <circle cx="196" cy="48" r="56" fill="#ffffff" opacity="0.18"/>
+  <circle cx="64" cy="208" r="72" fill="#000000" opacity="0.12"/>
+  <text x="128" y="148" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="72" font-weight="700" fill="#ffffff">DR</text>
+</svg>
