@@ -1,0 +1,42 @@
+# TEMPLATE — not a live workflow in this repo.
+#
+# This is a ready-to-copy example for USERS who install this skill in their
+# OWN project and want a "PR diagram bot" that renders base/head/diff PNGs
+# for every .drawio changed in a pull request. It is named ".example.yml"
+# (so GitHub Actions never auto-picks it up as `drawio-pr-diff.yml`) AND the
+# job is gated with `if: false` below, so simply merging this file into THIS
+# repo does NOT start any CI here.
+#
+# To adopt it in your own repo:
+#   1. Copy this file to `.github/workflows/drawio-pr-diff.yml` (drop
+#      `.example`).
+#   2. Delete (or flip) the `if: false` guard on the `diagram-diff` job.
+#   3. Uncomment the `pull_request` trigger below (and drop/keep
+#      `workflow_dispatch` as you like — it's kept for manual testing).
+#   4. Make sure the job has `pull-requests: write` permission (below) so
+#      the sticky PR comment can be posted.
+#   5. See skills/drawio-skill/references/pr-bot.md for the full adoption
+#      guide (runner tool requirements, token scopes, how the sticky
+#      comment works).
+
+name: drawio-pr-diff (example)
+
+on:
+  workflow_dispatch: {}
+  # pull_request:
+  #   paths:
+  #     - "**/*.drawio"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  diagram-diff:
+    if: false  # remove this line in your own repo once you've adopted the workflow above
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/drawio-diff
+        with:
+          base-sha: ${{ github.event.pull_request.base.sha }}
+          head-sha: ${{ github.sha }}

@@ -1,0 +1,95 @@
+name: 'draw.io PR Diagram Diff'
+description: >-
+  Renders base/head/diff PNGs for every .drawio file changed in a pull
+  request and posts a Markdown report as a sticky PR comment + job summary.
+author: 'drawio-skill'
+
+inputs:
+  base-sha:
+    description: 'Base commit SHA to diff from'
+    required: false
+    default: ${{ github.event.pull_request.base.sha }}
+  head-sha:
+    description: 'Head commit SHA to diff to'
+    required: false
+    default: ${{ github.sha }}
+  out-dir:
+    description: 'Directory for the exported PNGs + report'
+    required: false
+    default: 'drawio-pr'
+  github-token:
+    description: 'Token used to read/post the sticky PR comment (needs pull-requests: write)'
+    required: false
+    default: ${{ github.token }}
+  skip-tool-install:
+    description: 'Skip installing draw.io + Graphviz (set true if the runner already provides them)'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout (full history, for base..head diffing)
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    # Same recipe as docs/CI.md "Option A" in this repo: draw.io desktop's CLI
+    # is Electron-based, so it needs Graphviz (autolayout) + Xvfb (headless
+    # display) on the runner. Skip this step (skip-tool-install: true) if your
+    # runner/container already has `drawio` and `dot` on PATH.
+    - name: Install draw.io CLI + Graphviz
+      if: inputs.skip-tool-install != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y graphviz xvfb libgtk-3-0 libnotify4 libnss3 libgbm1 libasound2t64
+        URL=$(curl -s https://api.github.com/repos/jgraph/drawio-desktop/releases/latest \
+              | grep -o 'https://[^"]*amd64[^"]*\.deb' | head -1)
+        curl -sL "$URL" -o /tmp/drawio.deb
+        sudo apt-get install -y /tmp/drawio.deb
+
+    - name: Render base/head/diff PNGs + Markdown report
+      shell: bash
+      run: |
+        set -euo pipefail
+        export HOME=${HOME:-/tmp}
+        mkdir -p "${{ inputs.out-dir }}"
+        xvfb-run -a --server-args="-screen 0 1280x1024x24" \
+          python3 skills/drawio-skill/scripts/prdiff.py \
+            --base "${{ inputs.base-sha }}" \
+            --head "${{ inputs.head-sha }}" \
+            --out-dir "${{ inputs.out-dir }}" \
+            -o "${{ inputs.out-dir }}/report.md"
+
+    - name: Write job summary
+      shell: bash
+      run: cat "${{ inputs.out-dir }}/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload PNGs + report artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: drawio-pr-diff
+        path: ${{ inputs.out-dir }}
+
+    - name: Post/update sticky PR comment
+      if: github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        marker="<!-- drawio-pr-diff-bot -->"
+        body_file="$(mktemp)"
+        printf '%s\n' "$marker" > "$body_file"
+        cat "${{ inputs.out-dir }}/report.md" >> "$body_file"
+        pr_number="${{ github.event.pull_request.number }}"
+        existing_id=$(gh api "repos/${{ github.repository }}/issues/${pr_number}/comments" --paginate \
+          --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1)
+        if [ -n "$existing_id" ]; then
+          gh api --method PATCH "repos/${{ github.repository }}/issues/comments/${existing_id}" \
+            -f body=@"$body_file"
+        else
+          gh pr comment "$pr_number" --body-file "$body_file"
+        fi
