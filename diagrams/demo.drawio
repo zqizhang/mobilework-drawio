@@ -1,0 +1,124 @@
+﻿<mxfile host="app.diagrams.net">
+  <diagram name="第 1 页" id="2JH35p7Li8tr-ZY624xz">
+    <mxGraphModel dx="1136" dy="629" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="lane1" parent="1" style="swimlane;horizontal=0;startSize=110;fillColor=#e8f4f8;strokeColor=#6c8ebf;html=1;fontStyle=1;fontSize=14;" value="表现层" vertex="1">
+          <mxGeometry height="150" width="1100" as="geometry" />
+        </mxCell>
+        <mxCell id="webUser" parent="lane1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Web 用户" vertex="1">
+          <mxGeometry height="60" width="140" x="130" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="admin" parent="lane1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="管理员" vertex="1">
+          <mxGeometry height="60" width="140" x="340" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="lane2" parent="1" style="swimlane;horizontal=0;startSize=110;fillColor=#fff2cc;strokeColor=#d6b656;html=1;fontStyle=1;fontSize=14;" value="服务层" vertex="1">
+          <mxGeometry height="150" width="1100" y="150" as="geometry" />
+        </mxCell>
+        <mxCell id="apiGateway" parent="lane2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff9e6;strokeColor=#d6b656;" value="API Gateway" vertex="1">
+          <mxGeometry height="60" width="140" x="130" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="userService" parent="lane2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff9e6;strokeColor=#d6b656;" value="用户服务" vertex="1">
+          <mxGeometry height="60" width="140" x="340" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="orderService" parent="lane2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff9e6;strokeColor=#d6b656;" value="订单服务" vertex="1">
+          <mxGeometry height="60" width="140" x="550" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="paymentService" parent="lane2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff9e6;strokeColor=#d6b656;" value="支付服务" vertex="1">
+          <mxGeometry height="60" width="140" x="760" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="lane3" parent="1" style="swimlane;horizontal=0;startSize=110;fillColor=#e8f5e9;strokeColor=#82b366;html=1;fontStyle=1;fontSize=14;" value="数据层" vertex="1">
+          <mxGeometry height="150" width="1100" y="300" as="geometry" />
+        </mxCell>
+        <mxCell id="mysql" parent="lane3" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="MySQL" vertex="1">
+          <mxGeometry height="70" width="140" x="130" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="redis" parent="lane3" style="image;sketch=0;aspect=fixed;html=1;points=[];align=center;fontSize=12;verticalLabelPosition=bottom;verticalAlign=top;image=https://app.diagrams.net/img/lib/mscae/Azure_Cache_for_Redis.svg;" value="Redis" vertex="1">
+          <mxGeometry height="60" width="60" x="350" y="35" as="geometry" />
+        </mxCell>
+        <mxCell id="externalPayment" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;dashed=1;" value="外部支付平台" vertex="1">
+          <mxGeometry height="60" width="140" x="920" y="220" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="webUser" style="endArrow=classic;edgeStyle=orthogonalEdgeStyle;rounded=0;libavoidRouting=1;orthogonalLoop=1;jettySize=auto;html=1;" target="apiGateway" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="admin" style="endArrow=classic;edgeStyle=orthogonalEdgeStyle;rounded=0;libavoidRouting=1;orthogonalLoop=1;jettySize=auto;html=1;" target="apiGateway" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="305" y="75" />
+              <mxPoint x="305" y="225" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="apiGateway" style="endArrow=classic;edgeStyle=orthogonalEdgeStyle;rounded=0;libavoidRouting=1;orthogonalLoop=1;jettySize=auto;html=1;" target="userService" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="apiGateway" style="endArrow=classic;edgeStyle=orthogonalEdgeStyle;rounded=0;libavoidRouting=1;orthogonalLoop=1;jettySize=auto;html=1;" target="orderService" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="200" y="179" />
+              <mxPoint x="620" y="179" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e9" edge="1" parent="1" source="apiGateway" style="endArrow=classic;edgeStyle=orthogonalEdgeStyle;rounded=0;libavoidRouting=1;orthogonalLoop=1;jettySize=auto;html=1;" target="paymentService" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="200" y="165" />
+              <mxPoint x="830" y="165" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="userService" style="endArrow=classic;edgeStyle=orthogonalEdgeStyle;rounded=0;libavoidRouting=1;orthogonalLoop=1;jettySize=auto;html=1;" target="mysql" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="305" y="225" />
+              <mxPoint x="305" y="375" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="userService" style="endArrow=classic;edgeStyle=orthogonalEdgeStyle;rounded=0;libavoidRouting=1;orthogonalLoop=1;jettySize=auto;html=1;" target="redis" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="410" y="302" />
+              <mxPoint x="380" y="302" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="1" source="orderService" style="endArrow=classic;edgeStyle=orthogonalEdgeStyle;rounded=0;libavoidRouting=1;orthogonalLoop=1;jettySize=auto;html=1;" target="mysql" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="620" y="288" />
+              <mxPoint x="200" y="288" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="1" source="orderService" style="endArrow=classic;edgeStyle=orthogonalEdgeStyle;rounded=0;libavoidRouting=1;orthogonalLoop=1;jettySize=auto;html=1;" target="redis" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="620" y="365" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e10" edge="1" parent="1" source="paymentService" style="endArrow=classic;edgeStyle=orthogonalEdgeStyle;rounded=0;libavoidRouting=1;orthogonalLoop=1;jettySize=auto;html=1;" target="orderService" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e11" edge="1" parent="1" source="paymentService" style="endArrow=classic;edgeStyle=orthogonalEdgeStyle;rounded=0;libavoidRouting=1;orthogonalLoop=1;jettySize=auto;html=1;" target="externalPayment" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="830" y="296" />
+              <mxPoint x="990" y="296" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

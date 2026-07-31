@@ -1,0 +1,29 @@
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Generated diagrams
+exports/
+logs/
+temp/
+
+# Generated images/documents
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
