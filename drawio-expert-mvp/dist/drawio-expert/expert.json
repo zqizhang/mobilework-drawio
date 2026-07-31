@@ -1,0 +1,127 @@
+{
+  "slug": "drawio-expert",
+  "type": "expert",
+  "name": "Draw.io 绘图专家",
+  "summary": "创建、读取和校验可编辑的 Draw.io 技术图表。",
+  "description": "根据需求、文档和代码生成结构清晰、可继续编辑的 Draw.io 架构图、流程图和系统拓扑图，并对现有图表执行结构化检查。",
+  "language": "zh",
+  "profession": "系统可视化与技术绘图专家",
+  "category_id": "02-Engineering",
+  "display_description": "面向技术架构、业务流程和系统拓扑的 Draw.io 单专家。",
+  "avatar_url": "avatars/drawio-expert.svg",
+  "tags": [
+    "drawio",
+    "architecture-diagram",
+    "visualization"
+  ],
+  "quick_prompts": [
+    "根据当前项目生成一张 Draw.io 系统架构图。",
+    "读取这张 Draw.io 图并说明其中的节点和连接关系。",
+    "校验这张 Draw.io 图的 XML、节点引用和几何结构。"
+  ],
+  "default_prompt": "根据当前项目生成一张 Draw.io 系统架构图。",
+  "common_skills": [
+    "drawio-expert-common"
+  ],
+  "runtime_extensions": {
+    "commands": [
+      {
+        "name": "drawio-create",
+        "template": "先分析当前需求、项目资料和验收标准，建立节点与连接的语义模型，再调用 drawio_create 创建一张可编辑的 Draw.io 图表，最后调用 drawio_validate 验证并报告文件路径、图结构、验证证据和剩余风险。",
+        "description": "根据当前需求创建 Draw.io 图表",
+        "agent": "drawio-expert"
+      },
+      {
+        "name": "drawio-inspect",
+        "template": "调用 drawio_inspect 读取用户指定的 Draw.io 文件，说明页面、节点、连接、布局和发现的问题。不要在读取前猜测图表内容。",
+        "description": "读取并解释 Draw.io 图表",
+        "agent": "drawio-expert"
+      },
+      {
+        "name": "drawio-validate",
+        "template": "调用 drawio_validate 检查用户指定的 Draw.io 文件，逐项报告 XML、页面、ID、父子引用、边端点和节点几何的验证状态。",
+        "description": "校验 Draw.io 文件结构",
+        "agent": "drawio-expert"
+      }
+    ],
+    "custom_tools": [],
+    "plugins": {
+      "npm": [],
+      "local": [
+        {
+          "path": "drawio-expert.ts",
+          "content": "import { promises as fs } from \"node:fs\"\nimport path from \"node:path\"\nimport { type Plugin, tool } from \"@opencode-ai/plugin\"\nimport { XMLBuilder, XMLParser, XMLValidator } from \"fast-xml-parser\"\nimport pako from \"pako\"\n\ntype Direction = \"left-to-right\" | \"top-to-bottom\"\n\ntype DiagramNode = {\n  id: string\n  label: string\n  kind?: \"default\" | \"application\" | \"service\" | \"database\" | \"external\" | \"decision\"\n}\n\ntype DiagramEdge = {\n  id?: string\n  source: string\n  target: string\n  label?: string\n}\n\ntype ParsedCell = {\n  id: string\n  parent?: string\n  source?: string\n  target?: string\n  label?: string\n  style?: string\n  vertex: boolean\n  edge: boolean\n  geometry?: {\n    x?: number\n    y?: number\n    width?: number\n    height?: number\n  }\n}\n\ntype ParsedPage = {\n  id: string\n  name: string\n  compressed: boolean\n  cells: ParsedCell[]\n}\n\nconst parser = new XMLParser({\n  ignoreAttributes: false,\n  attributeNamePrefix: \"@_\",\n  textNodeName: \"#text\",\n  trimValues: false,\n})\n\nconst builder = new XMLBuilder({\n  ignoreAttributes: false,\n  attributeNamePrefix: \"@_\",\n  textNodeName: \"#text\",\n  format: false,\n  suppressEmptyNode: true,\n})\n\nconst ALLOWED_EXTENSIONS = [\".drawio\", \".xml\"]\nconst MAX_FILE_BYTES = 20 * 1024 * 1024\nconst SAFE_ID = /^[A-Za-z0-9_.:-]+$/\n\nfunction asArray<T>(value: T | T[] | undefined): T[] {\n  if (value === undefined) return []\n  return Array.isArray(value) ? value : [value]\n}\n\nfunction attribute(value: unknown): string | undefined {\n  return value === undefined || value === null ? undefined : String(value)\n}\n\nfunction numberAttribute(value: unknown): number | undefined {\n  if (value === undefined || value === null || value === \"\") return undefined\n  const parsed = Number(value)\n  return Number.isFinite(parsed) ? parsed : undefined\n}\n\nfunction xmlEscape(value: string): string {\n  return value\n    .replaceAll(\"&\", \"&amp;\")\n    .replaceAll(\"<\", \"&lt;\")\n    .replaceAll(\">\", \"&gt;\")\n    .replaceAll('\"', \"&quot;\")\n    .replaceAll(\"'\", \"&apos;\")\n}\n\nfunction slug(value: string): string {\n  const normalized = value\n    .normalize(\"NFKD\")\n    .replace(/[^\\p{Letter}\\p{Number}]+/gu, \"-\")\n    .replace(/^-+|-+$/g, \"\")\n    .toLowerCase()\n  return normalized || \"diagram\"\n}\n\nfunction resolveWorkspacePath(\n  context: { directory: string; worktree?: string },\n  requestedPath: string,\n): string {\n  if (!requestedPath.trim()) throw new Error(\"file must be a non-empty path\")\n  if (path.isAbsolute(requestedPath)) {\n    throw new Error(\"absolute paths are not allowed; use a workspace-relative path\")\n  }\n\n  const workspace = path.resolve(context.worktree || context.directory)\n  const target = path.resolve(workspace, requestedPath)\n  const relative = path.relative(workspace, target)\n  const parentToken = String.fromCharCode(46).repeat(2)\n\n  if (\n    !relative\n    || relative === parentToken\n    || relative.startsWith(parentToken + path.sep)\n    || path.isAbsolute(relative)\n  ) {\n    throw new Error(\"file must resolve to a file inside the current workspace\")\n  }\n\n  const lower = target.toLowerCase()\n  if (!ALLOWED_EXTENSIONS.some((extension) => lower.endsWith(extension))) {\n    throw new Error(`unsupported file extension; expected ${ALLOWED_EXTENSIONS.join(\" or \")}`)\n  }\n\n  return target\n}\n\nasync function readDiagramFile(target: string): Promise<string> {\n  const stat = await fs.stat(target)\n  if (!stat.isFile()) throw new Error(\"target is not a regular file\")\n  if (stat.size > MAX_FILE_BYTES) {\n    throw new Error(`file is larger than the ${MAX_FILE_BYTES / 1024 / 1024} MB MVP limit`)\n  }\n  return fs.readFile(target, \"utf8\")\n}\n\nfunction decodeDiagramPayload(payload: string): string {\n  const compressed = Buffer.from(payload.trim(), \"base64\")\n  const percentEncoded = new TextDecoder().decode(pako.inflateRaw(compressed))\n  return decodeURIComponent(percentEncoded)\n}\n\nfunction encodeDiagramPayload(xml: string): string {\n  const percentEncoded = encodeURIComponent(xml)\n  const compressed = pako.deflateRaw(new TextEncoder().encode(percentEncoded))\n  return Buffer.from(compressed).toString(\"base64\")\n}\n\nfunction geometryFromCell(cell: Record<string, unknown>): ParsedCell[\"geometry\"] {\n  const raw = cell.mxGeometry\n  if (!raw || typeof raw !== \"object\") return undefined\n  const geometry = raw as Record<string, unknown>\n  return {\n    x: numberAttribute(geometry[\"@_x\"]),\n    y: numberAttribute(geometry[\"@_y\"]),\n    width: numberAttribute(geometry[\"@_width\"]),\n    height: numberAttribute(geometry[\"@_height\"]),\n  }\n}\n\nfunction parseGraphModel(modelXml: string): ParsedCell[] {\n  const validation = XMLValidator.validate(modelXml)\n  if (validation !== true) {\n    throw new Error(`invalid mxGraphModel XML: ${JSON.stringify(validation)}`)\n  }\n\n  const document = parser.parse(modelXml) as Record<string, unknown>\n  const graph = document.mxGraphModel as Record<string, unknown> | undefined\n  const root = graph?.root as Record<string, unknown> | undefined\n  if (!root) throw new Error(\"diagram page does not contain mxGraphModel/root\")\n\n  return asArray(root.mxCell as Record<string, unknown> | Record<string, unknown>[] | undefined)\n    .map((cell) => ({\n      id: attribute(cell[\"@_id\"]) || \"\",\n      parent: attribute(cell[\"@_parent\"]),\n      source: attribute(cell[\"@_source\"]),\n      target: attribute(cell[\"@_target\"]),\n      label: attribute(cell[\"@_value\"]),\n      style: attribute(cell[\"@_style\"]),\n      vertex: attribute(cell[\"@_vertex\"]) === \"1\",\n      edge: attribute(cell[\"@_edge\"]) === \"1\",\n      geometry: geometryFromCell(cell),\n    }))\n}\n\nfunction parseDrawio(xml: string): ParsedPage[] {\n  const validation = XMLValidator.validate(xml)\n  if (validation !== true) {\n    throw new Error(`invalid draw.io XML: ${JSON.stringify(validation)}`)\n  }\n\n  const document = parser.parse(xml) as Record<string, unknown>\n  if (document.mxGraphModel) {\n    return [{\n      id: \"page-1\",\n      name: \"Page-1\",\n      compressed: false,\n      cells: parseGraphModel(xml),\n    }]\n  }\n\n  const mxfile = document.mxfile as Record<string, unknown> | undefined\n  if (!mxfile) throw new Error(\"root element must be mxfile or mxGraphModel\")\n\n  const diagrams = asArray(\n    mxfile.diagram as Record<string, unknown> | Record<string, unknown>[] | undefined,\n  )\n  if (diagrams.length === 0) throw new Error(\"mxfile contains no diagram pages\")\n\n  return diagrams.map((diagram, index) => {\n    const pageId = attribute(diagram[\"@_id\"]) || `page-${index + 1}`\n    const pageName = attribute(diagram[\"@_name\"]) || `Page-${index + 1}`\n    const embeddedModel = diagram.mxGraphModel\n\n    if (embeddedModel && typeof embeddedModel === \"object\") {\n      const modelXml = builder.build({ mxGraphModel: embeddedModel })\n      return {\n        id: pageId,\n        name: pageName,\n        compressed: false,\n        cells: parseGraphModel(modelXml),\n      }\n    }\n\n    const payload = attribute(diagram[\"#text\"])\n    if (!payload?.trim()) throw new Error(`page ${pageName} has no diagram data`)\n    return {\n      id: pageId,\n      name: pageName,\n      compressed: true,\n      cells: parseGraphModel(decodeDiagramPayload(payload)),\n    }\n  })\n}\n\nfunction validateSemanticGraph(nodes: DiagramNode[], edges: DiagramEdge[]): void {\n  if (nodes.length === 0) throw new Error(\"nodes must contain at least one node\")\n\n  const nodeIds = new Set<string>()\n  for (const node of nodes) {\n    if (!SAFE_ID.test(node.id) || node.id === \"0\" || node.id === \"1\") {\n      throw new Error(`invalid or reserved node id: ${node.id}`)\n    }\n    if (!node.label.trim()) throw new Error(`node ${node.id} has an empty label`)\n    if (nodeIds.has(node.id)) throw new Error(`duplicate node id: ${node.id}`)\n    nodeIds.add(node.id)\n  }\n\n  const edgeIds = new Set<string>()\n  for (const [index, edge] of edges.entries()) {\n    const id = edge.id || `edge-${index + 1}`\n    if (!SAFE_ID.test(id) || id === \"0\" || id === \"1\") {\n      throw new Error(`invalid or reserved edge id: ${id}`)\n    }\n    if (edgeIds.has(id) || nodeIds.has(id)) throw new Error(`duplicate cell id: ${id}`)\n    if (!nodeIds.has(edge.source)) throw new Error(`edge ${id} has unknown source: ${edge.source}`)\n    if (!nodeIds.has(edge.target)) throw new Error(`edge ${id} has unknown target: ${edge.target}`)\n    edgeIds.add(id)\n  }\n}\n\nfunction calculateRanks(nodes: DiagramNode[], edges: DiagramEdge[]): Map<string, number> {\n  const incoming = new Map(nodes.map((node) => [node.id, 0]))\n  const outgoing = new Map(nodes.map((node) => [node.id, [] as string[]]))\n  const ranks = new Map(nodes.map((node) => [node.id, 0]))\n\n  for (const edge of edges) {\n    incoming.set(edge.target, (incoming.get(edge.target) || 0) + 1)\n    outgoing.get(edge.source)?.push(edge.target)\n  }\n\n  const queue = nodes.filter((node) => incoming.get(node.id) === 0).map((node) => node.id)\n  const visited = new Set<string>()\n\n  while (queue.length > 0) {\n    const current = queue.shift()!\n    if (visited.has(current)) continue\n    visited.add(current)\n\n    for (const target of outgoing.get(current) || []) {\n      ranks.set(target, Math.max(ranks.get(target) || 0, (ranks.get(current) || 0) + 1))\n      incoming.set(target, (incoming.get(target) || 1) - 1)\n      if (incoming.get(target) === 0) queue.push(target)\n    }\n  }\n\n  // Cycles cannot be topologically ranked; keep their current deterministic rank.\n  return ranks\n}\n\nfunction nodeStyle(kind: DiagramNode[\"kind\"]): string {\n  const base = \"rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=1.5;\"\n  const styles: Record<NonNullable<DiagramNode[\"kind\"]>, string> = {\n    default: \"fillColor=#dae8fc;strokeColor=#6c8ebf;\",\n    application: \"fillColor=#d5e8d4;strokeColor=#82b366;\",\n    service: \"fillColor=#dae8fc;strokeColor=#6c8ebf;\",\n    database: \"shape=cylinder3;boundedLbl=1;backgroundOutline=1;fillColor=#fff2cc;strokeColor=#d6b656;\",\n    external: \"dashed=1;fillColor=#f5f5f5;strokeColor=#666666;\",\n    decision: \"rhombus;fillColor=#ffe6cc;strokeColor=#d79b00;\",\n  }\n  return base + styles[kind || \"default\"]\n}\n\nfunction buildGraphModel(\n  nodes: DiagramNode[],\n  edges: DiagramEdge[],\n  direction: Direction,\n): string {\n  const ranks = calculateRanks(nodes, edges)\n  const byRank = new Map<number, DiagramNode[]>()\n\n  for (const node of nodes) {\n    const rank = ranks.get(node.id) || 0\n    const row = byRank.get(rank) || []\n    row.push(node)\n    byRank.set(rank, row)\n  }\n\n  const nodeCells = nodes.map((node) => {\n    const rank = ranks.get(node.id) || 0\n    const offset = (byRank.get(rank) || []).findIndex((candidate) => candidate.id === node.id)\n    const x = direction === \"left-to-right\" ? 80 + rank * 240 : 80 + offset * 240\n    const y = direction === \"left-to-right\" ? 80 + offset * 140 : 80 + rank * 140\n    const width = node.kind === \"decision\" ? 140 : 160\n    const height = node.kind === \"decision\" ? 100 : 70\n    return `      <mxCell id=\"${xmlEscape(node.id)}\" value=\"${xmlEscape(node.label)}\" style=\"${xmlEscape(nodeStyle(node.kind))}\" vertex=\"1\" parent=\"1\">\n        <mxGeometry x=\"${x}\" y=\"${y}\" width=\"${width}\" height=\"${height}\" as=\"geometry\"/>\n      </mxCell>`\n  })\n\n  const edgeCells = edges.map((edge, index) => {\n    const id = edge.id || `edge-${index + 1}`\n    const style = \"edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;\"\n    return `      <mxCell id=\"${xmlEscape(id)}\" value=\"${xmlEscape(edge.label || \"\")}\" style=\"${style}\" edge=\"1\" parent=\"1\" source=\"${xmlEscape(edge.source)}\" target=\"${xmlEscape(edge.target)}\">\n        <mxGeometry relative=\"1\" as=\"geometry\"/>\n      </mxCell>`\n  })\n\n  return `<mxGraphModel dx=\"1200\" dy=\"800\" grid=\"1\" gridSize=\"10\" guides=\"1\" tooltips=\"1\" connect=\"1\" arrows=\"1\" fold=\"1\" page=\"1\" pageScale=\"1\" pageWidth=\"1169\" pageHeight=\"827\" math=\"0\" shadow=\"0\">\n  <root>\n    <mxCell id=\"0\"/>\n    <mxCell id=\"1\" parent=\"0\"/>\n${[...nodeCells, ...edgeCells].join(\"\\n\")}\n  </root>\n</mxGraphModel>`\n}\n\nfunction buildDrawioDocument(\n  title: string,\n  nodes: DiagramNode[],\n  edges: DiagramEdge[],\n  direction: Direction,\n  compressed: boolean,\n): string {\n  const graphModel = buildGraphModel(nodes, edges, direction)\n  const pageId = `page-${slug(title)}`\n  const diagramContent = compressed ? encodeDiagramPayload(graphModel) : graphModel\n  const now = new Date().toISOString()\n  return `<mxfile host=\"OpenWork\" modified=\"${now}\" agent=\"drawio-expert\" version=\"26.0.0\">\n  <diagram id=\"${xmlEscape(pageId)}\" name=\"${xmlEscape(title)}\">${diagramContent}</diagram>\n</mxfile>\n`\n}\n\nfunction validationReport(pages: ParsedPage[]) {\n  const errors: string[] = []\n  const warnings: string[] = []\n\n  for (const page of pages) {\n    const ids = new Set<string>()\n    for (const cell of page.cells) {\n      if (!cell.id) {\n        errors.push(`${page.name}: cell without id`)\n        continue\n      }\n      if (ids.has(cell.id)) errors.push(`${page.name}: duplicate cell id ${cell.id}`)\n      ids.add(cell.id)\n    }\n\n    for (const cell of page.cells) {\n      if (cell.parent && !ids.has(cell.parent)) {\n        errors.push(`${page.name}: ${cell.id} references missing parent ${cell.parent}`)\n      }\n      if (cell.edge) {\n        if (!cell.source || !ids.has(cell.source)) {\n          errors.push(`${page.name}: edge ${cell.id} has missing source ${cell.source || \"(empty)\"}`)\n        }\n        if (!cell.target || !ids.has(cell.target)) {\n          errors.push(`${page.name}: edge ${cell.id} has missing target ${cell.target || \"(empty)\"}`)\n        }\n      }\n      if (cell.vertex) {\n        if (!cell.geometry) {\n          errors.push(`${page.name}: vertex ${cell.id} has no geometry`)\n        } else if (\n          (cell.geometry.width !== undefined && cell.geometry.width <= 0)\n          || (cell.geometry.height !== undefined && cell.geometry.height <= 0)\n        ) {\n          errors.push(`${page.name}: vertex ${cell.id} has non-positive dimensions`)\n        }\n        if (!cell.label?.trim()) warnings.push(`${page.name}: vertex ${cell.id} has an empty label`)\n      }\n    }\n  }\n\n  return {\n    valid: errors.length === 0,\n    errors,\n    warnings,\n    stats: {\n      pages: pages.length,\n      nodes: pages.reduce((sum, page) => sum + page.cells.filter((cell) => cell.vertex).length, 0),\n      edges: pages.reduce((sum, page) => sum + page.cells.filter((cell) => cell.edge).length, 0),\n    },\n  }\n}\n\nasync function atomicWrite(target: string, content: string, overwrite: boolean) {\n  await fs.mkdir(path.dirname(target), { recursive: true })\n\n  let exists = false\n  try {\n    exists = (await fs.stat(target)).isFile()\n  } catch (error) {\n    if ((error as NodeJS.ErrnoException).code !== \"ENOENT\") throw error\n  }\n\n  if (exists && !overwrite) {\n    throw new Error(\"target already exists; set overwrite=true to replace it with a recoverable backup\")\n  }\n\n  const temporary = `${target}.${process.pid}.${Date.now()}.tmp`\n  await fs.writeFile(temporary, content, \"utf8\")\n\n  if (!exists) {\n    await fs.rename(temporary, target)\n    return { backup: null }\n  }\n\n  const backup = `${target}.${new Date().toISOString().replace(/[:.]/g, \"-\")}.bak`\n  await fs.rename(target, backup)\n  try {\n    await fs.rename(temporary, target)\n  } catch (error) {\n    await fs.rename(backup, target)\n    throw error\n  }\n  return { backup }\n}\n\nconst nodeSchema = tool.schema.object({\n  id: tool.schema.string().describe(\"Stable unique cell id; 0 and 1 are reserved\"),\n  label: tool.schema.string().describe(\"Visible node label\"),\n  kind: tool.schema\n    .enum([\"default\", \"application\", \"service\", \"database\", \"external\", \"decision\"])\n    .optional()\n    .describe(\"Visual node category\"),\n})\n\nconst edgeSchema = tool.schema.object({\n  id: tool.schema.string().optional().describe(\"Stable unique edge id\"),\n  source: tool.schema.string().describe(\"Source node id\"),\n  target: tool.schema.string().describe(\"Target node id\"),\n  label: tool.schema.string().optional().describe(\"Visible edge label\"),\n})\n\nexport const DrawioExpertPlugin: Plugin = async () => ({\n  tool: {\n    drawio_create: tool({\n      description:\n        \"Create a validated Draw.io file from a semantic graph. Use this instead of writing mxGraphModel XML directly.\",\n      args: {\n        file: tool.schema.string().describe(\"Workspace-relative .drawio or .xml output path\"),\n        title: tool.schema.string().describe(\"Diagram page title\"),\n        nodes: tool.schema.array(nodeSchema).describe(\"Diagram nodes\"),\n        edges: tool.schema.array(edgeSchema).default([]).describe(\"Diagram edges\"),\n        direction: tool.schema\n          .enum([\"left-to-right\", \"top-to-bottom\"])\n          .default(\"left-to-right\")\n          .describe(\"Layered layout direction\"),\n        compressed: tool.schema\n          .boolean()\n          .default(false)\n          .describe(\"Write standard compressed Draw.io page payload\"),\n        overwrite: tool.schema\n          .boolean()\n          .default(false)\n          .describe(\"Allow replacement; the previous file is preserved as a timestamped backup\"),\n      },\n      async execute(args, context) {\n        validateSemanticGraph(args.nodes, args.edges)\n        const target = resolveWorkspacePath(context, args.file)\n        const xml = buildDrawioDocument(\n          args.title,\n          args.nodes,\n          args.edges,\n          args.direction,\n          args.compressed,\n        )\n        const pages = parseDrawio(xml)\n        const report = validationReport(pages)\n        if (!report.valid) {\n          throw new Error(`generated diagram failed validation: ${JSON.stringify(report.errors)}`)\n        }\n        const writeResult = await atomicWrite(target, xml, args.overwrite)\n        return JSON.stringify({\n          created: path.relative(context.worktree || context.directory, target),\n          backup: writeResult.backup\n            ? path.relative(context.worktree || context.directory, writeResult.backup)\n            : null,\n          compressed: args.compressed,\n          ...report,\n        }, null, 2)\n      },\n    }),\n\n    drawio_inspect: tool({\n      description:\n        \"Inspect a compressed or uncompressed Draw.io file and return pages, nodes, edges, geometry, and styles.\",\n      args: {\n        file: tool.schema.string().describe(\"Workspace-relative .drawio or .xml file\"),\n      },\n      async execute(args, context) {\n        const target = resolveWorkspacePath(context, args.file)\n        const xml = await readDiagramFile(target)\n        const pages = parseDrawio(xml)\n        return JSON.stringify({\n          file: path.relative(context.worktree || context.directory, target),\n          pages: pages.map((page) => ({\n            id: page.id,\n            name: page.name,\n            compressed: page.compressed,\n            nodes: page.cells.filter((cell) => cell.vertex),\n            edges: page.cells.filter((cell) => cell.edge),\n          })),\n          ...validationReport(pages),\n        }, null, 2)\n      },\n    }),\n\n    drawio_validate: tool({\n      description:\n        \"Validate Draw.io XML, page structure, cell ids, parent/source/target references, and node geometry.\",\n      args: {\n        file: tool.schema.string().describe(\"Workspace-relative .drawio or .xml file\"),\n      },\n      async execute(args, context) {\n        const target = resolveWorkspacePath(context, args.file)\n        try {\n          const xml = await readDiagramFile(target)\n          const pages = parseDrawio(xml)\n          return JSON.stringify({\n            file: path.relative(context.worktree || context.directory, target),\n            ...validationReport(pages),\n          }, null, 2)\n        } catch (error) {\n          return JSON.stringify({\n            file: args.file,\n            valid: false,\n            errors: [(error as Error).message],\n            warnings: [],\n            stats: { pages: 0, nodes: 0, edges: 0 },\n          }, null, 2)\n        }\n      },\n    }),\n  },\n})\n"
+        }
+      ],
+      "package_json": {
+        "type": "module",
+        "dependencies": {
+          "fast-xml-parser": "^5.0.0",
+          "pako": "^2.1.0"
+        }
+      }
+    },
+    "reference_files": [],
+    "instruction_files": [],
+    "references": {},
+    "instructions": [],
+    "lsp": null
+  },
+  "agent": {
+    "id": "drawio-expert",
+    "name": "Draw.io 绘图专家",
+    "display_name": "Draw.io 绘图专家",
+    "profession": "系统可视化与技术绘图专家",
+    "description": "直接完成 Draw.io 图表的需求理解、语义建模、创建、读取和结构校验，并提供可复查的验证证据。",
+    "mode": "primary",
+    "color": "#f08705",
+    "max_turns": 80,
+    "avatar_url": "avatars/drawio-expert.svg",
+    "responsibilities": [
+      "把用户需求、文档或代码结构转换成明确的节点、连接和页面语义模型。",
+      "使用 drawio_create 创建可编辑的 Draw.io 文件，不直接自由拼写 mxGraphModel XML。",
+      "使用 drawio_inspect 读取压缩或未压缩的 Draw.io 文件，并准确说明图表结构。",
+      "使用 drawio_validate 检查 XML、ID、父子引用、边端点和节点几何。",
+      "交付文件路径、图结构摘要、验证证据和未决风险。"
+    ],
+    "route_triggers": [
+      "用户要求创建 Draw.io 架构图、流程图、拓扑图或其他技术图表。",
+      "用户要求读取、解释或审查已有的 .drawio 或 Draw.io XML 文件。",
+      "用户要求检查 Draw.io 文件是否损坏、引用是否完整或结构是否有效。"
+    ],
+    "workflow": [
+      "明确图表用途、目标读者、输入材料、图类型和验收标准。",
+      "创建任务先建立节点与连接的结构化语义模型；读取或校验任务先定位目标文件。",
+      "创建任务调用 drawio_create，不直接写入原始 mxGraphModel XML。",
+      "读取任务调用 drawio_inspect，不根据文件名或用户描述猜测图中内容。",
+      "所有创建结果必须调用 drawio_validate 进行独立校验。",
+      "核对工具返回的页面数、节点数、连接数、错误和警告。",
+      "最终报告生成或读取的文件、核心结构、验证状态、限制和剩余风险。"
+    ],
+    "quality_gates": [
+      "输出文件必须位于当前 workspace 内，且扩展名为 .drawio 或 .xml。",
+      "所有节点 ID 唯一，且所有连接的 source 和 target 都引用真实节点。",
+      "每个可视节点具有有效几何信息和正数尺寸。",
+      "生成文件可被插件重新读取，并通过 drawio_validate。",
+      "默认不覆盖已有文件；明确覆盖时必须保留带时间戳的备份。",
+      "最终交付包含文件路径、节点和连接统计、错误、警告及未决风险。"
+    ],
+    "handoff_contract": [
+      "返回任务理解、目标文件、图表页面与语义结构、执行过的工具、验证状态、错误或警告、限制和剩余风险。"
+    ],
+    "skills": [],
+    "permission": {
+      "read": "allow",
+      "edit": "allow",
+      "bash": {
+        "*": "deny"
+      },
+      "webfetch": "ask",
+      "skill": {
+        "*": "deny",
+        "drawio-expert-common": "allow",
+        "drawio-expert-drawio-expert": "allow"
+      }
+    }
+  }
+}
