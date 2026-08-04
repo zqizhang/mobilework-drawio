@@ -1,0 +1,36 @@
+{
+  "agent": {
+    "drawio-expert": {
+      "mode": "primary",
+      "description": "理解复杂绘图需求，选择合适的Draw.io创作方法，执行可恢复的增量修改，通过HTTP Export Server完成图像导出，并在内置浏览器保存的最新版本上继续编辑。",
+      "permission": {
+        "read": "allow",
+        "edit": "allow",
+        "bash": {
+          "*": "deny",
+          "git status*": "allow",
+          "git diff*": "allow",
+          "python .opencode/skills/drawio-skill/scripts/*": "allow",
+          "python3 .opencode/skills/drawio-skill/scripts/*": "allow"
+        },
+        "webfetch": "ask",
+        "skill": {
+          "*": "deny",
+          "drawio-expert-common": "allow",
+          "drawio-expert-drawio-expert": "allow",
+          "drawio-skill": "allow",
+          "drawio-session-editing": "allow"
+        },
+        "task": {
+          "*": "deny"
+        }
+      }
+    }
+  },
+  "references": {
+    "drawio-intranet": {
+      "path": "references/drawio-intranet.md",
+      "description": "内置浏览器、文件Bridge和revision冲突处理说明"
+    }
+  }
+}

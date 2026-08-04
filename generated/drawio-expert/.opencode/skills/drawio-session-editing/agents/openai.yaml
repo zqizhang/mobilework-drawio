@@ -1,0 +1,7 @@
+interface:
+  display_name: "Draw.io 会话编辑与冲突保护"
+  short_description: "在内置浏览器和Agent之间安全同步Draw.io人工编辑"
+  default_prompt: "使用 $drawio-session-editing 打开工作区中的Draw.io文件，保留用户人工修改，并按最新revision继续安全编辑。"
+  brand_color: "#F08705"
+policy:
+  allow_implicit_invocation: true
