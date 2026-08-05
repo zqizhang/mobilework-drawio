@@ -23,7 +23,7 @@ const context = {
 }
 
 try {
-  const plugin = await DrawioExpertPlugin({})
+  const plugin = await DrawioExpertPlugin({ directory: workspace })
   const health = JSON.parse(await plugin.tool.drawio_health_check.execute({ deep: true }, context))
   assert.equal(health.success, true)
   assert.equal(health.checks.deep_test.success, true)

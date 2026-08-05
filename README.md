@@ -52,7 +52,7 @@ http://127.0.0.1:18765/ImageExport4/export
 
 ### 2. 配置环境变量
 
-参考 [.env.example](.env.example)：
+将 [.env.example](.env.example) 复制为当前 OpenCode 工作区根目录下的 `.env`。插件初始化时会显式读取该文件；宿主进程已经设置的同名环境变量优先，修改 `.env` 后需要重启 OpenCode 插件进程：
 
 ```dotenv
 DRAWIO_WEB_URL=https://embed.diagrams.net

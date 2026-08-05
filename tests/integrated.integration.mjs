@@ -6,9 +6,19 @@ import path from "node:path"
 
 import { DrawioExpertPlugin } from "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js"
 
-process.env.DRAWIO_BRIDGE_HOST = "127.0.0.1"
-process.env.DRAWIO_BRIDGE_PORT = "0"
-process.env.DRAWIO_WEB_URL = "https://embed.diagrams.net"
+const DRAWIO_ENVIRONMENT_KEYS = [
+  "DRAWIO_WEB_URL",
+  "DRAWIO_BRIDGE_HOST",
+  "DRAWIO_BRIDGE_PORT",
+  "DRAWIO_EXPORT_URL",
+  "DRAWIO_REQUEST_TIMEOUT",
+  "DRAWIO_MAX_INPUT_SIZE_MB",
+  "DRAWIO_MAX_OUTPUT_SIZE_MB",
+]
+const originalEnvironment = Object.fromEntries(
+  DRAWIO_ENVIRONMENT_KEYS.map((name) => [name, process.env[name]]),
+)
+for (const name of DRAWIO_ENVIRONMENT_KEYS) delete process.env[name]
 
 const PNG = Buffer.concat([
   Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -31,7 +41,6 @@ const exportServer = createServer(async (request, response) => {
 })
 await new Promise((resolve) => exportServer.listen(0, "127.0.0.1", resolve))
 const exportAddress = exportServer.address()
-process.env.DRAWIO_EXPORT_URL = `http://127.0.0.1:${exportAddress.port}/ImageExport4/export`
 
 const XML = '<mxfile host="test"><diagram id="p1" name="Page-1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="node" value="MobileWork" vertex="1" parent="1"><mxGeometry x="20" y="20" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>'
 const NESTED_XML = `<mxfile host="test"><diagram id="nested" name="Nested containers"><mxGraphModel><root>
@@ -63,6 +72,17 @@ const LABEL_CLEAR_XML = LABEL_OVERLAP_XML.replace(
 )
 
 const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-integrated-"))
+await fs.writeFile(path.join(workspace, ".env"), [
+  'DRAWIO_WEB_URL="http://127.0.0.1:18080" # local Docker editor',
+  "DRAWIO_BRIDGE_HOST=127.0.0.1",
+  "DRAWIO_BRIDGE_PORT=0",
+  `DRAWIO_EXPORT_URL=http://127.0.0.1:${exportAddress.port}/ImageExport4/export`,
+  "DRAWIO_REQUEST_TIMEOUT=60",
+  "DRAWIO_MAX_INPUT_SIZE_MB=20",
+  "DRAWIO_MAX_OUTPUT_SIZE_MB=100",
+  "DRAWIO_UNRELATED_VALUE=must-not-load",
+  "",
+].join("\n"), "utf8")
 const context = {
   sessionID: "integrated-session",
   messageID: "integrated-message",
@@ -77,7 +97,9 @@ const context = {
 }
 
 try {
-  const plugin = await DrawioExpertPlugin({})
+  const plugin = await DrawioExpertPlugin({ directory: workspace })
+  assert.equal(process.env.DRAWIO_WEB_URL, "http://127.0.0.1:18080")
+  assert.equal(process.env.DRAWIO_UNRELATED_VALUE, undefined)
   assert.equal(typeof plugin.tool.drawio_export.execute, "function")
   assert.equal(typeof plugin.tool.drawio_validate.execute, "function")
   assert.equal(typeof plugin.tool.drawio_health_check.execute, "function")
@@ -166,7 +188,7 @@ try {
   assert.equal(openResult.ok, true)
   assert.match(openResult.openUrl, /\/editor\?/) 
   const editorPage = await fetch(openResult.openUrl).then((response) => response.text())
-  assert.match(editorPage, /embed\.diagrams\.net/)
+  assert.match(editorPage, /127\.0\.0\.1:18080/)
   assert.match(editorPage, /baseRevision/)
 
   const apiUrl = new URL(openResult.openUrl)
@@ -267,4 +289,8 @@ try {
   }
   await new Promise((resolve) => exportServer.close(resolve))
   await fs.rm(workspace, { recursive: true, force: true })
+  for (const name of DRAWIO_ENVIRONMENT_KEYS) {
+    if (originalEnvironment[name] === undefined) delete process.env[name]
+    else process.env[name] = originalEnvironment[name]
+  }
 }

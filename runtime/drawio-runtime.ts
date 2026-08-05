@@ -118,6 +118,15 @@ const BRIDGE_TOKEN_TTL_MS = 12 * 60 * 60 * 1000
 const SESSION_HISTORY_LIMIT = 20
 const ARTIFACT_MARKER = "drawio-expert-artifact:v1"
 const SAFE_ID = /^[A-Za-z0-9_.:-]+$/
+const DRAWIO_ENVIRONMENT_KEYS = [
+  "DRAWIO_WEB_URL",
+  "DRAWIO_BRIDGE_HOST",
+  "DRAWIO_BRIDGE_PORT",
+  "DRAWIO_EXPORT_URL",
+  "DRAWIO_REQUEST_TIMEOUT",
+  "DRAWIO_MAX_INPUT_SIZE_MB",
+  "DRAWIO_MAX_OUTPUT_SIZE_MB",
+] as const
 const EDGE_BASE_STYLE =
   "edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;jumpStyle=arc;jumpSize=10;endArrow=block;endFill=1;"
 
@@ -163,6 +172,46 @@ function resolveWorkspaceRoot(context: WorkspaceContext): string {
   const directory = context.directory.trim()
   if (!directory) throw new Error("OpenCode did not provide a workspace directory")
   return path.resolve(directory)
+}
+
+async function loadWorkspaceEnvironment(directory: string): Promise<void> {
+  const environmentPath = path.join(resolveWorkspaceRoot({ directory }), ".env")
+  let content: string
+  try {
+    content = await fs.readFile(environmentPath, "utf8")
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+    throw new Error(`cannot read workspace .env at ${environmentPath}: ${(error as Error).message}`)
+  }
+
+  const parsed: Record<string, string> = {}
+  for (const line of content.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/)
+    if (!match) continue
+    const [, name, rawValue] = match
+    const trimmed = rawValue.trim()
+    const quote = trimmed[0]
+    const closingQuote = quote === '"' || quote === "'" || quote === "`"
+      ? trimmed.lastIndexOf(quote)
+      : -1
+    let value = closingQuote > 0
+      ? trimmed.slice(1, closingQuote)
+      : trimmed.replace(/\s+#.*$/, "").trim()
+    if (quote === '"' && closingQuote > 0) {
+      value = value
+        .replace(/\\n/g, "\n")
+        .replace(/\\r/g, "\r")
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, "\\")
+    }
+    parsed[name] = value
+  }
+
+  for (const name of DRAWIO_ENVIRONMENT_KEYS) {
+    if (!process.env[name]?.trim() && parsed[name] !== undefined) {
+      process.env[name] = parsed[name]
+    }
+  }
 }
 
 function workspaceRelative(context: WorkspaceContext, target: string): string {
@@ -2879,7 +2928,10 @@ function candidateDrawioPath(args: unknown): string | null {
   return null
 }
 
-export const DrawioExpertPlugin: Plugin = async () => ({
+export const DrawioExpertPlugin: Plugin = async (input) => {
+  await loadWorkspaceEnvironment(input.directory)
+
+  return {
   "experimental.chat.system.transform": async (_input, output) => {
     output.system.push(DRAWIO_RUNTIME_GUIDANCE)
   },
@@ -3530,4 +3582,5 @@ export const DrawioExpertPlugin: Plugin = async () => ({
     }),
 
   },
-})
+  }
+}
