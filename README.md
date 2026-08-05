@@ -2,7 +2,7 @@
 
 <div align="center">
 
-面向 MobileWork / OpenCode 的 Draw.io 单专家包：创建和修改可编辑图表，通过 Docker 导出图片，并在内置浏览器中完成人机协同编辑。
+面向 MobileWork / OpenWork 的 Draw.io 单专家包：创建和修改可编辑图表，通过自托管 Draw.io 服务导出图片，并在内置浏览器中完成人机协同编辑。
 
 ![MobileWork Expert](https://img.shields.io/badge/MobileWork-Expert-2563eb)
 ![Runtime](https://img.shields.io/badge/runtime-TypeScript-3178c6)
@@ -15,8 +15,8 @@
 - 根据自然语言创建架构图、流程图、ER 图、UML、BPMN、SysML、网络拓扑和基础设施图。
 - 读取、检查、比较和增量修改压缩或非压缩的 `.drawio` 文件。
 - 使用稳定 ID 修改节点和连线，避免无关内容被整图重建。
-- 通过 Docker HTTP Export Server 导出 PNG、JPEG 和 PDF。
-- 创建或修改结束后自动导出同名 PNG，并在 MobileWork 内置浏览器中打开。
+- 通过自托管的 `jgraph/drawio` + `jgraph/export-server` 导出 PNG、JPEG 和 PDF。
+- 创建或修改结束后自动导出同名 PNG，并在 MobileWork / OpenWork 内置浏览器中打开。
 - 用户在浏览器保存后，将最新 XML 和 revision 作为 Agent 下一次修改的基线。
 - 通过 revision 冲突检查避免旧快照覆盖最新内容；人工编辑本身仍可按当前任务要求继续调整。
 - 检查节点重叠、边穿节点、边交叉、嵌套容器坐标、边标签碰撞、空标签和缺少跳线等质量问题。
@@ -29,10 +29,10 @@ flowchart LR
     A --> S["绘图与会话 Skills"]
     S --> R["TypeScript 运行时插件"]
     R --> D["工作区 .drawio 文件"]
-    R --> E["Docker Export Server"]
+    R --> E["Draw.io Web + Export Server"]
     E --> P["PNG / JPEG / PDF"]
     R --> B["revision Bridge"]
-    B --> W["MobileWork 内置浏览器"]
+    B --> W["MobileWork / OpenWork 内置浏览器"]
     W -->|"用户保存新 revision"| B
 ```
 
@@ -40,22 +40,41 @@ flowchart LR
 
 ## 快速开始
 
-### 1. 准备导出服务
+### 1. 启动自包含 Draw.io Docker 服务
 
-启动一个兼容 `ImageExport4/export` 的 Docker HTTP Export Server。默认地址为：
+使用 jGraph 官方 [self-contained/docker-compose.yml](https://github.com/jgraph/docker-drawio/blob/dev/self-contained/docker-compose.yml)，将两个服务的端口改为：
 
-```text
-http://127.0.0.1:18765/ImageExport4/export
+```yaml
+services:
+  image-export:
+    ports:
+      - "18765:8000"
+
+  drawio:
+    ports:
+      - "8443:8443"
+      - "18080:8080"
 ```
 
-本工程只连接该服务，不在专家运行时启动或管理 Docker 容器。
-
-### 2. 配置环境变量
-
-将 [.env.example](.env.example) 复制为当前 OpenCode 工作区根目录下的 `.env`。插件初始化时会显式读取该文件；宿主进程已经设置的同名环境变量优先，修改 `.env` 后需要重启 OpenCode 插件进程：
+在 `docker-compose.yml` 同目录创建 `.env`：
 
 ```dotenv
-DRAWIO_WEB_URL=https://embed.diagrams.net
+DRAWIO_SERVER_URL=http://127.0.0.1:18080/
+DRAWIO_BASE_URL=http://127.0.0.1:18080
+```
+
+```powershell
+docker compose pull
+docker compose up -d
+docker compose ps
+```
+
+### 2. 配置工作区环境变量
+
+将 [.env.example](.env.example) 复制为工作区根目录下的 `.env`：
+
+```dotenv
+DRAWIO_WEB_URL=http://127.0.0.1:18080
 DRAWIO_BRIDGE_HOST=127.0.0.1
 DRAWIO_BRIDGE_PORT=0
 DRAWIO_EXPORT_URL=http://127.0.0.1:18765/ImageExport4/export
@@ -64,17 +83,14 @@ DRAWIO_MAX_INPUT_SIZE_MB=20
 DRAWIO_MAX_OUTPUT_SIZE_MB=100
 ```
 
-主要配置：
+端口对应关系：
 
-| 变量 | 默认值 | 用途 |
+| 工作区变量 | Compose 服务 | 端口映射 |
 |---|---|---|
-| `DRAWIO_WEB_URL` | `https://embed.diagrams.net` | 内置浏览器加载的 Draw.io Web 编辑器 |
-| `DRAWIO_BRIDGE_HOST` | `127.0.0.1` | 会话 Bridge 监听地址，仅允许本机回环地址 |
-| `DRAWIO_BRIDGE_PORT` | `0` | Bridge 端口；`0` 表示自动选择空闲端口 |
-| `DRAWIO_EXPORT_URL` | `http://127.0.0.1:18765/ImageExport4/export` | Docker 导出接口 |
-| `DRAWIO_REQUEST_TIMEOUT` | `60` | 导出请求超时，单位为秒 |
-| `DRAWIO_MAX_INPUT_SIZE_MB` | `20` | 最大 Draw.io 输入大小 |
-| `DRAWIO_MAX_OUTPUT_SIZE_MB` | `100` | 最大导出文件大小 |
+| `DRAWIO_WEB_URL` | `drawio` | `18080:8080` |
+| `DRAWIO_EXPORT_URL` | `image-export` | `18765:8000` |
+
+其余变量用于 Bridge 监听、请求超时和文件大小限制。修改 `.env` 后重启 MobileWork / OpenWork。
 
 ### 3. 构建专家包
 
@@ -107,16 +123,21 @@ generated/drawio-expert/
 
 > 构建依赖只用于开发阶段。`generated/drawio-expert/` 不包含 `node_modules`、Python MCP 或运行时依赖清单。
 
-### 4. 安装到 MobileWork 工作区
+### 4. 安装到工作区
+
+#### MobileWork
+
+MobileWork 工作区不要直接覆盖现有 `.opencode`。使用 `mobilework-expert-manager` 的安装脚本复制 Agent、Skills、命令和插件，并把本包的运行时配置合并到 `<workspace>/.opencode/opencode.jsonc`。
 
 以下示例安装到 `D:\workspace\opencode`：
 
 ```powershell
 python "$env:USERPROFILE\.agents\skills\mobilework-expert-manager\scripts\install_expert.py" `
   --package-dir ".\generated\drawio-expert" `
-  --workspace-dir "D:\workspace\opencode" `
-  --force
+  --workspace-dir "D:\workspace\opencode"
 ```
+
+首次安装不要加 `--force`。如果脚本报告同名 Agent、Skill、插件或配置项已经存在，先检查冲突内容；确认要用本包版本覆盖时，再在命令末尾加 `--force`。
 
 安装后主要文件包括：
 
@@ -129,7 +150,32 @@ python "$env:USERPROFILE\.agents\skills\mobilework-expert-manager\scripts\instal
 └── opencode.jsonc
 ```
 
-安装或更新后应完全重启 MobileWork / OpenCode，使 Agent、Skills 和插件重新加载。
+安装脚本不会把包根目录的 `.env.example` 安装成真实配置，还需要执行：
+
+```powershell
+Copy-Item ".\generated\drawio-expert\.env.example" "D:\workspace\opencode\.env"
+```
+
+检查其中的本地 Draw.io 地址后，完全重启 MobileWork，并在 MobileWork 中选择同一个 `D:\workspace\opencode` 工作区。
+
+#### OpenWork
+
+OpenWork 不使用上面的 MobileWork 安装脚本。把生成专家包的**全部内容**直接复制到 OpenWork 工作区根目录即可；目标目录应是用于该专家的空工作区：
+
+```powershell
+$package = Resolve-Path ".\generated\drawio-expert"
+$workspace = "D:\workspace\drawio-expert"
+
+New-Item -ItemType Directory -Force $workspace | Out-Null
+Get-ChildItem -LiteralPath $package -Force |
+  Copy-Item -Destination $workspace -Recurse
+
+Copy-Item `
+  -LiteralPath "$workspace\.env.example" `
+  -Destination "$workspace\.env"
+```
+
+复制完成后，`opencode.json`、`AGENTS.md`、`.opencode/` 和 `.env` 都应直接位于 `D:\workspace\drawio-expert` 根目录。然后在 OpenWork 中选择该目录并完全重启对应的 OpenCode 进程；无需再拆分目录、合并配置或运行安装脚本。加载成功后应能看到 `drawio-expert` Agent、四个 Draw.io Skills、六个 `/drawio-*` 命令，以及 `drawio_*` 工具。
 
 ## 使用示例
 
@@ -162,7 +208,7 @@ python "$env:USERPROFILE\.agents\skills\mobilework-expert-manager\scripts\instal
 | `/drawio-patch` | 通过稳定 ID 增量修改图表 |
 | `/drawio-polish` | 自动布局、路由调整和质量门禁 |
 | `/drawio-export` | 通过 Docker 导出 PNG、JPEG 或 PDF |
-| `/drawio-open` | 在 MobileWork 内置浏览器中打开并协同编辑 |
+| `/drawio-open` | 在 MobileWork / OpenWork 内置浏览器中打开并协同编辑 |
 
 ## 会话与并发安全
 
@@ -207,12 +253,12 @@ node tests/integrated.integration.mjs
 node tests/docker.integration.mjs
 ```
 
-该测试要求默认 Docker Export Server 已经可访问，并会实际导出 PNG。
+该测试要求上面的两个 Compose 服务均已启动，并会通过 `http://127.0.0.1:18765/ImageExport4/export` 实际导出 PNG。
 
 ## 项目结构
 
 ```text
-drawio-expert-integrated/
+mobilework-drawio/
 ├── expert.json                         # MobileWork 专家 manifest
 ├── runtime/
 │   └── drawio-runtime.ts               # TypeScript 工具、评分器、Bridge 和导出客户端
@@ -236,10 +282,10 @@ drawio-expert-integrated/
 ## 能力边界
 
 - 默认导出格式为 PNG、JPEG 和 PDF，不提供 Draw.io 到 SVG 的转换。
-- 不调用 Draw.io Desktop，也不依赖 `rlespinasse/drawio-export`。
+- 不调用 Draw.io Desktop，也不依赖 `rlespinasse/drawio-export`；推荐运行时依赖官方 Compose 中的 `jgraph/drawio` 与 `jgraph/export-server`。
 - Skills 中的数据提取、Graphviz 自动布局等高级脚本是可选能力；只有使用这些脚本时才需要 Python 或相应第三方工具。
 - Bridge 仅监听本机回环地址，文件工具只允许访问当前工作区内的相对路径。
-- Docker Export Server、MobileWork 和 OpenCode 的安装与升级不由本工程管理。
+- 专家运行时不会管理 Docker、MobileWork 或 OpenWork 的安装、启动与升级。
 
 ## 开发约定
 
