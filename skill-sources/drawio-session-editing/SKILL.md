@@ -1,6 +1,6 @@
 ---
 name: drawio-session-editing
-description: 当用户需要在MobileWork内置浏览器中手动编辑Draw.io工作区文件，或Agent需要在人工编辑后继续修改时使用。负责读取最新会话revision、把用户保存版本作为新的修改基线、以乐观并发方式提交XML，并在revision_conflict时重新读取和重试，避免旧快照造成内容丢失。
+description: 当用户需要在MobileWork内置浏览器中手动编辑Draw.io工作区文件，或Agent需要在人工编辑后继续修改时使用。负责读取最新会话revision、把用户保存版本作为新的修改基线、以乐观并发方式提交XML，并在revision_conflict时重新读取和重试，避免旧快照造成内容丢失。同时覆盖框选注释任务流程：用户在内置浏览器框选图元并提交修改说明，每条注释形成包含稳定ID、页面、区域和说明的独立任务，Agent逐条处理并标记已解决。
 ---
 
 # Draw.io 会话同步与并发控制
@@ -36,5 +36,38 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 - `drawio_update_state(base_revision=..., xml=...)`：以乐观并发方式提交完整XML。
 - 这些工具根据运行时上下文识别session，不需要用户手动传入session ID。
 - 如果会话工具不可用，应明确说明无法提供冲突安全的浏览器编辑，不得假装当前画布已同步。
+
+## 注释任务（框选评审）
+
+用户在内置浏览器中框选一个或多个图元并填写修改说明后，每条注释是一条独立任务，记录选中图元的稳定 ID、页面、区域范围、修改说明和提交时的 revision。注释随文件持久化到 `<basename>.annotations.json`，重启后仍可恢复。
+
+### 每轮自动检查（重要）
+
+只要当前会话已通过 `drawio_open`/`drawio_finalize` 绑定了 `.drawio` 文件，**每一轮对话开始都必须先调用 `drawio_list_annotations(file, status="open")` 检查待处理注释**，再决定本轮动作。不要等用户说"处理注释"——用户提交注释后通常只会回到对话等结果。
+
+- 检查结果为空：按用户本轮意图正常处理（创建/修改/导出/无关问答等）。
+- 检查到待处理注释，且用户本轮未明确要求别的动作（例如新建图、导出、或对其它文件操作）：立即按"处理一条注释的标准闭环"逐条处理，全部处理完再回应本轮。
+- 检查到待处理注释，但用户本轮明确提了其他与注释无关的请求：先完成用户明确要求的动作，再处理注释，或在本轮回应里说明还有几条注释待处理。
+- 用户明确说"先不要动注释"或"这条注释我先看看"：尊重用户意愿，跳过或仅列出。
+
+该协议每轮都需要执行，包括用户只发"嗯"、"继续"、"好了吗"这类简短回复的轮次——只要会话还绑定着文件，就先 list 再回话。
+
+### 工具
+
+- `drawio_list_annotations(file, status="open")`：列出待处理注释。每轮第一句对话必调一次。`status` 可用 `"open"`、`"resolved"`、`"stale"`、`"all"`。
+- `drawio_get_annotation(id)`：取注释详情，含选中 id、region、过时标记和最新图元快照，省去重新解析 XML。
+- `drawio_resolve_annotation(id, summary, changed_ids?)`：标记已解决并记录 summary；只改任务状态，不改图。
+
+### 处理一条注释的标准闭环
+
+1. `drawio_get_annotation(id)` 取详情；
+2. `drawio_get_state` 取最新 XML 与 revision（注释里的 `baseRevision` 仅作过时提示，不能直接当 `base_revision`）；
+3. 用 `drawio_patch` 或 `drawio_update_state` 执行修改并携带上一步返回的 revision；
+4. `drawio_resolve_annotation(id, summary, changed_ids)`；
+5. `drawio_finalize` 刷新 PNG 与浏览器。
+
+一次只处理一条以避免 revision 冲突；处理完一条后回到第 1 步处理下一条。`stale` 注释表示提交后被改动，需在新基线上重新核对而非原样照做——仍按 `drawio_get_state` 取最新 revision 后再决定怎么改。
+
+用户也可以在浏览器注释面板手动标记已解决；agent 看到 `resolved` 的注释跳过即可，无需再次处理。
 
 诊断Bridge或实现宿主适配时读取[references/protocol.md](references/protocol.md)。需要理解基础XML模式时读取[references/xml-patterns.md](references/xml-patterns.md)；复杂绘图知识以`drawio-skill`为准。

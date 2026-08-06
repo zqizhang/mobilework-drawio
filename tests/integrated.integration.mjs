@@ -265,6 +265,100 @@ try {
   assert.equal(health.success, true)
   assert.equal(health.checks.deep_test.success, true)
 
+  const annotationsUrl = new URL(finalize.openUrl)
+  annotationsUrl.pathname = "/api/annotations"
+  const liveInspect = JSON.parse(await plugin.tool.drawio_inspect.execute({
+    file: "architecture.drawio",
+  }, context))
+  const pageId = liveInspect.pages[0].id
+  const pageName = liveInspect.pages[0].name
+  const submitted = await fetch(annotationsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "把该节点改名为 Draw.io 并标记处理完成",
+      pageId,
+      pageName,
+      cells: [{ id: "node", kind: "node", label: "Agent" }],
+    }),
+  }).then((response) => response.json())
+  assert.equal(submitted.ok, true)
+  assert.equal(submitted.annotation.status, "open")
+  assert.equal(submitted.annotation.cells.length, 1)
+  assert.ok(submitted.annotation.region)
+  assert.ok(submitted.annotation.region.width > 0)
+
+  const listResult = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
+    file: "architecture.drawio",
+    status: "open",
+  }, context))
+  assert.equal(listResult.count, 1)
+  assert.equal(listResult.annotations[0].id, submitted.annotation.id)
+
+  const detail = JSON.parse(await plugin.tool.drawio_get_annotation.execute({
+    id: submitted.annotation.id,
+  }, context))
+  assert.equal(detail.annotation.id, submitted.annotation.id)
+  assert.equal(Array.isArray(detail.cellSnapshots), true)
+  assert.equal(detail.cellSnapshots[0].id, "node")
+  assert.equal(detail.cellSnapshots[0].missing, undefined)
+
+  const beforePatch = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
+  const patchResult = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    operations: [{ type: "update-node", id: "node", label: "Draw.io" }],
+    dry_run: false,
+    base_revision: beforePatch.revision,
+  }, context))
+  assert.equal(patchResult.diff.summary.changed, 1)
+
+  const resolved = JSON.parse(await plugin.tool.drawio_resolve_annotation.execute({
+    id: submitted.annotation.id,
+    summary: "已将节点改名为 Draw.io",
+    changed_ids: ["node"],
+  }, context))
+  assert.equal(resolved.ok, true)
+  assert.equal(resolved.annotation.status, "resolved")
+  assert.equal(resolved.annotation.result.changedIds.join(","), "node")
+
+  const storedAnnotations = await fs.readFile(path.join(workspace, "architecture.annotations.json"), "utf8")
+  assert.match(storedAnnotations, /architecture\/|architecture\.drawio|"file":\s*"architecture.drawio"/)
+  assert.match(storedAnnotations, /已将节点改名为 Draw\.io/)
+
+  const openAfterResolve = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
+    file: "architecture.drawio",
+    status: "open",
+  }, context))
+  assert.equal(openAfterResolve.count, 0)
+
+  const staleAnn = await fetch(annotationsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "检查陈旧标记",
+      pageId,
+      pageName,
+      cells: [{ id: "node", kind: "node", label: "Draw.io" }],
+    }),
+  }).then((response) => response.json())
+  const staleRevision = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context)).revision
+  const externalChange = await fetch(apiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      xml: JSON.parse(await plugin.tool.drawio_get_state.execute({}, context)).xml.replace("Draw.io", "Draw.io Updated"),
+      baseRevision: staleRevision,
+      source: "editor",
+      clientId: "stale-test",
+    }),
+  })
+  assert.equal(externalChange.status, 200)
+  const staleDetail = JSON.parse(await plugin.tool.drawio_get_annotation.execute({
+    id: staleAnn.annotation.id,
+  }, context))
+  assert.equal(staleDetail.annotation.stale, true)
+  assert.match(staleDetail.annotation.staleReason, /changed/)
+
   console.log(JSON.stringify({
     ok: true,
     openUrl: true,
@@ -278,6 +372,10 @@ try {
     automaticPng: true,
     browserOpenUrl: true,
     exportOwnedByTypeScript: true,
+    annotationLifecycle: true,
+    annotationRegionComputation: true,
+    annotationPersistence: true,
+    annotationStalenessDetection: true,
   }, null, 2))
 } finally {
   const bridge = globalThis.__drawioIntegratedBridge

@@ -2311,6 +2311,45 @@ type IntegratedToken = {
   expiresAt: number
 }
 
+type AnnotationRegion = {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+type AnnotationCell = {
+  id: string
+  kind: "node" | "edge"
+  label: string
+  source?: string
+  target?: string
+}
+
+type AnnotationResult = {
+  summary: string
+  changedIds: string[]
+  revision: number
+  updatedAt: string
+} | null
+
+type AnnotationTask = {
+  id: string
+  sessionId: string
+  file: string
+  pageId: string
+  pageName: string
+  cells: AnnotationCell[]
+  region: AnnotationRegion | null
+  instruction: string
+  status: "open" | "resolved" | "stale"
+  baseRevision: number
+  result: AnnotationResult
+  createdAt: string
+  updatedAt: string
+  resolvedAt: string | null
+}
+
 type IntegratedBridgeState = {
   server: Server | null
   startPromise: Promise<{ host: string; port: number }> | null
@@ -2320,6 +2359,7 @@ type IntegratedBridgeState = {
   tokens: Map<string, IntegratedToken>
   eventClients: Map<string, Set<import("node:http").ServerResponse>>
   writeQueues: Map<string, Promise<unknown>>
+  annotations: Map<string, Map<string, AnnotationTask>>
 }
 
 const integratedBridgeGlobal = globalThis as typeof globalThis & {
@@ -2337,9 +2377,11 @@ function getIntegratedBridgeState(): IntegratedBridgeState {
       tokens: new Map(),
       eventClients: new Map(),
       writeQueues: new Map(),
+      annotations: new Map(),
     }
   }
   integratedBridgeGlobal.__drawioIntegratedBridge.writeQueues ||= new Map()
+  integratedBridgeGlobal.__drawioIntegratedBridge.annotations ||= new Map()
   return integratedBridgeGlobal.__drawioIntegratedBridge
 }
 
@@ -2540,6 +2582,232 @@ function broadcastIntegratedRevision(session: IntegratedSession, clientId: strin
   }
 }
 
+function annotationStorePath(session: IntegratedSession): string {
+  const base = session.file.replace(/\.(drawio|xml)$/i, "")
+  return `${base}.annotations.json`
+}
+
+function getSessionAnnotations(sessionId: string): Map<string, AnnotationTask> {
+  const state = getIntegratedBridgeState()
+  let map = state.annotations.get(sessionId)
+  if (!map) {
+    map = new Map()
+    state.annotations.set(sessionId, map)
+  }
+  return map
+}
+
+async function loadStoredAnnotations(session: IntegratedSession): Promise<void> {
+  if (session.workspace === undefined) return
+  const map = getSessionAnnotations(session.sessionId)
+  if (map.size > 0) return
+  let store: string
+  try {
+    store = await fs.readFile(annotationStorePath(session), "utf8")
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+    return
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(store)
+  } catch {
+    return
+  }
+  if (!Array.isArray(parsed)) return
+  for (const entry of parsed) {
+    if (!integratedRecord(entry) || typeof entry.id !== "string" || typeof entry.sessionId !== "string") continue
+    if (entry.sessionId !== session.sessionId) continue
+    const task = normalizeAnnotationTask(entry, session)
+    if (task) map.set(task.id, task)
+  }
+}
+
+async function persistStoredAnnotations(session: IntegratedSession): Promise<void> {
+  const map = getSessionAnnotations(session.sessionId)
+  const store = [...map.values()].map((task) => ({
+    id: task.id,
+    sessionId: task.sessionId,
+    file: task.file,
+    pageId: task.pageId,
+    pageName: task.pageName,
+    cells: task.cells,
+    region: task.region,
+    instruction: task.instruction,
+    status: task.status,
+    baseRevision: task.baseRevision,
+    result: task.result,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    resolvedAt: task.resolvedAt,
+  }))
+  const target = annotationStorePath(session)
+  const temporary = `${target}.${process.pid}.${Date.now()}.tmp`
+  await fs.writeFile(temporary, JSON.stringify(store, null, 2), "utf8")
+  await fs.rename(temporary, target)
+}
+
+function normalizeAnnotationTask(value: Record<string, unknown>, session: IntegratedSession): AnnotationTask | null {
+  const cells: AnnotationCell[] = Array.isArray(value.cells)
+    ? value.cells
+      .filter((cell): cell is Record<string, unknown> => integratedRecord(cell) && typeof cell.id === "string")
+      .map((cell) => ({
+        id: String(cell.id),
+        kind: cell.kind === "edge" ? "edge" : "node",
+        label: typeof cell.label === "string" ? cell.label : "",
+        source: typeof cell.source === "string" ? cell.source : undefined,
+        target: typeof cell.target === "string" ? cell.target : undefined,
+      }))
+    : []
+  const region = integratedRecord(value.region) && typeof value.region.x === "number"
+    ? {
+      x: Number(value.region.x),
+      y: Number(value.region.y),
+      width: Number(value.region.width),
+      height: Number(value.region.height),
+    }
+    : null
+  const status = value.status === "resolved" || value.status === "stale" ? value.status : "open"
+  return {
+    id: String(value.id),
+    sessionId: session.sessionId,
+    file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
+    pageId: typeof value.pageId === "string" ? String(value.pageId) : "",
+    pageName: typeof value.pageName === "string" ? String(value.pageName) : "",
+    cells,
+    region,
+    instruction: typeof value.instruction === "string" ? String(value.instruction) : "",
+    status,
+    baseRevision: Number.isInteger(value.baseRevision) ? Number(value.baseRevision) : 0,
+    result: integratedRecord(value.result) && typeof value.result.summary === "string"
+      ? {
+        summary: String(value.result.summary),
+        changedIds: Array.isArray(value.result.changedIds)
+          ? value.result.changedIds.map((id) => String(id))
+          : [],
+        revision: Number.isInteger(value.result.revision) ? Number(value.result.revision) : 0,
+        updatedAt: typeof value.result.updatedAt === "string" ? String(value.result.updatedAt) : "",
+      }
+      : null,
+    createdAt: typeof value.createdAt === "string" ? String(value.createdAt) : new Date().toISOString(),
+    updatedAt: typeof value.updatedAt === "string" ? String(value.updatedAt) : new Date().toISOString(),
+    resolvedAt: typeof value.resolvedAt === "string" ? String(value.resolvedAt) : null,
+  }
+}
+
+function annotationRegion(pages: ParsedPage[], pageId: string, cellIds: string[]): AnnotationRegion | null {
+  const page = pages.find((candidate) => candidate.id === pageId || !pageId)
+  if (!page) return null
+  const context = createGeometryContext(page.cells)
+  const verticesById = context.cellsById
+  let minX = Number.POSITIVE_INFINITY
+  let minY = Number.POSITIVE_INFINITY
+  let maxX = Number.NEGATIVE_INFINITY
+  let maxY = Number.NEGATIVE_INFINITY
+  let found = false
+  for (const id of cellIds) {
+    const cell = verticesById.get(id)
+    if (!cell) continue
+    let rectangle: Rectangle | null = null
+    if (cell.vertex) {
+      rectangle = vertexRectangle(cell, context)
+    } else if (cell.edge) {
+      const polyline = edgePolyline(cell, verticesById, context)
+      if (polyline && polyline.length > 0) {
+        let eMinX = Number.POSITIVE_INFINITY
+        let eMinY = Number.POSITIVE_INFINITY
+        let eMaxX = Number.NEGATIVE_INFINITY
+        let eMaxY = Number.NEGATIVE_INFINITY
+        for (const point of polyline) {
+          eMinX = Math.min(eMinX, point.x)
+          eMinY = Math.min(eMinY, point.y)
+          eMaxX = Math.max(eMaxX, point.x)
+          eMaxY = Math.max(eMaxY, point.y)
+        }
+        rectangle = { x: eMinX, y: eMinY, width: eMaxX - eMinX, height: eMaxY - eMinY }
+      }
+    }
+    if (!rectangle) continue
+    found = true
+    minX = Math.min(minX, rectangle.x)
+    minY = Math.min(minY, rectangle.y)
+    maxX = Math.max(maxX, rectangle.x + rectangle.width)
+    maxY = Math.max(maxY, rectangle.y + rectangle.height)
+  }
+  if (!found) return null
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY }
+}
+
+function annotationStaleState(
+  session: IntegratedSession,
+  task: AnnotationTask,
+): { stale: boolean; reason?: string } {
+  if (task.status === "resolved") return { stale: false }
+  if (task.baseRevision >= session.revision) return { stale: false }
+  if (task.cells.length === 0) return { stale: false }
+  const base = session.history.find((entry) => entry.revision === task.baseRevision)
+  if (!base) {
+    // base revision no longer in memory; verify cells still resolve on latest XML instead
+  }
+  try {
+    const beforePages = base ? parseDrawio(base.xml) : []
+    const afterPages = parseDrawio(session.xml)
+    const pageIdMatch = (page: ParsedPage) => page.id === task.pageId
+    const beforePage = beforePages.find(pageIdMatch)
+    const afterPage = afterPages.find(pageIdMatch)
+    if (!afterPage) {
+      return { stale: true, reason: `page "${task.pageName || task.pageId}" no longer exists in the latest revision` }
+    }
+    const beforeCells = beforePage ? new Map(beforePage.cells.map((cell) => [cell.id, cell])) : new Map()
+    const afterCells = new Map(afterPage.cells.map((cell) => [cell.id, cell]))
+    for (const selected of task.cells) {
+      const before = beforeCells.get(selected.id)
+      const after = afterCells.get(selected.id)
+      if (!after) {
+        return { stale: true, reason: `selected cell "${selected.id}" was deleted since the annotation was created` }
+      }
+      if (before && JSON.stringify(comparableCell(before)) !== JSON.stringify(comparableCell(after))) {
+        return { stale: true, reason: `selected cell "${selected.id}" changed since the annotation was created` }
+      }
+    }
+  } catch {
+    // geometry diff unavailable; fall back to revision-only staleness below
+  }
+  return { stale: false }
+}
+
+function annotationPayload(
+  session: IntegratedSession,
+  task: AnnotationTask,
+  stale: { stale: boolean; reason?: string } = { stale: false },
+) {
+  return {
+    id: task.id,
+    sessionId: task.sessionId,
+    file: task.file,
+    page: { id: task.pageId, name: task.pageName },
+    cells: task.cells,
+    region: task.region,
+    instruction: task.instruction,
+    status: stale.stale && task.status === "open" ? "stale" : task.status,
+    stale: stale.stale,
+    staleReason: stale.reason || null,
+    baseRevision: task.baseRevision,
+    currentRevision: session.revision,
+    result: task.result,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    resolvedAt: task.resolvedAt,
+  }
+}
+
+function broadcastAnnotation(session: IntegratedSession, task: AnnotationTask, kind: string): void {
+  const payload = `event: annotation\\ndata: ${JSON.stringify({ kind, annotation: annotationPayload(session, task) })}\\n\\n`
+  for (const response of getIntegratedBridgeState().eventClients.get(session.sessionId) || []) {
+    response.write(payload)
+  }
+}
+
 function buildIntegratedEditorPage(options: {
   session: IntegratedSession
   editorUrl: URL
@@ -2549,18 +2817,22 @@ function buildIntegratedEditorPage(options: {
   const apiUrl = new URL("/api/diagram", options.bridgeUrl)
   apiUrl.searchParams.set("sessionId", options.session.sessionId)
   apiUrl.searchParams.set("token", options.token)
-  const eventsUrl = new URL("/api/events", options.bridgeUrl)
+const eventsUrl = new URL("/api/events", options.bridgeUrl)
   eventsUrl.searchParams.set("sessionId", options.session.sessionId)
   eventsUrl.searchParams.set("token", options.token)
+  const annotationsUrl = new URL("/api/annotations", options.bridgeUrl)
+  annotationsUrl.searchParams.set("sessionId", options.session.sessionId)
+  annotationsUrl.searchParams.set("token", options.token)
   const config = safeScriptJson({
     file: path.relative(options.session.workspace, options.session.file).split(path.sep).join("/"),
     drawioUrl: options.editorUrl.toString(),
     drawioOrigin: options.editorUrl.origin,
     apiUrl: apiUrl.toString(),
     eventsUrl: eventsUrl.toString(),
+    annotationsUrl: annotationsUrl.toString(),
   })
 
-  return `<!doctype html>
+return `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -2569,15 +2841,99 @@ function buildIntegratedEditorPage(options: {
   <style>
     html, body, iframe { width: 100%; height: 100%; margin: 0; border: 0; overflow: hidden; }
     body { background: #f8fafc; font: 13px system-ui, sans-serif; }
-    #status { position: fixed; z-index: 2; left: 12px; bottom: 10px; padding: 6px 9px;
+    #status { position: fixed; z-index: 4; left: 12px; bottom: 10px; padding: 6px 9px;
       border-radius: 8px; background: rgba(15, 23, 42, .88); color: white; opacity: 0;
       pointer-events: none; transition: opacity .15s; }
     #status.visible { opacity: 1; }
+    #ann-btn { position: fixed; z-index: 3; right: 14px; bottom: 14px; display: flex;
+      align-items: center; gap: 6px; padding: 8px 12px; border: 1px solid #c8d0dc;
+      border-radius: 999px; background: #fff; color: #1f2937; cursor: pointer;
+      box-shadow: 0 2px 8px rgba(15,23,42,.12); }
+    #ann-btn:hover { background: #f1f5f9; }
+    #ann-btn .dot { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px;
+      background: #2563eb; color: #fff; font-size: 11px; font-weight: 600;
+      display: inline-flex; align-items: center; justify-content: center; }
+    #ann-btn .dot.zero { background: #cbd5e1; color: #475569; }
+    #ann-drawer { position: fixed; z-index: 5; top: 0; right: 0; height: 100%; width: 360px;
+      max-width: 90vw; transform: translateX(100%); transition: transform .2s ease;
+      background: #fff; border-left: 1px solid #e2e8f0; box-shadow: -4px 0 16px rgba(15,23,42,.08);
+      display: flex; flex-direction: column; }
+    #ann-drawer.open { transform: translateX(0); }
+    #ann-drawer header { display: flex; align-items: center; gap: 8px; padding: 12px 14px;
+      border-bottom: 1px solid #e2e8f0; }
+    #ann-drawer header strong { font-size: 14px; }
+    #ann-drawer header .spacer { flex: 1; }
+    #ann-drawer header button { border: 1px solid #c8d0dc; border-radius: 6px; background: #fff;
+      padding: 4px 8px; cursor: pointer; }
+    #ann-drawer .new-btn { border-color: #2563eb; background: #2563eb; color: #fff; }
+    #ann-list { flex: 1; overflow-y: auto; padding: 10px 14px; }
+    #ann-list .item { border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px;
+      margin-bottom: 10px; background: #fafbfc; }
+    #ann-list .item.resolved { opacity: .65; background: #f1f5f9; }
+    #ann-list .item .meta { display: flex; align-items: center; gap: 6px; font-size: 11px;
+      color: #64748b; margin-bottom: 6px; }
+    #ann-list .item .badge { padding: 1px 7px; border-radius: 999px; font-weight: 600; }
+    #ann-list .item .badge.open { background: #dbeafe; color: #1d4ed8; }
+    #ann-list .item .badge.stale { background: #fef3c7; color: #b45309; }
+    #ann-list .item .badge.resolved { background: #dcfce7; color: #15803d; }
+    #ann-list .item .instruction { color: #1f2937; white-space: pre-wrap; word-break: break-word; }
+    #ann-list .item .cells { font-size: 11px; color: #64748b; margin-top: 6px; }
+    #ann-list .item form { display: flex; gap: 6px; margin-top: 8px; }
+    #ann-list .item form input { flex: 1; }
+    #ann-none { color: #94a3b8; text-align: center; padding: 24px 8px; }
+    #ann-form { display: none; flex: 1; flex-direction: column; }
+    #ann-form.visible { display: flex; }
+    #ann-form .field { padding: 10px 14px; }
+    #ann-form .selection { font-size: 12px; color: #475569; background: #f1f5f9;
+      border-radius: 6px; padding: 8px 10px; margin: 0 14px; }
+    #ann-form textarea { width: 100%; min-height: 96px; resize: vertical; font: inherit;
+      padding: 8px; border: 1px solid #cbd5e1; border-radius: 6px; }
+    #ann-form .actions { display: flex; gap: 8px; justify-content: flex-end; padding: 12px 14px;
+      border-top: 1px solid #e2e8f0; }
+    #ann-form .actions button { border: 1px solid #c8d0dc; border-radius: 6px; background: #fff;
+      padding: 6px 12px; cursor: pointer; }
+    #ann-form .actions .primary { border-color: #2563eb; background: #2563eb; color: #fff; }
+    #ann-form .actions .primary:disabled { opacity: .5; cursor: not-allowed; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #0f172a; }
+      #ann-btn, #ann-drawer { background: #1e293b; color: #e2e8f0; border-color: #334155; }
+      #ann-btn:hover, #ann-drawer header button { background: #243049; }
+      #ann-list .item { background: #243049; border-color: #334155; }
+      #ann-list .item .instruction { color: #e2e8f0; }
+      #ann-list .item .meta, #ann-list .item .cells { color: #94a3b8; }
+      #ann-form textarea { background: #0f172a; color: #e2e8f0; border-color: #334155; }
+      #ann-form .selection { background: #243049; color: #cbd5e1; }
+      #ann-none { color: #475569; }
+    }
   </style>
 </head>
 <body>
   <iframe id="editor" title="Draw.io editor"></iframe>
   <div id="status" role="status"></div>
+  <button id="ann-btn" type="button" title="注释与修改任务">
+    <span>注释</span><span class="dot zero" id="ann-count">0</span>
+  </button>
+  <div id="ann-drawer" aria-hidden="true">
+    <header>
+      <strong>注释任务</strong>
+      <span class="spacer"></span>
+      <button type="button" class="new-btn" id="ann-new">＋ 添加注释</button>
+      <button type="button" id="ann-close">关闭</button>
+    </header>
+    <div id="ann-list"></div>
+    <div id="ann-form">
+      <div class="field">
+        <div class="selection" id="ann-selection">正在获取选中内容…</div>
+      </div>
+      <div class="field">
+        <textarea id="ann-instruction" placeholder="修改说明：描述这里要怎么改（例如：把该节点改名为 Redis 缓存层，并增加一条从应用到此的连线）"></textarea>
+      </div>
+      <div class="actions">
+        <button type="button" id="ann-cancel">取消</button>
+        <button type="button" class="primary" id="ann-submit" disabled>提交注释</button>
+      </div>
+    </div>
+  </div>
   <script>
     (() => {
       const CONFIG = ${config};
@@ -2587,6 +2943,17 @@ function buildIntegratedEditorPage(options: {
       let current = null;
       let saveChain = Promise.resolve();
       let externalTimer = null;
+      let pendingSelection = null;
+      let awaitingSelection = false;
+
+      const annBtn = document.getElementById("ann-btn");
+      const annCount = document.getElementById("ann-count");
+      const annDrawer = document.getElementById("ann-drawer");
+      const annList = document.getElementById("ann-list");
+      const annForm = document.getElementById("ann-form");
+      const annSelection = document.getElementById("ann-selection");
+      const annInstruction = document.getElementById("ann-instruction");
+      const annSubmit = document.getElementById("ann-submit");
 
       function showStatus(message, duration = 2400) {
         status.textContent = message;
@@ -2636,7 +3003,167 @@ function buildIntegratedEditorPage(options: {
         current = latest;
         sendEditor({ action: "load", xml: latest.xml, autosave: 1, diffSync: true, title: CONFIG.file });
         showStatus("Agent 更新已加载 · revision " + latest.revision);
+        void refreshAnnotations();
       }
+
+      function openDrawer() {
+        annDrawer.classList.add("open");
+        annDrawer.setAttribute("aria-hidden", "false");
+        void refreshAnnotations();
+      }
+
+      function closeDrawer() {
+        annDrawer.classList.remove("open");
+        annDrawer.setAttribute("aria-hidden", "true");
+        cancelAnnotationForm();
+      }
+
+      function startAnnotation() {
+        awaitingSelection = true;
+        pendingSelection = null;
+        annForm.classList.add("visible");
+        annList.style.display = "none";
+        annSelection.textContent = "正在获取选中内容…";
+        annInstruction.value = "";
+        annSubmit.disabled = true;
+        annInstruction.focus();
+        sendEditor({ action: "export", format: "json", selection: true, currentPage: true, allPages: false });
+      }
+
+      function cancelAnnotationForm() {
+        awaitingSelection = false;
+        pendingSelection = null;
+        annForm.classList.remove("visible");
+        annList.style.display = "";
+      }
+
+      function applySelectionExport(data) {
+        if (!awaitingSelection) return;
+        awaitingSelection = false;
+        const page = data && data.pages && data.pages[0] ? data.pages[0] : null;
+        const cells = page && Array.isArray(page.cells)
+          ? page.cells.filter((cell) => cell.type === "node" || cell.type === "edge")
+          : [];
+        if (!page || cells.length === 0) {
+          pendingSelection = null;
+          annSelection.textContent = "未选中任何图元。请在画布上框选一个或多个节点或连线后再添加注释。";
+          annSubmit.disabled = true;
+          return;
+        }
+        pendingSelection = {
+          pageId: page.id || "",
+          pageName: page.name || "",
+          cells: cells.map((cell) => ({
+            id: cell.id,
+            kind: cell.type === "edge" ? "edge" : "node",
+            label: cell.label || "",
+            source: cell.source,
+            target: cell.target,
+          })),
+        };
+        const labels = pendingSelection.cells
+          .map((cell) => cell.label || cell.id)
+          .slice(0, 5)
+          .join("、");
+        const extra = pendingSelection.cells.length > 5 ? " 等" : "";
+        annSelection.textContent = "已选中 " + pendingSelection.cells.length + " 个图元：" + labels + extra;
+        annSubmit.disabled = false;
+      }
+
+      async function submitAnnotation() {
+        if (!pendingSelection) return;
+        const instruction = annInstruction.value.trim();
+        if (!instruction) { annInstruction.focus(); return; }
+        annSubmit.disabled = true;
+        try {
+          const response = await fetch(CONFIG.annotationsUrl, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ instruction, pageId: pendingSelection.pageId, pageName: pendingSelection.pageName, cells: pendingSelection.cells }),
+          });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || "提交注释失败");
+          showStatus("注释已提交", 1800);
+          cancelAnnotationForm();
+          await refreshAnnotations();
+        } catch (error) {
+          showStatus(error.message || "提交注释失败", 5000);
+          annSubmit.disabled = false;
+        }
+      }
+
+      async function resolveAnnotation(id, button) {
+        if (button) button.disabled = true;
+        try {
+          const response = await fetch(CONFIG.annotationsUrl + "/" + encodeURIComponent(id), {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ status: "resolved", summary: "已由用户标记为已解决" }),
+          });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || "标记已解决失败");
+          await refreshAnnotations();
+        } catch (error) {
+          showStatus(error.message || "标记已解决失败", 5000);
+          if (button) button.disabled = false;
+        }
+      }
+
+      async function refreshAnnotations() {
+        try {
+          const response = await fetch(CONFIG.annotationsUrl, { cache: "no-store" });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || "读取注释失败");
+          renderAnnotations(result.annotations || []);
+        } catch (error) {
+          showStatus(error.message || "读取注释失败", 5000);
+        }
+      }
+
+      function renderAnnotations(annotations) {
+        const open = annotations.filter((task) => task.status !== "resolved");
+        annCount.textContent = String(open.length);
+        annCount.classList.toggle("zero", open.length === 0);
+        if (annotations.length === 0) {
+          annList.innerHTML = '<div id="ann-none">还没有注释。框选图元后点击“添加注释”，标注你要让 Agent 修改的地方。</div>';
+          return;
+        }
+        const escape = (value) => String(value).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+        annList.innerHTML = annotations.map((task) => {
+          const status = task.stale ? "stale" : task.status;
+          const cells = (task.cells || []).map((cell) => escape(cell.label || cell.id)).join("、");
+          const region = task.region
+            ? "区域 x=" + Math.round(task.region.x) + " y=" + Math.round(task.region.y)
+              + " w=" + Math.round(task.region.width) + " h=" + Math.round(task.region.height)
+            : "";
+          const result = task.result
+            ? '<div style="margin-top:6px;font-size:11px;color:#64748b">已处理：' + escape(task.result.summary || "") + "（revision " + task.result.revision + "）</div>"
+            : "";
+          const resolveBtn = task.status !== "resolved"
+            ? '<form><button type="button" data-resolve="' + escape(task.id) + '">标记已解决</button></form>'
+            : "";
+          return '<div class="item ' + task.status + '">'
+            + '<div class="meta"><span class="badge ' + status + '">' + ({ open: "待处理", stale: "已过时", resolved: "已解决" }[status] || status) + '</span>'
+            + '<span>页面 ' + escape(task.page.name || task.page.id) + '</span>'
+            + '<span>rev ' + task.baseRevision + '→' + task.currentRevision + '</span></div>'
+            + '<div class="instruction">' + escape(task.instruction) + '</div>'
+            + '<div class="cells">图元：' + (cells || "（无）") + (region ? " · " + region : "") + '</div>'
+            + (task.staleReason ? '<div style="margin-top:4px;font-size:11px;color:#b45309">⚠ ' + escape(task.staleReason) + '</div>' : "")
+            + result + resolveBtn + '</div>';
+        }).join("");
+      }
+
+      annBtn.addEventListener("click", openDrawer);
+      document.getElementById("ann-close").addEventListener("click", closeDrawer);
+      document.getElementById("ann-new").addEventListener("click", startAnnotation);
+      document.getElementById("ann-cancel").addEventListener("click", cancelAnnotationForm);
+      annSubmit.addEventListener("click", submitAnnotation);
+      annList.addEventListener("click", (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        const id = target.getAttribute("data-resolve");
+        if (id) void resolveAnnotation(id, target);
+      });
 
       editor.src = CONFIG.drawioUrl;
       window.addEventListener("message", async event => {
@@ -2650,7 +3177,10 @@ function buildIntegratedEditorPage(options: {
           try {
             current = await readLatest();
             sendEditor({ action: "load", xml: current.xml, autosave: 1, diffSync: true, title: CONFIG.file });
+            void refreshAnnotations();
           } catch (error) { showStatus(error.message || "读取失败", 5000); }
+        } else if (message.event === "export" && message.format === "json" && awaitingSelection) {
+          applySelectionExport(message.data);
         } else if ((message.event === "autosave" || message.event === "save") && typeof message.xml === "string") {
           queueSave(message.xml);
         }
@@ -2662,6 +3192,9 @@ function buildIntegratedEditorPage(options: {
         if (update.clientId === clientId) return;
         clearTimeout(externalTimer);
         externalTimer = setTimeout(() => void applyExternalRevision(update.revision), 250);
+      });
+      events.addEventListener("annotation", () => {
+        void refreshAnnotations();
       });
       events.onerror = () => showStatus("正在重连图表同步服务…", 5000);
     })();
@@ -2769,10 +3302,152 @@ async function handleIntegratedBridgeRequest(
     response.write(": connected\\n\\n")
     const clients = state.eventClients.get(session.sessionId) || new Set()
     clients.add(response)
-    state.eventClients.set(session.sessionId, clients)
+state.eventClients.set(session.sessionId, clients)
     request.on("close", () => {
       clients.delete(response)
       if (clients.size === 0) state.eventClients.delete(session.sessionId)
+    })
+    return
+  }
+
+  const annotationIdMatch = requestUrl.pathname.match(/^\/api\/annotations\/([^/]+)$/)
+  const annotationId = annotationIdMatch ? decodeURIComponent(annotationIdMatch[1]) : null
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/annotations") {
+    const map = getSessionAnnotations(session.sessionId)
+    const statusFilter = requestUrl.searchParams.get("status")
+    const list = [...map.values()]
+      .filter((task) => !statusFilter || statusFilter === "all" || task.status === statusFilter)
+      .map((task) => annotationPayload(session, task, annotationStaleState(session, task)))
+    integratedJsonResponse(response, 200, {
+      ok: true,
+      sessionId: session.sessionId,
+      file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
+      count: list.length,
+      annotations: list,
+    })
+    return
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/annotations") {
+    let body: Record<string, unknown>
+    try {
+      body = await integratedRequestJson(request)
+    } catch (error) {
+      integratedJsonResponse(response, 400, { ok: false, error: (error as Error).message })
+      return
+    }
+    const instruction = typeof body.instruction === "string" ? body.instruction.trim() : ""
+    if (!instruction) {
+      integratedJsonResponse(response, 400, { ok: false, error: "instruction must not be empty" })
+      return
+    }
+    const pageId = typeof body.pageId === "string" ? body.pageId : ""
+    const cells = Array.isArray(body.cells)
+      ? body.cells
+        .filter((cell): cell is Record<string, unknown> => integratedRecord(cell) && typeof cell.id === "string")
+        .map((cell) => ({
+          id: String(cell.id),
+          kind: cell.kind === "edge" ? ("edge" as const) : ("node" as const),
+          label: typeof cell.label === "string" ? cell.label : "",
+          source: typeof cell.source === "string" ? cell.source : undefined,
+          target: typeof cell.target === "string" ? cell.target : undefined,
+        }))
+      : []
+    if (cells.length === 0) {
+      integratedJsonResponse(response, 400, { ok: false, error: "select at least one cell before adding an annotation" })
+      return
+    }
+    await refreshIntegratedSession(session)
+    const pages = parseDrawio(session.xml)
+    const pageName = typeof body.pageName === "string" ? body.pageName
+      : pages.find((page) => page.id === pageId)?.name || ""
+    const region = annotationRegion(pages, pageId, cells.map((cell) => cell.id))
+    const now = new Date().toISOString()
+    const id = `ant_${randomBytes(6).toString("base64url")}`
+    const task: AnnotationTask = {
+      id,
+      sessionId: session.sessionId,
+      file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
+      pageId,
+      pageName,
+      cells,
+      region,
+      instruction,
+      status: "open",
+      baseRevision: session.revision,
+      result: null,
+      createdAt: now,
+      updatedAt: now,
+      resolvedAt: null,
+    }
+    const map = getSessionAnnotations(session.sessionId)
+    map.set(id, task)
+    await persistStoredAnnotations(session)
+    broadcastAnnotation(session, task, "created")
+    integratedJsonResponse(response, 201, {
+      ok: true,
+      annotation: annotationPayload(session, task),
+    })
+    return
+  }
+
+  if (annotationId && request.method === "GET") {
+    const map = getSessionAnnotations(session.sessionId)
+    const task = map.get(annotationId)
+    if (!task) {
+      integratedJsonResponse(response, 404, { ok: false, error: "annotation not found" })
+      return
+    }
+    integratedJsonResponse(response, 200, {
+      ok: true,
+      annotation: annotationPayload(session, task, annotationStaleState(session, task)),
+    })
+    return
+  }
+
+  if (annotationId && (request.method === "PATCH" || request.method === "PUT")) {
+    const map = getSessionAnnotations(session.sessionId)
+    const task = map.get(annotationId)
+    if (!task) {
+      integratedJsonResponse(response, 404, { ok: false, error: "annotation not found" })
+      return
+    }
+    let body: Record<string, unknown>
+    try {
+      body = await integratedRequestJson(request)
+    } catch (error) {
+      integratedJsonResponse(response, 400, { ok: false, error: (error as Error).message })
+      return
+    }
+    const requestedStatus = typeof body.status === "string" ? body.status : ""
+    if (requestedStatus === "resolved") {
+      const summary = typeof body.summary === "string" ? body.summary.trim() : ""
+      const changedIds = Array.isArray(body.changedIds)
+        ? body.changedIds.map((value) => String(value))
+        : []
+      task.status = "resolved"
+      task.result = {
+        summary: summary || "resolved",
+        changedIds,
+        revision: session.revision,
+        updatedAt: new Date().toISOString(),
+      }
+      task.resolvedAt = task.result.updatedAt
+    } else if (requestedStatus === "open" || requestedStatus === "stale") {
+      task.status = requestedStatus
+      if (requestedStatus === "open") {
+        task.result = null
+        task.resolvedAt = null
+      }
+    }
+    task.updatedAt = new Date().toISOString()
+    map.set(id, task)
+    await persistStoredAnnotations(session)
+    broadcastAnnotation(session, task, "updated")
+    integratedJsonResponse(response, 200, {
+      ok: true,
+      annotation: annotationPayload(session, task),
     })
     return
   }
@@ -2857,7 +3532,8 @@ async function bindIntegratedSession(
       }],
       backupFile: null,
     }
-  state.sessions.set(context.sessionID, session)
+state.sessions.set(context.sessionID, session)
+  await loadStoredAnnotations(session)
   const bridge = await ensureIntegratedBridgeStarted()
   const token = randomBytes(24).toString("base64url")
   state.tokens.set(token, {
@@ -2915,7 +3591,12 @@ const DRAWIO_RUNTIME_GUIDANCE = `## Draw.io 文件写入与交付
 每次修改前必须立即调用 drawio_get_state，并把返回的最新 XML 作为修改基线。人工编辑不是只读内容，可以按当前任务要求继续调整。
 提交时必须携带该次读取返回的准确 base_revision；revision_conflict 后重新读取，在新 XML 上重新执行所需变更并重试，禁止重发旧 XML。
 禁止用普通 write、edit 或脚本直接覆盖已绑定的 .drawio 文件，因为这会绕过 revision 检查并可能用旧快照丢失最新内容。
-每次创建或修改成功后必须调用 drawio_finalize：校验、评分、自动导出同名 PNG，并将 openUrl 交给 MobileWork 现有 browser.open_url 打开。完成浏览器调用前不要结束任务。`
+每次创建或修改成功后必须调用 drawio_finalize：校验、评分、自动导出同名 PNG，并将 openUrl 交给 MobileWork 现有 browser.open_url 打开。完成浏览器调用前不要结束任务。
+
+## 注释任务（框选评审）
+
+用户在内置浏览器中框选图元并提交注释后，每条注释是一条独立任务，记录选中图元的稳定 ID、页面、区域范围、修改说明和提交时的 revision。
+注释任务的检查与处理流程由 drawio-session-editing 技能负责编排，详见该 SKILL.md。`
 
 function candidateDrawioPath(args: unknown): string | null {
   if (!args || typeof args !== "object" || Array.isArray(args)) return null
@@ -2932,7 +3613,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
   await loadWorkspaceEnvironment(input.directory)
 
   return {
-  "experimental.chat.system.transform": async (_input, output) => {
+"experimental.chat.system.transform": async (_input, output) => {
     output.system.push(DRAWIO_RUNTIME_GUIDANCE)
   },
   "tool.execute.before": async (input, output) => {
@@ -3577,6 +4258,131 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           browserAction: "Immediately call MobileWork's existing browser.open_url with openUrl before ending the task.",
           saveMode: "workspace-file",
           tokenExpiresAt: new Date(Date.now() + BRIDGE_TOKEN_TTL_MS).toISOString(),
+        }, null, 2)
+},
+    }),
+
+    drawio_list_annotations: tool({
+      description:
+        "List annotation (review comment) tasks for a opened Draw.io file. Each annotation is an independent task containing the selected stable cell ids, page, region, instruction and status.",
+      args: {
+        file: tool.schema.string().describe("Workspace-relative .drawio or .xml file bound to the session"),
+        status: tool.schema
+          .enum(["open", "resolved", "stale", "all"])
+          .default("open")
+          .describe("Filter by status; open returns pending tasks Agent should process"),
+      },
+      async execute(args, context) {
+        const target = resolveWorkspacePath(context, args.file)
+        const session = integratedSessionFor(context, target)
+        if (!session) throw new Error("No active Draw.io session for this file. Call drawio_open first.")
+        await refreshIntegratedSession(session)
+        const map = getSessionAnnotations(session.sessionId)
+        const list = [...map.values()]
+          .map((task) => ({ task, stale: annotationStaleState(session, task) }))
+          .filter((entry) => {
+            const effective = entry.stale.stale && entry.task.status === "open" ? "stale" : entry.task.status
+            if (args.status === "all") return true
+            return effective === args.status
+          })
+          .map((entry) => annotationPayload(session, entry.task, entry.stale))
+        return JSON.stringify({
+          file: workspaceRelative(context, target).split(path.sep).join("/"),
+          sessionId: session.sessionId,
+          currentRevision: session.revision,
+          count: list.length,
+          annotations: list,
+          guidance: "Open ones are independent tasks. For each: call drawio_get_annotation, then drawio_get_state, perform the change with drawio_patch/drawio_update_state, then drawio_resolve_annotation. Prefer one annotation at a time to avoid revision conflicts.",
+        }, null, 2)
+      },
+    }),
+
+    drawio_get_annotation: tool({
+      description:
+        "Read one annotation task in full, including the selected stable cell ids, region, instruction, base revision, staleness and a per-cell snapshot from the latest revision so the Agent can act without re-parsing the XML.",
+      args: {
+        id: tool.schema.string().describe("Annotation id returned by drawio_list_annotations"),
+      },
+      async execute(args, context) {
+        const session = getIntegratedBridgeState().sessions.get(context.sessionID)
+        if (!session) throw new Error("No active Draw.io session. Call drawio_open first.")
+        await refreshIntegratedSession(session)
+        const map = getSessionAnnotations(session.sessionId)
+        const task = map.get(args.id)
+        if (!task) throw new Error(`annotation not found: ${args.id}`)
+        const stale = annotationStaleState(session, task)
+        const payload = annotationPayload(session, task, stale)
+        let snapshots: Array<Record<string, unknown>> = []
+        try {
+          const pages = parseDrawio(session.xml)
+          const page = pages.find((candidate) => candidate.id === task.pageId) || pages[0]
+          if (page) {
+            const byId = new Map(page.cells.map((cell) => [cell.id, cell]))
+            snapshots = task.cells.map((selected) => {
+              const cell = byId.get(selected.id)
+              if (!cell) return { id: selected.id, missing: true }
+              const rectangle = cell.vertex ? vertexRectangle(cell, createGeometryContext(page.cells)) : null
+              return {
+                id: cell.id,
+                kind: cell.edge ? "edge" : "node",
+                label: cell.label || "",
+                style: cell.style || "",
+                source: cell.source,
+                target: cell.target,
+                geometry: rectangle || null,
+                parent: cell.parent,
+              }
+            })
+          }
+        } catch {
+          // snapshot is best-effort; the core payload still carries ids and instruction
+        }
+        return JSON.stringify({
+          annotation: payload,
+          cellSnapshots: snapshots,
+          guidance: stale.stale
+            ? "This annotation is stale: the diagram changed after it was created. Re-read the selection with drawio_get_state and adapt the change to the latest revision before writing."
+            : "Call drawio_get_state next, then apply the change with drawio_patch or drawio_update_state using the exact base_revision returned by get_state, then call drawio_resolve_annotation.",
+        }, null, 2)
+      },
+    }),
+
+    drawio_resolve_annotation: tool({
+      description:
+        "Mark an annotation task as resolved after the requested change has been written (or after deciding no change is needed). This updates status and stores a summary; it does not modify the diagram itself.",
+      args: {
+        id: tool.schema.string().describe("Annotation id to resolve"),
+        summary: tool.schema
+          .string()
+          .describe("Short description of what was changed or why the annotation needs no change"),
+        changed_ids: tool.schema
+          .array(tool.schema.string())
+          .optional()
+          .describe("Stable cell ids that were added, removed or modified for this annotation"),
+      },
+      async execute(args, context) {
+        const session = getIntegratedBridgeState().sessions.get(context.sessionID)
+        if (!session) throw new Error("No active Draw.io session. Call drawio_open first.")
+        await refreshIntegratedSession(session)
+        const map = getSessionAnnotations(session.sessionId)
+        const task = map.get(args.id)
+        if (!task) throw new Error(`annotation not found: ${args.id}`)
+        const now = new Date().toISOString()
+        task.status = "resolved"
+        task.result = {
+          summary: args.summary,
+          changedIds: args.changed_ids || [],
+          revision: session.revision,
+          updatedAt: now,
+        }
+        task.resolvedAt = now
+        task.updatedAt = now
+        map.set(task.id, task)
+        await persistStoredAnnotations(session)
+        broadcastAnnotation(session, task, "updated")
+        return JSON.stringify({
+          ok: true,
+          annotation: annotationPayload(session, task),
         }, null, 2)
       },
     }),

@@ -44,7 +44,54 @@ as a required read-merge-retry operation, not as a transient network retry.
 ## Events and editor
 
 - `GET /api/events?sessionId=...` is a server-sent event stream.
+  - `event: diagram` — revision updates (see Update).
+  - `event: annotation` — annotation task lifecycle (`created`/`updated`), with the full annotation payload.
 - `GET /editor?sessionId=...&token=...` serves the embedded Draw.io wrapper.
-- The wrapper uses the official Draw.io JSON embed protocol.
+- The wrapper uses the official Draw.io JSON embed protocol. The wrapper adds an
+  "添加注释" button that requests `{action:'export', format:'json', selection:true,
+  currentPage:true, allPages:false}` from the editor, then posts the selected
+  cells (stable ids) plus the user's instruction to the annotation endpoints below.
 - The bridge binds only to loopback and requires the short-lived token returned
   by `drawio_open`.
+
+## Annotations (review comments)
+
+A new annotation is a single independent task tied to the bound session/file. It
+records the selected stable cell ids, the page, the union bounding box (region,
+computed by the bridge from the latest XML), the instruction and the revision at
+submit time. Tasks persist to `<basename>.annotations.json` next to the diagram.
+
+```http
+GET /api/annotations?sessionId=...&status=open
+```
+
+Returns `{ ok, sessionId, file, count, annotations: [...] }`. `status` may be
+`open` (default), `resolved`, `stale` or `all`.
+
+```http
+POST /api/annotations?sessionId=...
+Content-Type: application/json
+
+{
+  "instruction": "把该节点改名为 Redis 缓存层",
+  "pageId": "p1",
+  "pageName": "Page-1",
+  "cells": [{ "id": "node", "kind": "node", "label": "MobileWork" }]
+}
+```
+
+Returns `201` with `{ ok, annotation }`. The `region` and `baseRevision` are
+filled in by the bridge.
+
+```http
+GET /api/annotations/{id}?sessionId=...
+PATCH /api/annotations/{id}?sessionId=...
+Content-Type: application/json
+
+{ "status": "resolved", "summary": "改名并新增连线", "changedIds": ["node", "edge-2"] }
+```
+
+`PATCH` accepts `status` of `resolved`, `open` (reopen) or `stale`. Resolving
+records `summary`, `changedIds`, `revision` and `updatedAt` in `result` without
+modifying the diagram — diagram changes go through the revision protocol above.
+Both Agent tools (`drawio_resolve_annotation`) and the wrapper UI can resolve.
