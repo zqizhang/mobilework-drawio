@@ -66,7 +66,11 @@ GET /api/annotations?sessionId=...&status=open
 ```
 
 Returns `{ ok, sessionId, file, count, annotations: [...] }`. `status` may be
-`open` (default), `resolved`, `stale` or `all`.
+`open` (all unfinished tasks, including stale ones), `resolved`, `stale`
+(unfinished tasks whose selected cells changed) or `all`. Annotation payloads
+keep lifecycle `status` as `open`/`resolved` and expose `freshness` as
+`fresh`/`stale`; stale open tasks also set `requiresConfirmation=true` and must
+be confirmed by the user before execution.
 
 ```http
 POST /api/annotations?sessionId=...
@@ -91,7 +95,9 @@ Content-Type: application/json
 { "status": "resolved", "summary": "改名并新增连线", "changedIds": ["node", "edge-2"] }
 ```
 
-`PATCH` accepts `status` of `resolved`, `open` (reopen) or `stale`. Resolving
+`PATCH` accepts `status` of `resolved`, `open` (reopen) or legacy `stale`.
+Regardless of stored legacy state, API payloads expose stale unfinished tasks as
+`status=open, freshness=stale`. Resolving
 records `summary`, `changedIds`, `revision` and `updatedAt` in `result` without
 modifying the diagram — diagram changes go through the revision protocol above.
 Both Agent tools (`drawio_resolve_annotation`) and the wrapper UI can resolve.

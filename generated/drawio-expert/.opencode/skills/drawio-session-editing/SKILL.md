@@ -1,6 +1,6 @@
 ---
 name: drawio-session-editing
-description: 当用户需要在MobileWork内置浏览器中手动编辑Draw.io工作区文件，或Agent需要在人工编辑后继续修改时使用。负责读取最新会话revision、把用户保存版本作为新的修改基线、以乐观并发方式提交XML，并在revision_conflict时重新读取和重试，避免旧快照造成内容丢失。同时覆盖框选注释任务流程：用户在内置浏览器框选图元并提交修改说明，每条注释形成包含稳定ID、页面、区域和说明的独立任务；每轮对话需同时探测"手动编辑"和"待处理注释"两种用户意图，合并为同一基线后再决定是否自动处理，user手调过画布时必须先确认再改动，避免与用户中间状态冲突。
+description: 当用户需要在MobileWork内置浏览器中手动编辑Draw.io工作区文件，或Agent需要在人工编辑后继续修改时使用。负责读取最新会话revision、把用户保存版本作为新的修改基线、以乐观并发方式提交XML，并在revision_conflict时重新读取和重试，避免旧快照造成内容丢失。同时覆盖框选注释任务流程：用户在内置浏览器框选图元并提交修改说明，每条注释形成包含稳定ID、页面、区域和说明的独立任务；每轮对话需同时探测"手动编辑"和"待处理注释"两种用户意图。仅当注释为freshness=stale/requiresConfirmation=true时先确认；未更改图元上的fresh注释直接基于最新版本处理。
 ---
 
 # Draw.io 会话同步与并发控制
@@ -39,7 +39,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 
 ## 注释任务（框选评审）
 
-用户在内置浏览器中框选一个或多个图元并填写修改说明后，每条注释是一条独立任务，记录选中图元的稳定 ID、页面、区域范围、修改说明和提交时的 revision。注释随文件持久化到 `<basename>.annotations.json`，重启后仍可恢复。
+用户在内置浏览器中框选一个或多个图元并填写修改说明后，每条注释是一条独立任务，记录选中图元的稳定 ID、页面、区域范围、修改说明和提交时的 revision。注释随文件持久化到 `<basename>.annotations.json`，重启后仍可恢复。任务生命周期只有“待处理（open）”和“已完成（resolved）”；`freshness=stale` 只表示选中图元在提交后发生变化，任务仍然 open，不能跳过或视为失效，但执行前必须得到用户确认。
 
 ### 每轮同时关注注释与手动编辑（重要）
 
@@ -50,19 +50,32 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 
 两者都是用户意图，必须合起来看，不能只看注释。探测后按下表决定本轮动作：
 
-| 注释 | `updatedBy` | 本轮动作 |
+| 注释情况 | `updatedBy` | 本轮动作 |
 |---|---|---|
 | 无 | 任意 | 按用户本轮意图正常处理（无关问答/创建/导出等）。 |
-| 有 | `agent`/`initial` | 用户没手调、意图明确交给 agent：立即按"处理一条注释的标准闭环"逐条处理，全部处理完再回话。 |
-| 有 | `editor`/`external` | 用户手动改过画布。**先 `drawio_get_state(since_revision=注释的 baseRevision)` 拿手动编辑的 diff**，在回话里同时说出：手动改了哪些（diff 摘要）+ 还有多少条注释待处理；并问"要我基于你当前画布处理这些注释吗？"。**得到用户确认后才开始 patch**，不要擅自下手。看到 stale 注释同样先确认。 |
-| 用户本轮明确提了其它动作 | 任意 | 先做用户明确要的，注释放到之后或在本轮回话里提示还有几条待处理。 |
+| 有，且 `requiresConfirmation=false` | 任意 | 图元自注释提交后未变化。即使 `updatedBy=editor/external`，也直接在最新 XML/revision 上按“处理一条注释的标准闭环”逐条处理，不额外询问。 |
+| 有，且至少一条 `requiresConfirmation=true` | 任意 | 这些 stale 注释仍然 open，但执行前先询问用户。若 `updatedBy=editor/external`，可先用 `drawio_get_state(since_revision=注释的 baseRevision)` 摘要说明变化；得到确认后再基于最新版本处理。fresh 注释不受影响，可直接处理。 |
+| 用户本轮明确提了其它动作 | 任意 | 先做用户明确要的；完成后必须在同一轮重新调用 `drawio_list_annotations(status="open")` 和 `drawio_get_state`。重新计算后，fresh 注释继续自动处理，stale 注释才询问。除非用户明确要求暂不处理，否则不得仅提示还有 fresh 注释便结束。 |
 | 用户明确说"先不动注释 / 我先看看" | 任意 | 尊重意愿，跳过或仅列出。 |
 
-关键点是手动编辑和注释可能同时存在（用户一边挪节点一边框选另一批提交注释），agent 必须先把两者都摸清楚再行动。该协议每轮都要执行，包括用户只发"嗯"、"继续"、"好了吗"这类简短回复的轮次——只要会话还绑定着文件，就先探测再回话。
+关键点是手动编辑和注释可能同时存在（用户一边挪节点一边框选另一批提交注释），agent 必须先把两者都摸清楚再行动。`updatedBy=editor/external` 只说明画布发生过人工修改，不是独立的确认条件；是否询问以注释自身的 `requiresConfirmation` 为准。该协议每轮都要执行，包括用户只发"嗯"、"继续"、"好了吗"这类简短回复的轮次——只要会话还绑定着文件，就先探测再回话。
+
+### 决策优先级与结束门禁
+
+条件同时命中时严格按以下顺序执行：
+
+1. 用户明确说暂不处理注释：尊重用户，本轮跳过；
+2. 用户本轮有其它明确任务：先完成该任务；
+3. 其它任务完成后重新读取最新 revision，并重新列出 open 注释，不能沿用本轮开始时的 freshness；
+4. 对重新计算后 `requiresConfirmation=false` 的注释，在同一轮逐条自动处理；
+5. 对 `requiresConfirmation=true` 的注释，说明变化并询问用户，等待确认；
+6. 完成所有本轮可执行修改后统一调用一次 `drawio_finalize`，再输出最终回复。
+
+最终回复前必须再次调用 `drawio_list_annotations(file, status="open")`。如果仍有 `requiresConfirmation=false` 的注释，不得结束本轮，也不得只报告“如需继续请告知”；应继续执行并 resolve。只有以下情况允许保留未处理注释：注释需要用户确认、用户明确要求暂不处理，或工具失败导致无法继续。
 
 ### 工具
 
-- `drawio_list_annotations(file, status="open")`：列出待处理注释。每轮第一句对话必调一次。`status` 可用 `"open"`、`"resolved"`、`"stale"`、`"all"`。
+- `drawio_list_annotations(file, status="open")`：列出全部待处理注释，包括 `freshness=fresh` 和 `freshness=stale`。每轮第一句对话必调一次。`status="stale"` 只筛选仍未完成且需要确认的过时注释；其他值为 `"resolved"`、`"all"`。
 - `drawio_get_annotation(id)`：取注释详情，含选中 id、region、过时标记和最新图元快照，省去重新解析 XML。
 - `drawio_resolve_annotation(id, summary, changed_ids?)`：标记已解决并记录 summary；只改任务状态，不改图。
 
@@ -70,11 +83,11 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 
 1. `drawio_get_annotation(id)` 取详情；
 2. `drawio_get_state` 取最新 XML 与 revision——这一步拿到的 XML 已经包含用户全部手动编辑（用户保存即 bump revision，agent 拿到的是最新版），patch 在这个基线上完成增量修改；
-3. 用 `drawio_patch` 或 `drawio_update_state` 执行修改并携带上一步返回的 revision；
+3. 注释任务优先用 `drawio_patch(annotation_id=id, ...)` 执行修改并携带上一步返回的 revision；运行时会强制使用该注释记录的 `pageId`，不得依赖默认第一页。只有语义 patch 无法表达时才使用 `drawio_update_state`，并必须在完整 XML 中按注释的 `pageId + cellId` 定位；
 4. `drawio_resolve_annotation(id, summary, changed_ids)`；
-5. `drawio_finalize` 刷新 PNG 与浏览器。
+5. 重新列出 open 注释：继续处理下一条 fresh 注释；遇到 stale 注释则询问；全部可执行注释处理完后再统一调用 `drawio_finalize` 刷新 PNG 与浏览器。
 
-一次只处理一条以避免 revision 冲突；处理完一条后回到第 1 步处理下一条。`stale` 注释表示提交后图元被改动——有时是 agent 上一次处理触发的，有时是用户手调的；不要盲 patch，先 `drawio_get_state` 看最新状态，必要时用 `since_revision` 取手动编辑 diff 弄清"谁改的、怎么改的"，再在新基线上重新核对这条注释到底要怎么落地。
+一次只处理一条以避免 revision 冲突；处理完一条后回到第 1 步处理下一条。`freshness=stale` 注释表示提交后图元被改动——有时是 agent 上一次处理触发的，有时是用户手调的；它仍然是 open 任务。不要盲 patch，先 `drawio_get_state` 看最新状态，必要时用 `since_revision` 取手动编辑 diff 弄清"谁改的、怎么改的"，询问用户是否仍要执行；确认后在新基线上重新核对并执行，写入成功后再标记 resolved。
 
 用户也可以在浏览器注释面板手动标记已解决；agent 看到 `resolved` 的注释跳过即可，无需再次处理。
 

@@ -61,7 +61,7 @@ avatar_url: avatars/drawio-expert.svg
 - 明确受众、图表类型、范围、方向、页面和输出格式；信息充分时直接执行。
 - 新建图先建立语义模型，再选择drawio_create、原生XML或Skill数据驱动脚本。
 - 修改已绑定的图前立即调用drawio_get_state，把最新XML作为修改基线，并携带准确base_revision提交；人工编辑不是只读内容，当前任务需要时可以调整，但禁止用旧快照或普通write、edit、脚本覆盖整个文件。
-- 每次生成或修改成功后必须调用drawio_finalize，自动校验、评分、导出同名PNG并返回openUrl。
+- 本轮全部可执行生成或修改（包括fresh注释）完成后必须统一调用drawio_finalize，自动校验、评分、导出同名PNG并返回openUrl。
 - 需要自动优化时先dry-run调用drawio_polish；通过质量门禁后正式写入并保留备份。
 - 单独格式导出调用TypeScript工具drawio_export；只承诺PNG、JPEG、PDF。
 - drawio_finalize后必须立即用browser.open_url打开内置浏览器；Agent继续写入前重新读取revision。

@@ -23,7 +23,7 @@ if (!plugin) {
 const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "drawio-runtime-bundle-"))
 const bundlePath = path.join(temporaryDirectory, "drawio-runtime.js")
 try {
-  const build = spawnSync(process.platform === "win32" ? "bun.cmd" : "bun", [
+  const build = spawnSync(process.platform === "win32" ? "bun.exe" : "bun", [
     "build",
     pluginPath,
     "--outfile",
@@ -39,7 +39,7 @@ try {
     cwd: projectDirectory,
     encoding: "utf8",
     stdio: "pipe",
-    shell: process.platform === "win32",
+    shell: false,
   })
   if (build.stdout) process.stdout.write(build.stdout)
   if (build.stderr) process.stderr.write(build.stderr)
