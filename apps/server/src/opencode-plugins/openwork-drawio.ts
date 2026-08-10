@@ -10,6 +10,7 @@ When the user asks to create or edit a diagram:
 3. Preserve the user's existing cells and changes unless the user explicitly asks to replace them.
 4. Call drawio_update_state with the exact revision returned by drawio_get_state and the complete updated draw.io XML.
 5. If the update reports revision_conflict, call drawio_get_state again, reconcile your intended edit with the new XML, and retry. Never resubmit stale XML.
+6. When the user asks for SVG, editable SVG, editable PNG, or HTML, keep the side panel open and call drawio_side_panel_export.
 
 The XML state is the source of truth. Do not rely on screenshots or overwrite a newer revision.`;
 
@@ -19,6 +20,15 @@ const updateArgsSchema = z.object({
   ),
   xml: z.string().min(1).describe(
     "Complete updated draw.io XML rooted at mxfile or mxGraphModel.",
+  ),
+});
+
+const exportArgsSchema = z.object({
+  format: z.enum(["svg", "xmlsvg", "xmlpng", "html2"]).describe(
+    "Draw.io Web export format: svg, editable SVG, editable PNG, or HTML.",
+  ),
+  fileName: z.string().min(1).max(255).optional().describe(
+    "Optional output file name. Directory components are ignored by the desktop bridge.",
   ),
 });
 
@@ -39,6 +49,12 @@ function bridgeUrl(): URL {
 
 function diagramUrl(sessionID: string): URL {
   const url = new URL("/api/diagram", bridgeUrl());
+  url.searchParams.set("sessionId", sessionID);
+  return url;
+}
+
+function exportUrl(sessionID: string): URL {
+  const url = new URL("/api/export", bridgeUrl());
   url.searchParams.set("sessionId", sessionID);
   return url;
 }
@@ -99,6 +115,22 @@ export const OpenWorkDrawio = async () => ({
         }
         if (!response.ok) throw new Error(String(body.error ?? "Unable to update Draw.io state."));
         return JSON.stringify({ ok: true, ...body }, null, 2);
+      },
+    },
+    drawio_side_panel_export: {
+      description: "Export the current OpenWork side-panel diagram through the connected Draw.io Web editor. The Draw.io side panel must be open.",
+      args: exportArgsSchema.shape,
+      async execute(rawArgs: unknown, context: DrawioToolContext) {
+        const args = exportArgsSchema.parse(rawArgs);
+        const response = await fetch(exportUrl(context.sessionID), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(args),
+          signal: AbortSignal.timeout(50_000),
+        });
+        const body = await parseResponse(response);
+        if (!response.ok) throw new Error(String(body.error ?? "Unable to export the Draw.io diagram."));
+        return JSON.stringify(body, null, 2);
       },
     },
   },
