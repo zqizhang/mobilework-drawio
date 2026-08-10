@@ -2366,6 +2366,13 @@ type AnnotationTask = {
   resolvedAt: string | null
 }
 
+type AnnotationEffectiveState = {
+  status: "open" | "resolved"
+  freshness: "fresh" | "stale"
+  requiresConfirmation: boolean
+  staleReason?: string
+}
+
 type IntegratedBridgeState = {
   server: Server | null
   startPromise: Promise<{ host: string; port: number }> | null
@@ -3049,10 +3056,36 @@ function annotationStaleState(
   return { stale: false }
 }
 
+function annotationEffectiveState(
+  session: IntegratedSession,
+  task: AnnotationTask,
+): AnnotationEffectiveState {
+  const lifecycleStatus = task.status === "resolved" ? "resolved" : "open"
+  const computed = annotationStaleState(session, task)
+  const stale = lifecycleStatus === "open" && (task.status === "stale" || computed.stale)
+  return {
+    status: lifecycleStatus,
+    freshness: stale ? "stale" : "fresh",
+    requiresConfirmation: stale,
+    staleReason: stale ? computed.reason : undefined,
+  }
+}
+
+function annotationMatchesStatus(
+  state: AnnotationEffectiveState,
+  statusFilter: string | null,
+): boolean {
+  if (!statusFilter || statusFilter === "all") return true
+  if (statusFilter === "open") return state.status === "open"
+  if (statusFilter === "resolved") return state.status === "resolved"
+  if (statusFilter === "stale") return state.status === "open" && state.freshness === "stale"
+  return false
+}
+
 function annotationPayload(
   session: IntegratedSession,
   task: AnnotationTask,
-  stale: { stale: boolean; reason?: string } = { stale: false },
+  state: AnnotationEffectiveState = annotationEffectiveState(session, task),
 ) {
   return {
     id: task.id,
@@ -3076,9 +3109,11 @@ function annotationPayload(
         consumedAt: task.authorization.consumedAt,
       }
       : null,
-    status: stale.stale && task.status === "open" ? "stale" : task.status,
-    stale: stale.stale,
-    staleReason: stale.reason || null,
+    status: state.status,
+    freshness: state.freshness,
+    requiresConfirmation: state.requiresConfirmation,
+    stale: state.freshness === "stale",
+    staleReason: state.staleReason || null,
     baseRevision: task.baseRevision,
     currentRevision: session.revision,
     result: task.result,
@@ -3405,7 +3440,10 @@ return `<!doctype html>
       async function resolveAnnotation(id, button) {
         if (button) button.disabled = true;
         try {
-          const response = await fetch(CONFIG.annotationsUrl + "/" + encodeURIComponent(id), {
+          const url = new URL(CONFIG.annotationsUrl);
+          url.pathname += "/" + encodeURIComponent(id);
+
+          const response = await fetch(url.toString(), {
             method: "PATCH",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ status: "resolved", summary: "已由用户标记为已解决" }),
@@ -3421,7 +3459,9 @@ return `<!doctype html>
 
       async function refreshAnnotations() {
         try {
-          const response = await fetch(CONFIG.annotationsUrl, { cache: "no-store" });
+          const url = new URL(CONFIG.annotationsUrl);
+          url.searchParams.set("status", "all");
+          const response = await fetch(url.toString(), { cache: "no-store" });
           const result = await response.json();
           if (!response.ok) throw new Error(result.error || "读取注释失败");
           renderAnnotations(result.annotations || []);
@@ -3452,7 +3492,7 @@ return `<!doctype html>
           const resolveBtn = task.status !== "resolved"
             ? '<form><button type="button" data-resolve="' + escape(task.id) + '">标记已解决</button></form>'
             : "";
-          return '<div class="item ' + task.status + '">'
+          return '<div class="item ' + status + '">'
             + '<div class="meta"><span class="badge ' + status + '">' + ({ open: "待处理", stale: "已过时", resolved: "已解决" }[status] || status) + '</span>'
             + '<span>页面 ' + escape(task.page.name || task.page.id) + '</span>'
             + '<span>rev ' + task.baseRevision + '→' + task.currentRevision + '</span></div>'
@@ -3624,11 +3664,13 @@ state.eventClients.set(session.sessionId, clients)
   const annotationId = annotationIdMatch ? decodeURIComponent(annotationIdMatch[1]) : null
 
   if (request.method === "GET" && requestUrl.pathname === "/api/annotations") {
+    await refreshIntegratedSession(session)
     const map = getSessionAnnotations(session.sessionId)
     const statusFilter = requestUrl.searchParams.get("status")
     const list = [...map.values()]
-      .filter((task) => !statusFilter || statusFilter === "all" || task.status === statusFilter)
-      .map((task) => annotationPayload(session, task, annotationStaleState(session, task)))
+      .map((task) => ({ task, state: annotationEffectiveState(session, task) }))
+      .filter((entry) => annotationMatchesStatus(entry.state, statusFilter))
+      .map((entry) => annotationPayload(session, entry.task, entry.state))
     integratedJsonResponse(response, 200, {
       ok: true,
       sessionId: session.sessionId,
@@ -3706,6 +3748,7 @@ state.eventClients.set(session.sessionId, clients)
   }
 
   if (annotationId && request.method === "GET") {
+    await refreshIntegratedSession(session)
     const map = getSessionAnnotations(session.sessionId)
     const task = map.get(annotationId)
     if (!task) {
@@ -3714,7 +3757,7 @@ state.eventClients.set(session.sessionId, clients)
     }
     integratedJsonResponse(response, 200, {
       ok: true,
-      annotation: annotationPayload(session, task, annotationStaleState(session, task)),
+      annotation: annotationPayload(session, task),
     })
     return
   }
@@ -3756,7 +3799,7 @@ state.eventClients.set(session.sessionId, clients)
       }
     }
     task.updatedAt = new Date().toISOString()
-    map.set(task.id, task)
+    map.set(annotationId, task)
     await persistStoredAnnotations(session)
     broadcastAnnotation(session, task, "updated")
     integratedJsonResponse(response, 200, {
@@ -3907,13 +3950,15 @@ const DRAWIO_RUNTIME_GUIDANCE = `## Draw.io 文件写入与交付
 每次修改前必须立即调用 drawio_get_state，并把返回的最新 XML 作为修改基线。人工编辑不是只读内容，可以按当前任务要求继续调整。
 提交时必须携带该次读取返回的准确 base_revision；revision_conflict 后重新读取，在新 XML 上重新执行所需变更并重试，禁止重发旧 XML。
 禁止用普通 write、edit 或脚本直接覆盖已绑定的 .drawio 文件，因为这会绕过 revision 检查并可能用旧快照丢失最新内容。
-每次创建或修改成功后必须调用 drawio_finalize：校验、评分、自动导出同名 PNG，并将 openUrl 交给 MobileWork 现有 browser.open_url 打开。完成浏览器调用前不要结束任务。
+本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG，并将 openUrl 交给 MobileWork 现有 browser.open_url 打开。完成浏览器调用前不要结束任务。
 
 ## 注释任务（框选评审）
 
 用户在内置浏览器中框选图元并提交注释后，每条注释是一条独立任务，记录选中图元的稳定 ID、页面、区域范围、修改说明、允许范围和提交时的 revision。
-处理注释时必须先读取最新状态并 dry-run，向用户说明计划、完整稳定 ID 清单和范围，再调用 drawio_authorize_annotation_change。该工具必须由 OpenCode 以 ask 权限弹窗在写入前批准；批准后才可把一次性 token 传给正式 drawio_patch/drawio_update_state。禁止先改后问。
+注释的 status 只有 open/resolved；freshness=stale 表示图元已变化但任务仍未完成。执行 stale 注释前必须先询问用户；fresh 注释可直接进入计划和审批流程。
+处理注释时必须先读取最新状态并 dry-run，向用户说明计划、完整稳定 ID 清单和范围，再调用 drawio_authorize_annotation_change。该工具必须由 OpenCode 以 ask 权限弹窗在写入前批准；批准后才可把一次性 token 传给正式 drawio_patch/drawio_update_state。调用 drawio_patch 时传 annotation_id，由运行时强制使用注释绑定的 pageId。禁止先改后问。
 不得修改授权范围外内容。确需越界时，在 authorization 的 escalation_reason 中先说明不可避免的原因并申请更宽范围；未获批准不得写入。drawio_polish 会重排整页，存在活动注释时禁止正式运行。
+用户本轮另有明确任务时先完成该任务，然后在同一轮重新探测注释；最终回复前仍存在 requiresConfirmation=false 的 open 注释时必须继续处理，不能只提示用户稍后继续。
 注释任务的检查与处理流程由 drawio-session-editing 技能负责编排，详见该 SKILL.md。`
 
 function candidateDrawioPath(args: unknown): string | null {
@@ -4194,13 +4239,17 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
 
     drawio_patch: tool({
       description:
-        "Apply semantic node and edge operations to an existing Draw.io file. Preserves unrelated cells and creates a recoverable backup unless dry_run is true.",
+        "Apply semantic node and edge operations to an existing Draw.io file. Pass annotation_id when executing an annotation so its bound page is enforced. Preserves unrelated cells and creates a recoverable backup unless dry_run is true.",
       args: {
         file: tool.schema.string().describe("Workspace-relative .drawio or .xml file"),
         page: tool.schema
           .string()
           .optional()
-          .describe("Page id or name; defaults to the first page"),
+          .describe("Page id or name; defaults to the first page unless annotation_id enforces the annotation page"),
+        annotation_id: tool.schema
+          .string()
+          .optional()
+          .describe("Annotation being executed; binds the target page and is mandatory for a formal annotation-driven write"),
         operations: tool.schema
           .array(patchOperationSchema)
           .min(1)
@@ -4215,10 +4264,6 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           .min(0)
           .optional()
           .describe("Exact revision returned by drawio_get_state; mandatory when writing an active session"),
-        annotation_id: tool.schema
-          .string()
-          .optional()
-          .describe("Active annotation id; mandatory for a formal annotation-driven write"),
         approval_token: tool.schema
           .string()
           .optional()
@@ -4228,6 +4273,26 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         const target = resolveWorkspacePath(context, args.file)
         const session = integratedSessionFor(context, target)
         const activeSession = session ? await refreshIntegratedSession(session) : null
+        let pageSelector = args.page
+        if (args.annotation_id) {
+          if (!activeSession) {
+            throw new Error("annotation_id requires an active Draw.io session for this file")
+          }
+          const annotation = getSessionAnnotations(activeSession.sessionId).get(args.annotation_id)
+          if (!annotation) throw new Error(`annotation not found: ${args.annotation_id}`)
+          if (annotation.status === "resolved") {
+            throw new Error(`annotation is already resolved: ${args.annotation_id}`)
+          }
+          if (!annotation.pageId.trim()) {
+            throw new Error(`annotation has no stable page id: ${args.annotation_id}`)
+          }
+          if (args.page && args.page !== annotation.pageId && args.page !== annotation.pageName) {
+            throw new Error(
+              `annotation ${args.annotation_id} is bound to page ${annotation.pageId}; received page ${args.page}`,
+            )
+          }
+          pageSelector = annotation.pageId
+        }
         if (activeSession && !args.dry_run && args.base_revision === undefined) {
           throw new Error(
             "base_revision is required for an active Draw.io session; "
@@ -4240,7 +4305,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         const beforeXml = activeSession?.xml || await readDiagramFile(target)
         const beforePages = parseDrawio(beforeXml)
         const editable = parseEditableDrawio(beforeXml)
-        const page = selectEditablePage(editable, args.page)
+        const page = selectEditablePage(editable, pageSelector)
         const changedIds = applyPatchOperations(page, args.operations as PatchOperation[])
         if (annotationGuard) {
           validateAnnotationPatchScope(annotationGuard, args.operations as PatchOperation[], changedIds)
@@ -4640,20 +4705,16 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         await refreshIntegratedSession(session)
         const map = getSessionAnnotations(session.sessionId)
         const list = [...map.values()]
-          .map((task) => ({ task, stale: annotationStaleState(session, task) }))
-          .filter((entry) => {
-            const effective = entry.stale.stale && entry.task.status === "open" ? "stale" : entry.task.status
-            if (args.status === "all") return true
-            return effective === args.status
-          })
-          .map((entry) => annotationPayload(session, entry.task, entry.stale))
+          .map((task) => ({ task, state: annotationEffectiveState(session, task) }))
+          .filter((entry) => annotationMatchesStatus(entry.state, args.status))
+          .map((entry) => annotationPayload(session, entry.task, entry.state))
         return JSON.stringify({
           file: workspaceRelative(context, target).split(path.sep).join("/"),
           sessionId: session.sessionId,
           currentRevision: session.revision,
           count: list.length,
           annotations: list,
-          guidance: "Open ones are independent tasks. For each: call drawio_get_annotation, drawio_get_state and a dry-run; disclose scope and exact stable IDs with drawio_authorize_annotation_change and wait for its OpenCode approval popup; only then perform one scoped write with its token, resolve the annotation and finalize. Never modify first and ask later.",
+          guidance: "Open includes fresh and stale unfinished tasks. Ask for confirmation before executing any task with requiresConfirmation=true. For each executable task: call drawio_get_annotation and drawio_get_state, dry-run, disclose scope and exact stable IDs with drawio_authorize_annotation_change, and wait for its OpenCode approval popup. Only then pass annotation_id and the one-time approval token to one scoped write, resolve the annotation, and finalize. Never modify first and ask later.",
         }, null, 2)
       },
     }),
@@ -4672,8 +4733,8 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         const task = map.get(args.id)
         if (!task) throw new Error(`annotation not found: ${args.id}`)
         session.activeAnnotationId = task.id
-        const stale = annotationStaleState(session, task)
-        const payload = annotationPayload(session, task, stale)
+        const annotationState = annotationEffectiveState(session, task)
+        const payload = annotationPayload(session, task, annotationState)
         let snapshots: Array<Record<string, unknown>> = []
         try {
           const pages = parseDrawio(session.xml)
@@ -4702,9 +4763,9 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         return JSON.stringify({
           annotation: payload,
           cellSnapshots: snapshots,
-          guidance: stale.stale
-            ? "This annotation is stale: the diagram changed after it was created. Re-read the selection with drawio_get_state and adapt the change to the latest revision before writing."
-            : "Call drawio_get_state, prepare a dry-run and exact changed-id plan, then call drawio_authorize_annotation_change. Wait for the OpenCode approval popup before any formal write. Pass its one-time token to drawio_patch/drawio_update_state, then call drawio_resolve_annotation.",
+          guidance: annotationState.requiresConfirmation
+            ? "This annotation is stale but still open. Ask the user whether to execute it. After confirmation, call drawio_get_state, prepare a dry-run and exact changed-id plan, then call drawio_authorize_annotation_change. Wait for the OpenCode approval popup before passing annotation_id and its one-time token to drawio_patch/drawio_update_state; resolve only after the write succeeds."
+            : "Call drawio_get_state, prepare a dry-run and exact changed-id plan, then call drawio_authorize_annotation_change. Wait for the OpenCode approval popup before passing annotation_id and its one-time token to drawio_patch/drawio_update_state; resolve only after the write succeeds.",
         }, null, 2)
       },
     }),

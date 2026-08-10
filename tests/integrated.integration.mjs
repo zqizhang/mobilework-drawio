@@ -110,6 +110,9 @@ try {
   await plugin["experimental.chat.system.transform"]({}, systemOutput)
   assert.match(systemOutput.system.join("\n"), /人工编辑不是只读内容/)
   assert.match(systemOutput.system.join("\n"), /最新 XML 作为修改基线/)
+  assert.match(systemOutput.system.join("\n"), /freshness=stale/)
+  assert.match(systemOutput.system.join("\n"), /requiresConfirmation=false/)
+  assert.match(systemOutput.system.join("\n"), /不能只提示用户稍后继续/)
   assert.match(systemOutput.system.join("\n"), /禁止先改后问/)
   const createResult = JSON.parse(await plugin.tool.drawio_create.execute({
     file: "architecture.drawio",
@@ -291,6 +294,8 @@ try {
   }).then((response) => response.json())
   assert.equal(submitted.ok, true)
   assert.equal(submitted.annotation.status, "open")
+  assert.equal(submitted.annotation.freshness, "fresh")
+  assert.equal(submitted.annotation.requiresConfirmation, false)
   assert.equal(submitted.annotation.cells.length, 1)
   assert.equal(submitted.annotation.scope, "selection_only")
   assert.equal(submitted.annotation.scopeLabel, "只修改选区")
@@ -304,6 +309,32 @@ try {
   assert.equal(listResult.count, 1)
   assert.equal(listResult.annotations[0].id, submitted.annotation.id)
 
+  // Simulate an explicit user task that advances the revision without touching
+  // the annotated cell. Explicit work runs before activating an annotation's
+  // guarded write flow; the annotation must remain fresh and executable.
+  const beforeExplicitTask = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
+  const explicitTask = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    operations: [{ type: "add-node", id: "explicit-task-node", label: "Explicit Task" }],
+    dry_run: false,
+    base_revision: beforeExplicitTask.revision,
+  }, context))
+  assert.equal(explicitTask.diff.summary.added, 1)
+
+  const freshAfterExplicitTask = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
+    file: "architecture.drawio",
+    status: "open",
+  }, context))
+  assert.equal(freshAfterExplicitTask.count, 1)
+  assert.equal(freshAfterExplicitTask.annotations[0].id, submitted.annotation.id)
+  assert.equal(freshAfterExplicitTask.annotations[0].status, "open")
+  assert.equal(freshAfterExplicitTask.annotations[0].freshness, "fresh")
+  assert.equal(freshAfterExplicitTask.annotations[0].requiresConfirmation, false)
+  assert.ok(
+    freshAfterExplicitTask.annotations[0].currentRevision
+      > freshAfterExplicitTask.annotations[0].baseRevision,
+  )
+
   const detail = JSON.parse(await plugin.tool.drawio_get_annotation.execute({
     id: submitted.annotation.id,
   }, context))
@@ -311,6 +342,17 @@ try {
   assert.equal(Array.isArray(detail.cellSnapshots), true)
   assert.equal(detail.cellSnapshots[0].id, "node")
   assert.equal(detail.cellSnapshots[0].missing, undefined)
+
+  await assert.rejects(
+    plugin.tool.drawio_patch.execute({
+      file: "architecture.drawio",
+      page: "wrong-page",
+      annotation_id: submitted.annotation.id,
+      operations: [{ type: "update-node", id: "node", label: "Wrong Page" }],
+      dry_run: true,
+    }, context),
+    /is bound to page/,
+  )
 
   const beforePatch = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
   const dryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
@@ -430,8 +472,93 @@ try {
   const staleDetail = JSON.parse(await plugin.tool.drawio_get_annotation.execute({
     id: staleAnn.annotation.id,
   }, context))
+  assert.equal(staleDetail.annotation.status, "open")
+  assert.equal(staleDetail.annotation.freshness, "stale")
+  assert.equal(staleDetail.annotation.requiresConfirmation, true)
   assert.equal(staleDetail.annotation.stale, true)
   assert.match(staleDetail.annotation.staleReason, /changed/)
+
+  const openWithStale = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
+    file: "architecture.drawio",
+    status: "open",
+  }, context))
+  assert.equal(openWithStale.count, 1)
+  assert.equal(openWithStale.annotations[0].id, staleAnn.annotation.id)
+  assert.equal(openWithStale.annotations[0].requiresConfirmation, true)
+
+  const staleOnly = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
+    file: "architecture.drawio",
+    status: "stale",
+  }, context))
+  assert.equal(staleOnly.count, 1)
+  assert.equal(staleOnly.annotations[0].id, staleAnn.annotation.id)
+
+  // Simulate user confirmation: re-read the latest revision, apply the stale
+  // task on its bound page through the same pre-write approval guard, then
+  // resolve it only after the write succeeds.
+  const confirmedState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
+  const confirmedDryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    annotation_id: staleAnn.annotation.id,
+    operations: [{ type: "update-node", id: "node", label: "Draw.io Confirmed" }],
+    dry_run: true,
+    base_revision: confirmedState.revision,
+  }, context))
+  assert.equal(confirmedDryRun.dryRun, true)
+  const staleAuthorization = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
+    id: staleAnn.annotation.id,
+    plan: "用户确认后把选中节点 node 改名为 Draw.io Confirmed",
+    proposed_changed_ids: ["node"],
+    requested_scope: "selection_only",
+  }, context))
+  const confirmedPatch = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    annotation_id: staleAnn.annotation.id,
+    operations: [{ type: "update-node", id: "node", label: "Draw.io Confirmed" }],
+    dry_run: false,
+    base_revision: confirmedState.revision,
+    approval_token: staleAuthorization.approvalToken,
+  }, context))
+  assert.equal(confirmedPatch.diff.summary.changed, 1)
+
+  const staleResolved = JSON.parse(await plugin.tool.drawio_resolve_annotation.execute({
+    id: staleAnn.annotation.id,
+    summary: "用户确认后基于最新版本完成修改",
+    changed_ids: ["node"],
+  }, context))
+  assert.equal(staleResolved.ok, true)
+  assert.equal(staleResolved.annotation.status, "resolved")
+  assert.equal(staleResolved.annotation.requiresConfirmation, false)
+
+  const finalOpenAnnotations = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
+    file: "architecture.drawio",
+    status: "open",
+  }, context))
+  assert.equal(finalOpenAnnotations.count, 0)
+  const finalStaleAnnotations = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
+    file: "architecture.drawio",
+    status: "stale",
+  }, context))
+  assert.equal(finalStaleAnnotations.count, 0)
+  const finalResolvedAnnotations = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
+    file: "architecture.drawio",
+    status: "resolved",
+  }, context))
+  assert.equal(finalResolvedAnnotations.count, 2)
+  assert.deepEqual(
+    new Set(finalResolvedAnnotations.annotations.map((annotation) => annotation.id)),
+    new Set([submitted.annotation.id, staleAnn.annotation.id]),
+  )
+
+  const annotationFinalize = JSON.parse(await plugin.tool.drawio_finalize.execute({
+    file: "architecture.drawio",
+    threshold: 0,
+    scale: 1,
+    border: 0,
+  }, context))
+  assert.equal(annotationFinalize.ok, true)
+  assert.equal(annotationFinalize.png.output_path, "architecture.png")
+  assert.match(annotationFinalize.openUrl, /\/editor\?/)
 
   console.log(JSON.stringify({
     ok: true,
@@ -450,6 +577,10 @@ try {
     annotationRegionComputation: true,
     annotationPersistence: true,
     annotationStalenessDetection: true,
+    annotationFreshAutoClosure: true,
+    annotationStaleConfirmationClosure: true,
+    annotationPageBinding: true,
+    annotationFinalizationGate: true,
     annotationScopeEnforcement: true,
     annotationPreWriteApproval: true,
   }, null, 2))
