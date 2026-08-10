@@ -1,6 +1,6 @@
 ---
 name: drawio-session-editing
-description: 当用户需要在MobileWork内置浏览器中手动编辑Draw.io工作区文件，或Agent需要在人工编辑后继续修改时使用。负责读取最新会话revision、把用户保存版本作为新的修改基线、以乐观并发方式提交XML，并在revision_conflict时重新读取和重试，避免旧快照造成内容丢失。同时覆盖框选注释任务流程：用户在内置浏览器框选图元并提交修改说明，每条注释形成包含稳定ID、页面、区域和说明的独立任务；每轮对话需同时探测"手动编辑"和"待处理注释"两种用户意图。仅当注释为freshness=stale/requiresConfirmation=true时先确认；未更改图元上的fresh注释直接基于最新版本处理。
+description: 当用户需要在MobileWork内置浏览器中手动编辑Draw.io工作区文件，或Agent需要在人工编辑后继续修改时使用。负责读取最新会话revision、把用户保存版本作为新的修改基线、以乐观并发方式提交XML，并在revision_conflict时重新读取和重试，避免旧快照造成内容丢失。同时覆盖框选注释任务流程：每条注释记录稳定ID、页面、区域、说明和允许修改范围；每轮同时探测手动编辑与待处理注释。仅stale注释需先确认，但所有正式写入都必须先dry-run、说明计划并通过OpenCode审批获得一次性授权；运行时拒绝未授权、越界或过期revision写入。
 ---
 
 # Draw.io 会话同步与并发控制
@@ -39,7 +39,19 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 
 ## 注释任务（框选评审）
 
-用户在内置浏览器中框选一个或多个图元并填写修改说明后，每条注释是一条独立任务，记录选中图元的稳定 ID、页面、区域范围、修改说明和提交时的 revision。注释随文件持久化到 `<basename>.annotations.json`，重启后仍可恢复。任务生命周期只有“待处理（open）”和“已完成（resolved）”；`freshness=stale` 只表示选中图元在提交后发生变化，任务仍然 open，不能跳过或视为失效，但执行前必须得到用户确认。
+用户在内置浏览器中框选一个或多个图元并填写修改说明后，还必须选择允许修改范围。每条注释记录选中图元的稳定 ID、页面、区域范围、修改说明、范围策略和提交时的 revision。注释随文件持久化到 `<basename>.annotations.json`，重启后仍可恢复。
+
+任务生命周期只有“待处理（open）”和“已完成（resolved）”；`freshness=stale` 只表示选中图元在提交后发生变化，任务仍然 open，不能跳过或视为失效，但执行前必须得到用户确认。fresh 注释无需额外口头确认，但仍必须经过下面的写前计划和OpenCode审批。
+
+范围策略只有三种：
+
+| 策略 | 允许修改 | 明确禁止 |
+|---|---|---|
+| `selection_only`（只修改选区） | 仅用户选中的稳定 ID | 未选中的节点、关联线、周边布局以及新增图元 |
+| `selection_and_edges`（允许调整关联连线） | 选中图元、与选中节点直接相连的边；可新增端点包含选中节点的边 | 其它节点和无关连线 |
+| `surrounding_layout`（允许调整周边布局） | 选区附近、一跳关联节点及它们之间的连线；新增节点必须落在运行时计算的周边区域内 | 更远节点、其它页面或未披露的稳定 ID |
+
+范围是上限，不是自动修改许可。无论选择哪一种，Agent在正式写入前都必须再次展示具体计划并触发OpenCode审批弹窗。运行时按稳定ID、范围、revision和一次性token强制校验。
 
 ### 每轮同时关注注释与手动编辑（重要）
 
@@ -53,7 +65,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 | 注释情况 | `updatedBy` | 本轮动作 |
 |---|---|---|
 | 无 | 任意 | 按用户本轮意图正常处理（无关问答/创建/导出等）。 |
-| 有，且 `requiresConfirmation=false` | 任意 | 图元自注释提交后未变化。即使 `updatedBy=editor/external`，也直接在最新 XML/revision 上按“处理一条注释的标准闭环”逐条处理，不额外询问。 |
+| 有，且 `requiresConfirmation=false` | 任意 | 图元自注释提交后未变化。即使 `updatedBy=editor/external`，也直接在最新 XML/revision 上按“处理一条注释的标准闭环”逐条处理，不额外口头询问；写前审批仍不可省略。 |
 | 有，且至少一条 `requiresConfirmation=true` | 任意 | 这些 stale 注释仍然 open，但执行前先询问用户。若 `updatedBy=editor/external`，可先用 `drawio_get_state(since_revision=注释的 baseRevision)` 摘要说明变化；得到确认后再基于最新版本处理。fresh 注释不受影响，可直接处理。 |
 | 用户本轮明确提了其它动作 | 任意 | 先做用户明确要的；完成后必须在同一轮重新调用 `drawio_list_annotations(status="open")` 和 `drawio_get_state`。重新计算后，fresh 注释继续自动处理，stale 注释才询问。除非用户明确要求暂不处理，否则不得仅提示还有 fresh 注释便结束。 |
 | 用户明确说"先不动注释 / 我先看看" | 任意 | 尊重意愿，跳过或仅列出。 |
@@ -76,16 +88,33 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 ### 工具
 
 - `drawio_list_annotations(file, status="open")`：列出全部待处理注释，包括 `freshness=fresh` 和 `freshness=stale`。每轮第一句对话必调一次。`status="stale"` 只筛选仍未完成且需要确认的过时注释；其他值为 `"resolved"`、`"all"`。
-- `drawio_get_annotation(id)`：取注释详情，含选中 id、region、过时标记和最新图元快照，省去重新解析 XML。
+- `drawio_get_annotation(id)`：取注释详情并把它设为当前活动注释，含选中id、region、范围、freshness、过时标记和最新图元快照。
+- `drawio_authorize_annotation_change(id, plan, proposed_changed_ids, requested_scope, escalation_reason?)`：必须在正式写入前调用；该工具权限固定为`ask`，OpenCode先弹窗，用户批准后才返回绑定当前revision和计划ID的一次性token。请求比用户原选项更宽的范围时，`escalation_reason`必填。
 - `drawio_resolve_annotation(id, summary, changed_ids?)`：标记已解决并记录 summary；只改任务状态，不改图。
 
 ### 处理一条注释的标准闭环
 
 1. `drawio_get_annotation(id)` 取详情；
 2. `drawio_get_state` 取最新 XML 与 revision——这一步拿到的 XML 已经包含用户全部手动编辑（用户保存即 bump revision，agent 拿到的是最新版），patch 在这个基线上完成增量修改；
-3. 注释任务优先用 `drawio_patch(annotation_id=id, ...)` 执行修改并携带上一步返回的 revision；运行时会强制使用该注释记录的 `pageId`，不得依赖默认第一页。只有语义 patch 无法表达时才使用 `drawio_update_state`，并必须在完整 XML 中按注释的 `pageId + cellId` 定位；
-4. `drawio_resolve_annotation(id, summary, changed_ids)`；
-5. 重新列出 open 注释：继续处理下一条 fresh 注释；遇到 stale 注释则询问；全部可执行注释处理完后再统一调用 `drawio_finalize` 刷新 PNG 与浏览器。
+3. 若`requiresConfirmation=true`，先说明图元变化并询问用户；未确认不得继续。fresh注释跳过本步；
+4. 用`drawio_patch(annotation_id=id, dry_run=true)`或等价差异分析形成精确计划，列出所有会改变的稳定ID和所需范围；运行时强制使用注释绑定的`pageId`，此时不得写入；
+5. 调`drawio_authorize_annotation_change`。OpenCode弹窗出现前，Agent先用`plan`说明将改什么；用户拒绝或关闭弹窗则立即停止，不得改图；
+6. 用户批准后，把返回的`approvalToken`、`annotation_id`和同一`base_revision`传给一次正式`drawio_patch`。只有语义patch无法表达时才用`drawio_update_state`，并必须按`pageId + cellId`定位。token仅能使用一次，revision变化后必须重新规划和审批；
+7. 写入成功后调用`drawio_resolve_annotation(id, summary, changed_ids)`；
+8. 重新列出open注释：继续处理下一条fresh注释；遇到stale注释则询问；全部可执行注释处理完后统一调用一次`drawio_finalize`刷新PNG与浏览器。
+
+正式`drawio_polish`会重排整页，活动注释期间禁止使用。完整XML写入也会进行稳定ID差异校验；新增图元优先使用带明确operation的`drawio_patch`。
+
+### 越界申请
+
+如果当前要求客观上无法在用户选择的范围内完成，先停止在dry-run阶段，不得尝试写入。随后：
+
+1. 说明具体受阻点、必须越界的稳定ID以及不越界会造成什么问题；
+2. 选择所需的更宽`requested_scope`，把原因写入`escalation_reason`；
+3. 再调用`drawio_authorize_annotation_change`触发新的审批弹窗；
+4. 只有用户批准后才使用新token写入；拒绝则保持原图不变。
+
+禁止先改完再让用户检查，也禁止用普通`write`、`edit`、脚本或省略`annotation_id`绕过范围守卫。
 
 一次只处理一条以避免 revision 冲突；处理完一条后回到第 1 步处理下一条。`freshness=stale` 注释表示提交后图元被改动——有时是 agent 上一次处理触发的，有时是用户手调的；它仍然是 open 任务。不要盲 patch，先 `drawio_get_state` 看最新状态，必要时用 `since_revision` 取手动编辑 diff 弄清"谁改的、怎么改的"，询问用户是否仍要执行；确认后在新基线上重新核对并执行，写入成功后再标记 resolved。
 

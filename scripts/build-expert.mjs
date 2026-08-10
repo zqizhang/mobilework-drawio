@@ -9,9 +9,10 @@ const projectDirectory = path.resolve(scriptDirectory, "..")
 const manifestPath = path.join(projectDirectory, "expert.json")
 const outputRoot = path.join(projectDirectory, "generated")
 const packageDirectory = path.join(outputRoot, "drawio-expert")
-const managerScripts = path.resolve(
-  projectDirectory,
-  "..",
+const managerScripts = path.join(
+  os.homedir(),
+  ".agents",
+  "skills",
   "mobilework-expert-manager",
   "scripts",
 )
