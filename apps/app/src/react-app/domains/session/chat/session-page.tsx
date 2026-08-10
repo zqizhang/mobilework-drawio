@@ -541,6 +541,19 @@ export function SessionPage(props: SessionPageProps) {
   const openDrawioPanel = useCallback(async () => {
     if (!props.selectedSessionId) return { action: "unavailable" };
     const bridgeState = await window.__OPENWORK_ELECTRON__?.drawio?.getState?.();
+    if (bridgeState?.docker.managed && bridgeState.docker.status !== "ready") {
+      let dockerState = await window.__OPENWORK_ELECTRON__?.drawio?.ensureDocker?.({ install: false });
+      if (dockerState?.status === "docker_required") {
+        const approved = window.confirm(
+          "Draw.io requires Docker Desktop. Install Docker Desktop now? Windows may request administrator approval.",
+        );
+        if (approved) dockerState = await window.__OPENWORK_ELECTRON__?.drawio?.ensureDocker?.({ install: true });
+      }
+      if (dockerState && dockerState.status !== "ready" && dockerState.status !== "external") {
+        window.alert(dockerState.error || "Docker Draw.io is not ready yet. Start Docker Desktop and try again.");
+        return { action: "unavailable" };
+      }
+    }
     const editorUrl = resolveDrawioEditorUrl(
       typeof window === "undefined" ? null : window.localStorage,
       import.meta.env.VITE_OPENWORK_DRAWIO_URL,
@@ -551,13 +564,17 @@ export function SessionPage(props: SessionPageProps) {
       sessionId: props.selectedSessionId,
       tabs: usePanelTabStore.getState().sessions[props.selectedSessionId]?.tabs ?? [],
       editorUrl: bridgeState
-        ? drawioEditorUrlForSession(editorUrl, props.selectedSessionId)
+          ? drawioEditorUrlForSession(
+              editorUrl,
+              props.selectedSessionId,
+              props.selectedWorkspaceDisplay.workspaceType === "remote" ? undefined : props.selectedWorkspaceRoot,
+            )
         : editorUrl,
       browser: getElectronBrowser(),
       storage: typeof window === "undefined" ? null : window.localStorage,
       openPanel: () => setCurrentSidePanel("panel"),
     });
-  }, [props.selectedSessionId, setCurrentSidePanel]);
+  }, [props.selectedSessionId, props.selectedWorkspaceDisplay.workspaceType, props.selectedWorkspaceRoot, setCurrentSidePanel]);
   const openDrawioPanelControlAction = useMemo<OpenworkControlAction | null>(() => (
     props.selectedSessionId && isElectronRuntime() ? {
       id: "drawio.panel.open",

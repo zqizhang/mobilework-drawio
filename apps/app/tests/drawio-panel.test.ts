@@ -51,8 +51,8 @@ describe("Draw.io editor URL resolution", () => {
       "http://127.0.0.1:43123/",
     );
 
-    expect(drawioEditorUrlForSession(bridge, "session/a"))
-      .toBe("http://127.0.0.1:43123/?sessionId=session%2Fa");
+    expect(drawioEditorUrlForSession(bridge, "session/a", "C:\\Workspaces\\orders"))
+      .toBe("http://127.0.0.1:43123/?sessionId=session%2Fa&workspacePath=C%3A%5CWorkspaces%5Corders");
   });
 });
 

@@ -62,9 +62,10 @@ export function resolveDrawioEditorUrl(
   );
 }
 
-export function drawioEditorUrlForSession(editorUrl: string, sessionId: string) {
+export function drawioEditorUrlForSession(editorUrl: string, sessionId: string, workspacePath?: string) {
   const url = new URL(editorUrl);
   url.searchParams.set("sessionId", sessionId);
+  if (workspacePath?.trim()) url.searchParams.set("workspacePath", workspacePath.trim());
   return url.toString();
 }
 

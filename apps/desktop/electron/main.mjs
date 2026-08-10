@@ -33,6 +33,7 @@ import { createApplicationMenu } from "./app-menu.mjs";
 import { applyBrandAppName } from "./brand-app-name.mjs";
 import { createBrowserPanel } from "./browser-panel.mjs";
 import { createDrawioBridge } from "./drawio-bridge.mjs";
+import { createDrawioDockerManager } from "./drawio-docker.mjs";
 import { createWorkspaceStore } from "./workspace-store.mjs";
 import {
   buildNukeManifest,
@@ -973,8 +974,12 @@ const browserPanel = createBrowserPanel({
   getWindow: () => mainWindow,
   onDeepLink: (urls) => queueDeepLinks(urls),
 });
+const drawioWebUrl = process.env.OPENWORK_DRAWIO_WEB_URL || "http://127.0.0.1:18080/";
+const drawioDocker = createDrawioDockerManager({ editorUrl: drawioWebUrl });
 const drawioBridge = createDrawioBridge({
   storageDir: path.join(app.getPath("userData"), "drawio-bridge"),
+  editorUrl: drawioWebUrl,
+  gitExecutable: process.env.OPENWORK_GIT_EXECUTABLE || "git",
   convertPngToJpeg: (content) => nativeImage.createFromBuffer(content).toJPEG(92),
 });
 
@@ -2469,7 +2474,13 @@ ipcMain.handle("openwork:terminal:kill", (event, terminalId) => {
 });
 
 browserPanel.registerIpc(ipcMain);
-ipcMain.handle("openwork:drawio:state", () => drawioBridge.getState());
+ipcMain.handle("openwork:drawio:state", () => ({
+  ...drawioBridge.getState(),
+  docker: drawioDocker.getState(),
+}));
+ipcMain.handle("openwork:drawio:ensure-docker", (_event, options) => (
+  drawioDocker.ensure({ install: options?.install === true })
+));
 
 registerMigrationIpc({ app, ipcMain });
 const { ensureAutoUpdater } = registerUpdaterIpc({
@@ -2506,6 +2517,7 @@ or use: pnpm dev:worktree`);
       disposeRuntimeBeforeQuit(),
       uiControlServer.stop(),
       drawioBridge.stop(),
+      drawioDocker.stop(),
     ]).finally(() => app.quit());
   });
 
@@ -2532,6 +2544,10 @@ or use: pnpm dev:worktree`);
 
   app.whenReady().then(async () => {
     installMediaPermissionHandlers(session, () => mainWindow);
+    drawioDocker.startMonitor();
+    void drawioDocker.ensure({ install: false }).catch((error) => {
+      console.warn("[drawio] Docker setup failed", error);
+    });
     await drawioBridge.start().then((bridgeState) => {
       process.env.OPENWORK_DRAWIO_BRIDGE_URL = bridgeState.baseUrl;
     }).catch((error) => {

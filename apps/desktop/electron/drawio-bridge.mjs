@@ -1,7 +1,9 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+
+import { createDrawioWorkspaceStore } from "./drawio-workspace.mjs";
 
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const EXPORT_TIMEOUT_MS = 45_000;
@@ -90,6 +92,8 @@ function bridgePage(editorUrl) {
         const config = ${config};
         const params = new URLSearchParams(location.search);
         const sessionId = params.get("sessionId");
+        const workspacePath = params.get("workspacePath");
+        const diagramId = params.get("diagramId");
         const clientId = crypto.randomUUID();
         const editor = document.getElementById("editor");
         const status = document.getElementById("status");
@@ -110,17 +114,24 @@ function bridgePage(editorUrl) {
           editor.contentWindow?.postMessage(JSON.stringify(payload), config.editorOrigin);
         }
 
+        function apiUrl(pathname) {
+          const query = new URLSearchParams({ sessionId });
+          if (workspacePath) query.set("workspacePath", workspacePath);
+          if (diagramId) query.set("diagramId", diagramId);
+          return pathname + "?" + query.toString();
+        }
+
         async function readLatest() {
-          const response = await fetch("/api/diagram?sessionId=" + encodeURIComponent(sessionId), { cache: "no-store" });
+          const response = await fetch(apiUrl("/api/diagram"), { cache: "no-store" });
           if (!response.ok) throw new Error("Unable to read the diagram state.");
           return response.json();
         }
 
         async function writeState(xml, baseRevision) {
-          const response = await fetch("/api/diagram?sessionId=" + encodeURIComponent(sessionId), {
+          const response = await fetch(apiUrl("/api/diagram"), {
             method: "PUT",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ xml, baseRevision, source: "editor", clientId }),
+            body: JSON.stringify({ xml, baseRevision, source: "editor", clientId, actorId: "user", sessionId }),
           });
           const result = await response.json();
           if (response.status === 409) return writeState(xml, result.current.revision);
@@ -175,7 +186,7 @@ function bridgePage(editorUrl) {
           pendingExport = null;
           try {
             if (typeof message.data !== "string") throw new Error("Draw.io returned no export data.");
-            const response = await fetch("/api/editor-export?sessionId=" + encodeURIComponent(sessionId), {
+            const response = await fetch(apiUrl("/api/editor-export"), {
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify({
@@ -233,7 +244,7 @@ function bridgePage(editorUrl) {
           }
         });
 
-        const events = new EventSource("/api/events?sessionId=" + encodeURIComponent(sessionId));
+        const events = new EventSource(apiUrl("/api/events"));
         events.addEventListener("diagram", (event) => {
           const update = JSON.parse(event.data);
           if (update.clientId === clientId || update.revision <= (current?.revision ?? 0)) return;
@@ -356,78 +367,52 @@ async function requestJson(request) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-function documentFileName(sessionId) {
-  return `${createHash("sha256").update(sessionId).digest("hex")}.json`;
-}
-
-function emptyDocument(sessionId) {
-  return { sessionId, revision: 0, xml: EMPTY_DRAWIO_XML, updatedAt: null, updatedBy: null, clientId: null };
-}
-
 export function createDrawioBridge({
   storageDir,
   host = "127.0.0.1",
   port = 0,
   editorUrl = process.env.OPENWORK_DRAWIO_WEB_URL || DEFAULT_EDITOR_URL,
   convertPngToJpeg = null,
+  gitExecutable = "git",
 }) {
   if (!storageDir) throw new Error("Draw.io bridge storageDir is required.");
   const drawioEditorUrl = validEditorUrl(editorUrl);
-  const queues = new Map();
   const eventClients = new Map();
   const pendingExports = new Map();
+  const workspaceStore = createDrawioWorkspaceStore({ storageDir, emptyXml: EMPTY_DRAWIO_XML, gitExecutable });
   let server = null;
   let state = null;
 
-  async function readDocument(sessionId) {
-    const file = path.join(storageDir, documentFileName(sessionId));
-    try {
-      const stored = JSON.parse(await readFile(file, "utf8"));
-      return stored.sessionId === sessionId ? stored : emptyDocument(sessionId);
-    } catch (error) {
-      if (error?.code === "ENOENT") return emptyDocument(sessionId);
-      throw error;
-    }
-  }
-
-  async function updateDocument(sessionId, input) {
-    const previous = queues.get(sessionId) ?? Promise.resolve();
-    const operation = previous.catch(() => undefined).then(async () => {
-      const current = await readDocument(sessionId);
-      if (!Number.isInteger(input.baseRevision) || input.baseRevision !== current.revision) {
-        return { conflict: true, current };
-      }
-      const xml = validateXml(input.xml);
-      if (!xml) return { invalid: true, error: "Expected valid draw.io XML rooted at mxfile or mxGraphModel." };
-      const next = {
-        sessionId,
-        revision: current.revision + 1,
-        xml,
-        updatedAt: new Date().toISOString(),
-        updatedBy: input.source === "editor" ? "editor" : "agent",
-        clientId: typeof input.clientId === "string" ? input.clientId : null,
-      };
-      await mkdir(storageDir, { recursive: true });
-      const file = path.join(storageDir, documentFileName(sessionId));
-      const temporary = `${file}.${randomUUID()}.tmp`;
-      await writeFile(temporary, JSON.stringify(next), "utf8");
-      await rename(temporary, file);
-      broadcast(sessionId, "diagram", {
-        revision: next.revision, updatedAt: next.updatedAt, updatedBy: next.updatedBy, clientId: next.clientId,
-      });
-      return { document: next };
+  async function resolveScope(requestUrl, sessionId) {
+    return workspaceStore.resolve({
+      sessionId,
+      workspacePath: requestUrl.searchParams.get("workspacePath"),
+      diagramId: requestUrl.searchParams.get("diagramId"),
     });
-    queues.set(sessionId, operation);
-    void operation.finally(() => { if (queues.get(sessionId) === operation) queues.delete(sessionId); });
-    return operation;
   }
 
-  function broadcast(sessionId, event, payload) {
+  async function updateDocument(scope, input) {
+    const xml = validateXml(input.xml);
+    if (!xml) return { invalid: true, error: "Expected valid draw.io XML rooted at mxfile or mxGraphModel." };
+    const result = await workspaceStore.update(scope, { ...input, xml });
+    if (result.document) {
+      broadcast(scope.key, "diagram", {
+        revision: result.document.revision,
+        updatedAt: result.document.updatedAt,
+        updatedBy: result.document.updatedBy,
+        actorId: result.document.actorId,
+        clientId: typeof input.clientId === "string" ? input.clientId : null,
+      });
+    }
+    return result;
+  }
+
+  function broadcast(scopeKey, event, payload) {
     const frame = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
-    for (const response of eventClients.get(sessionId) ?? []) response.write(frame);
+    for (const response of eventClients.get(scopeKey) ?? []) response.write(frame);
   }
 
-  async function saveExport(sessionId, format, data, fileName) {
+  async function saveExport(scope, format, data, fileName) {
     let content = decodeDataUri(data);
     if (content.length === 0 || content.length > MAX_BODY_BYTES) throw new Error("Draw.io returned an invalid export size.");
     if ((format === "jpeg" || format === "pdf") && isPng(content)) {
@@ -448,7 +433,7 @@ export function createDrawioBridge({
       throw new Error("Draw.io did not return JPEG content.");
     }
     const safeName = path.basename(fileName || EXPORT_FORMATS[format].fileName);
-    const outputDir = path.join(storageDir, "exports", createHash("sha256").update(sessionId).digest("hex"));
+    const outputDir = scope.exportsDir;
     const outputPath = path.join(outputDir, safeName);
     const temporary = `${outputPath}.${randomUUID()}.tmp`;
     await mkdir(outputDir, { recursive: true });
@@ -457,8 +442,8 @@ export function createDrawioBridge({
     return { outputPath, bytes: content.length };
   }
 
-  function requestEditorExport(sessionId, format, fileName) {
-    const clients = eventClients.get(sessionId);
+  function requestEditorExport(scope, format, fileName) {
+    const clients = eventClients.get(scope.key);
     if (!clients?.size) throw new Error("Open the Draw.io side panel before exporting from the agent.");
     const requestId = `export_${randomUUID()}`;
     return new Promise((resolve, reject) => {
@@ -466,9 +451,9 @@ export function createDrawioBridge({
         pendingExports.delete(requestId);
         reject(new Error("Draw.io export timed out."));
       }, EXPORT_TIMEOUT_MS);
-      pendingExports.set(requestId, { sessionId, format, fileName, resolve, reject, timer });
+      pendingExports.set(requestId, { scopeKey: scope.key, format, fileName, resolve, reject, timer });
       setTimeout(() => {
-        if (pendingExports.has(requestId)) broadcast(sessionId, "editor-command", { action: "export", requestId, format });
+        if (pendingExports.has(requestId)) broadcast(scope.key, "editor-command", { action: "export", requestId, format });
       }, 500);
     });
   }
@@ -494,8 +479,15 @@ export function createDrawioBridge({
       jsonResponse(response, 400, { ok: false, error: "A valid sessionId is required." });
       return;
     }
+    let scope;
+    try {
+      scope = await resolveScope(requestUrl, sessionId);
+    } catch (error) {
+      jsonResponse(response, 400, { ok: false, error: error.message });
+      return;
+    }
     if (request.method === "GET" && requestUrl.pathname === "/api/diagram") {
-      jsonResponse(response, 200, await readDocument(sessionId));
+      jsonResponse(response, 200, await workspaceStore.read(scope));
       return;
     }
     if (request.method === "PUT" && requestUrl.pathname === "/api/diagram") {
@@ -504,7 +496,7 @@ export function createDrawioBridge({
         jsonResponse(response, 400, { ok: false, error: error.message });
         return;
       }
-      const result = await updateDocument(sessionId, input);
+      const result = await updateDocument(scope, { ...input, sessionId });
       if (result.conflict) jsonResponse(response, 409, { ok: false, error: "revision_conflict", current: result.current });
       else if (result.invalid) jsonResponse(response, 400, { ok: false, error: result.error });
       else jsonResponse(response, 200, result.document);
@@ -515,13 +507,68 @@ export function createDrawioBridge({
         "cache-control": "no-cache", connection: "keep-alive", "content-type": "text/event-stream; charset=utf-8",
       });
       response.write(": connected\n\n");
-      const clients = eventClients.get(sessionId) ?? new Set();
+      const clients = eventClients.get(scope.key) ?? new Set();
       clients.add(response);
-      eventClients.set(sessionId, clients);
+      eventClients.set(scope.key, clients);
       request.on("close", () => {
         clients.delete(response);
-        if (clients.size === 0) eventClients.delete(sessionId);
+        if (clients.size === 0) eventClients.delete(scope.key);
       });
+      return;
+    }
+    if (request.method === "GET" && requestUrl.pathname === "/api/history") {
+      jsonResponse(response, 200, { ok: true, history: await workspaceStore.history(scope) });
+      return;
+    }
+    if (request.method === "GET" && requestUrl.pathname === "/api/diff") {
+      try {
+        const fromRevision = Number(requestUrl.searchParams.get("fromRevision"));
+        const toRevision = Number(requestUrl.searchParams.get("toRevision"));
+        jsonResponse(response, 200, { ok: true, ...(await workspaceStore.diff(scope, fromRevision, toRevision)) });
+      } catch (error) {
+        jsonResponse(response, 400, { ok: false, error: error.message });
+      }
+      return;
+    }
+    if (request.method === "POST" && requestUrl.pathname === "/api/restore") {
+      try {
+        const input = await requestJson(request);
+        const revision = Number(input.revision);
+        const result = await workspaceStore.restore(scope, revision, {
+          source: "agent",
+          actorId: input.actorId,
+          sessionId,
+          summary: input.summary,
+        });
+        if (result.conflict) {
+          jsonResponse(response, 409, { ok: false, error: "revision_conflict", current: result.current });
+          return;
+        }
+        if (result.document) {
+          broadcast(scope.key, "diagram", {
+            revision: result.document.revision,
+            updatedAt: result.document.updatedAt,
+            updatedBy: result.document.updatedBy,
+            actorId: result.document.actorId,
+            clientId: null,
+          });
+        }
+        jsonResponse(response, 200, { ok: true, ...result.document });
+      } catch (error) {
+        jsonResponse(response, 400, { ok: false, error: error.message });
+      }
+      return;
+    }
+    if (request.method === "POST" && requestUrl.pathname === "/api/checkpoint") {
+      try {
+        const input = await requestJson(request);
+        const message = typeof input.message === "string" && input.message.trim()
+          ? input.message.trim()
+          : `chore(drawio): checkpoint revision ${(await workspaceStore.read(scope)).revision}`;
+        jsonResponse(response, 200, { ok: true, ...(await workspaceStore.checkpoint(scope, message)) });
+      } catch (error) {
+        jsonResponse(response, 400, { ok: false, error: error.message });
+      }
       return;
     }
     if (request.method === "POST" && requestUrl.pathname === "/api/editor-export") {
@@ -530,10 +577,10 @@ export function createDrawioBridge({
         const format = exportFormat(input.format);
         if (!format) throw new Error("Unsupported Draw.io export format.");
         const pending = typeof input.requestId === "string" ? pendingExports.get(input.requestId) : null;
-        if (input.requestId && (!pending || pending.sessionId !== sessionId || pending.format !== format)) {
+        if (input.requestId && (!pending || pending.scopeKey !== scope.key || pending.format !== format)) {
           throw new Error("Unknown Draw.io export request.");
         }
-        const result = await saveExport(sessionId, format, input.data, pending?.fileName);
+        const result = await saveExport(scope, format, input.data, pending?.fileName);
         if (pending) {
           clearTimeout(pending.timer);
           pendingExports.delete(input.requestId);
@@ -550,7 +597,7 @@ export function createDrawioBridge({
         const input = await requestJson(request);
         const format = exportFormat(input.format);
         if (!format) throw new Error("Unsupported Draw.io export format.");
-        const result = await requestEditorExport(sessionId, format, input.fileName);
+        const result = await requestEditorExport(scope, format, input.fileName);
         jsonResponse(response, 200, { ok: true, format, label: EXPORT_FORMATS[format].label, ...result });
       } catch (error) {
         jsonResponse(response, 400, { ok: false, error: error.message });

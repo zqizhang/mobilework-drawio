@@ -2,7 +2,7 @@ import { z } from "zod";
 
 const DRAWIO_AGENT_GUIDANCE = `## Draw.io side-panel diagrams
 
-OpenWork has a session-scoped Draw.io editor in the right side panel.
+OpenWork has a workspace-scoped Draw.io editor in the right side panel. Sessions and agents in the same workspace share its current diagram and revision history.
 
 When the user asks to create or edit a diagram:
 1. Open or focus the editor with openwork_execute id "drawio.panel.open".
@@ -11,6 +11,7 @@ When the user asks to create or edit a diagram:
 4. Call drawio_update_state with the exact revision returned by drawio_get_state and the complete updated draw.io XML.
 5. If the update reports revision_conflict, call drawio_get_state again, reconcile your intended edit with the new XML, and retry. Never resubmit stale XML.
 6. When the user asks for SVG, PNG, editable SVG, editable PNG, PDF, JPEG, or HTML, keep the side panel open and call drawio_side_panel_export.
+7. Use drawio_history and drawio_diff to inspect prior work. Use drawio_restore only when the user asks to restore a version, and drawio_checkpoint for explicit Git milestones.
 
 The XML state is the source of truth. Do not rely on screenshots or overwrite a newer revision.`;
 
@@ -21,6 +22,7 @@ const updateArgsSchema = z.object({
   xml: z.string().min(1).describe(
     "Complete updated draw.io XML rooted at mxfile or mxGraphModel.",
   ),
+  summary: z.string().min(1).max(500).optional().describe("Short description of the diagram change."),
 });
 
 const exportArgsSchema = z.object({
@@ -32,8 +34,24 @@ const exportArgsSchema = z.object({
   ),
 });
 
+const diffArgsSchema = z.object({
+  fromRevision: z.number().int().min(1),
+  toRevision: z.number().int().min(1),
+});
+
+const restoreArgsSchema = z.object({
+  revision: z.number().int().min(1),
+  summary: z.string().min(1).max(500).optional(),
+});
+
+const checkpointArgsSchema = z.object({
+  message: z.string().min(1).max(500).optional(),
+});
+
 type DrawioToolContext = {
   sessionID: string;
+  agent?: string;
+  directory?: string;
 };
 
 function bridgeUrl(): URL {
@@ -47,15 +65,10 @@ function bridgeUrl(): URL {
   return url;
 }
 
-function diagramUrl(sessionID: string): URL {
-  const url = new URL("/api/diagram", bridgeUrl());
+function scopedUrl(pathname: string, sessionID: string, workspacePath?: string): URL {
+  const url = new URL(pathname, bridgeUrl());
   url.searchParams.set("sessionId", sessionID);
-  return url;
-}
-
-function exportUrl(sessionID: string): URL {
-  const url = new URL("/api/export", bridgeUrl());
-  url.searchParams.set("sessionId", sessionID);
+  if (workspacePath) url.searchParams.set("workspacePath", workspacePath);
   return url;
 }
 
@@ -71,16 +84,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export const OpenWorkDrawio = async () => ({
-  "experimental.chat.system.transform": async (_input: unknown, output: { system: string[] }) => {
-    output.system.push(DRAWIO_AGENT_GUIDANCE);
-  },
-  tool: {
+export const OpenWorkDrawio = async (factoryInput?: unknown) => {
+  const factoryDirectory = isRecord(factoryInput) && typeof factoryInput.directory === "string"
+    ? factoryInput.directory
+    : undefined;
+  const workspaceFor = (context: DrawioToolContext) => context.directory ?? factoryDirectory;
+  const actorFor = (context: DrawioToolContext) => context.agent ?? "agent";
+
+  return {
+    "experimental.chat.system.transform": async (_input: unknown, output: { system: string[] }) => {
+      output.system.push(DRAWIO_AGENT_GUIDANCE);
+    },
+    tool: {
     drawio_get_state: {
-      description: "Read the latest session-scoped Draw.io XML and revision, including the user's manual edits. Always call this immediately before changing a diagram.",
+      description: "Read the latest workspace-scoped Draw.io XML and revision, including manual edits and changes from other sessions or agents.",
       args: {},
       async execute(_rawArgs: unknown, context: DrawioToolContext) {
-        const response = await fetch(diagramUrl(context.sessionID), {
+        const response = await fetch(scopedUrl("/api/diagram", context.sessionID, workspaceFor(context)), {
           cache: "no-store",
           signal: AbortSignal.timeout(5_000),
         });
@@ -90,17 +110,19 @@ export const OpenWorkDrawio = async () => ({
       },
     },
     drawio_update_state: {
-      description: "Replace the current session's Draw.io XML using optimistic concurrency. A stale revision is rejected so user edits cannot be overwritten.",
+      description: "Replace the current workspace diagram XML using optimistic concurrency. A stale revision is rejected so user or agent edits cannot be overwritten.",
       args: updateArgsSchema.shape,
       async execute(rawArgs: unknown, context: DrawioToolContext) {
         const args = updateArgsSchema.parse(rawArgs);
-        const response = await fetch(diagramUrl(context.sessionID), {
+        const response = await fetch(scopedUrl("/api/diagram", context.sessionID, workspaceFor(context)), {
           method: "PUT",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             xml: args.xml,
             baseRevision: args.baseRevision,
             source: "agent",
+            actorId: actorFor(context),
+            summary: args.summary,
           }),
           signal: AbortSignal.timeout(10_000),
         });
@@ -122,7 +144,7 @@ export const OpenWorkDrawio = async () => ({
       args: exportArgsSchema.shape,
       async execute(rawArgs: unknown, context: DrawioToolContext) {
         const args = exportArgsSchema.parse(rawArgs);
-        const response = await fetch(exportUrl(context.sessionID), {
+        const response = await fetch(scopedUrl("/api/export", context.sessionID, workspaceFor(context)), {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(args),
@@ -133,5 +155,65 @@ export const OpenWorkDrawio = async () => ({
         return JSON.stringify(body, null, 2);
       },
     },
+    drawio_history: {
+      description: "List the complete revision history for the current workspace diagram, including session and agent identities.",
+      args: {},
+      async execute(_rawArgs: unknown, context: DrawioToolContext) {
+        const response = await fetch(scopedUrl("/api/history", context.sessionID, workspaceFor(context)), {
+          cache: "no-store",
+          signal: AbortSignal.timeout(5_000),
+        });
+        const body = await parseResponse(response);
+        if (!response.ok) throw new Error(String(body.error ?? "Unable to read Draw.io history."));
+        return JSON.stringify(body, null, 2);
+      },
+    },
+    drawio_diff: {
+      description: "Compare two revisions of the current workspace diagram by added, removed, and changed Draw.io cell IDs.",
+      args: diffArgsSchema.shape,
+      async execute(rawArgs: unknown, context: DrawioToolContext) {
+        const args = diffArgsSchema.parse(rawArgs);
+        const url = scopedUrl("/api/diff", context.sessionID, workspaceFor(context));
+        url.searchParams.set("fromRevision", String(args.fromRevision));
+        url.searchParams.set("toRevision", String(args.toRevision));
+        const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(5_000) });
+        const body = await parseResponse(response);
+        if (!response.ok) throw new Error(String(body.error ?? "Unable to compare Draw.io revisions."));
+        return JSON.stringify(body, null, 2);
+      },
+    },
+    drawio_restore: {
+      description: "Restore a previous revision as a new current revision. Use only when the user explicitly requests a restore.",
+      args: restoreArgsSchema.shape,
+      async execute(rawArgs: unknown, context: DrawioToolContext) {
+        const args = restoreArgsSchema.parse(rawArgs);
+        const response = await fetch(scopedUrl("/api/restore", context.sessionID, workspaceFor(context)), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ...args, actorId: actorFor(context) }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        const body = await parseResponse(response);
+        if (!response.ok) throw new Error(String(body.error ?? "Unable to restore the Draw.io revision."));
+        return JSON.stringify(body, null, 2);
+      },
+    },
+    drawio_checkpoint: {
+      description: "Create an explicit Git milestone containing the current diagram, workspace manifest, and revision history.",
+      args: checkpointArgsSchema.shape,
+      async execute(rawArgs: unknown, context: DrawioToolContext) {
+        const args = checkpointArgsSchema.parse(rawArgs);
+        const response = await fetch(scopedUrl("/api/checkpoint", context.sessionID, workspaceFor(context)), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(args),
+          signal: AbortSignal.timeout(15_000),
+        });
+        const body = await parseResponse(response);
+        if (!response.ok) throw new Error(String(body.error ?? "Unable to create the Draw.io Git checkpoint."));
+        return JSON.stringify(body, null, 2);
+      },
+    },
   },
-});
+  };
+};

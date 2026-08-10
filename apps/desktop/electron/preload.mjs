@@ -137,6 +137,7 @@ contextBridge.exposeInMainWorld("__OPENWORK_ELECTRON__", {
   },
   drawio: {
     getState() { return ipcRenderer.invoke("openwork:drawio:state"); },
+    ensureDocker(options) { return ipcRenderer.invoke("openwork:drawio:ensure-docker", options); },
   },
   browser: {
     show(bounds) { return ipcRenderer.invoke("openwork:browser:show", bounds); },

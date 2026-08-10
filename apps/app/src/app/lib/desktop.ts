@@ -135,10 +135,24 @@ declare global {
       };
       drawio?: {
         getState?: () => Promise<{
-          baseUrl: string;
-          editorUrl: string;
-          port: number;
-        } | null>;
+          baseUrl?: string;
+          editorUrl?: string;
+          port?: number;
+          docker: {
+            managed: boolean;
+            status: string;
+            editorUrl: string;
+            containerName: string;
+            image: string;
+            error: string | null;
+            checkedAt: string | null;
+          };
+        }>;
+        ensureDocker?: (options?: { install?: boolean }) => Promise<{
+          managed: boolean;
+          status: string;
+          error: string | null;
+        }>;
       };
       browser?: {
         show?: (bounds: { x: number; y: number; width: number; height: number }) => Promise<void>;

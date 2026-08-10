@@ -198,3 +198,107 @@ test("bridge exports PNG, PDF, and JPEG files returned by Draw.io Web", async ()
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("workspace diagrams persist across sessions with agent history, diff, and restore", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "openwork-drawio-"));
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "openwork-drawio-workspace-"));
+  const bridge = createDrawioBridge({ storageDir: root });
+  const scopedUrl = (baseUrl, pathname, sessionId) => {
+    const url = new URL(pathname, baseUrl);
+    url.searchParams.set("sessionId", sessionId);
+    url.searchParams.set("workspacePath", workspace);
+    return url;
+  };
+  try {
+    const state = await bridge.start();
+    const sessionA = scopedUrl(state.baseUrl, "/api/diagram", "session-a");
+    const sessionB = scopedUrl(state.baseUrl, "/api/diagram", "session-b");
+    const initial = await fetch(sessionA).then((response) => response.json());
+    assert.equal(initial.revision, 0);
+    assert.equal(initial.workspacePath, workspace);
+
+    const first = await fetch(sessionA, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        xml: XML_ONE,
+        baseRevision: 0,
+        source: "agent",
+        actorId: "agent-a",
+        summary: "Create the initial flow",
+      }),
+    });
+    assert.equal(first.status, 200);
+    assert.equal((await first.json()).revision, 1);
+
+    const shared = await fetch(sessionB).then((response) => response.json());
+    assert.equal(shared.revision, 1);
+    assert.equal(shared.xml, XML_ONE);
+    const events = await fetch(scopedUrl(state.baseUrl, "/api/events", "session-a"));
+    const eventReader = events.body.getReader();
+    const eventDecoder = new TextDecoder();
+
+    const stale = await fetch(sessionB, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ xml: XML_TWO, baseRevision: 0, source: "agent", actorId: "agent-b" }),
+    });
+    assert.equal(stale.status, 409);
+
+    const second = await fetch(sessionB, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        xml: XML_TWO,
+        baseRevision: 1,
+        source: "agent",
+        actorId: "agent-b",
+        summary: "Add the second cell",
+      }),
+    });
+    assert.equal(second.status, 200);
+    assert.equal((await second.json()).revision, 2);
+    let eventBuffer = "";
+    let diagramEvent;
+    while (!diagramEvent) {
+      const chunk = await eventReader.read();
+      assert.equal(chunk.done, false);
+      eventBuffer += eventDecoder.decode(chunk.value, { stream: true });
+      const frames = eventBuffer.split("\n\n");
+      eventBuffer = frames.pop();
+      for (const frame of frames) {
+        if (!frame.startsWith("event: diagram")) continue;
+        const data = frame.split("\n").find((line) => line.startsWith("data: "));
+        diagramEvent = JSON.parse(data.slice(6));
+      }
+    }
+    assert.equal(diagramEvent.revision, 2);
+    assert.equal(diagramEvent.actorId, "agent-b");
+
+    const history = await fetch(scopedUrl(state.baseUrl, "/api/history", "session-a")).then((response) => response.json());
+    assert.deepEqual(history.history.map((entry) => entry.actorId), ["agent-b", "agent-a"]);
+
+    const diffUrl = scopedUrl(state.baseUrl, "/api/diff", "session-a");
+    diffUrl.searchParams.set("fromRevision", "1");
+    diffUrl.searchParams.set("toRevision", "2");
+    const diff = await fetch(diffUrl).then((response) => response.json());
+    assert.deepEqual(diff.added, ["1"]);
+
+    const restored = await fetch(scopedUrl(state.baseUrl, "/api/restore", "session-b"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: 1, actorId: "agent-b", summary: "Restore the initial flow" }),
+    }).then((response) => response.json());
+    assert.equal(restored.revision, 3);
+    assert.equal(restored.xml, XML_ONE);
+
+    const manifest = JSON.parse(await readFile(path.join(workspace, ".openwork", "drawio-workspace.json"), "utf8"));
+    assert.equal(manifest.diagrams[0].revision, 3);
+    assert.equal(await readFile(path.join(workspace, manifest.diagrams[0].file), "utf8"), XML_ONE);
+    await eventReader.cancel();
+  } finally {
+    await bridge.stop();
+    await rm(root, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
