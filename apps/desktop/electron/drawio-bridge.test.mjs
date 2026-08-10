@@ -62,6 +62,10 @@ test("bridge page and health endpoint are served from the managed port", async (
     assert.match(page, /127\.0\.0\.1:18080/);
     assert.match(page, /event === "autosave"/);
     assert.match(page, /Editable SVG/);
+    assert.match(page, /data-format="png">PNG/);
+    assert.match(page, /data-format="pdf">PDF/);
+    assert.match(page, /data-format="jpeg">JPEG/);
+    assert.match(page, /active\.format === "jpeg" \|\| active\.format === "pdf" \? "png"/);
   } finally {
     await bridge.stop();
     await rm(root, { recursive: true, force: true });
@@ -116,6 +120,78 @@ test("agent export command is completed by the connected side-panel editor", asy
     assert.equal(exported.ok, true);
     assert.equal(exported.format, "xmlsvg");
     assert.equal(await readFile(exported.outputPath, "utf8"), svg);
+    await reader.cancel();
+  } finally {
+    await bridge.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("bridge exports PNG, PDF, and JPEG files returned by Draw.io Web", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "openwork-drawio-"));
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0]);
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xc0, 0, 17, 8, 0, 1, 0, 1, 3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0, 0xff, 0xd9]);
+  const bridge = createDrawioBridge({ storageDir: root, convertPngToJpeg: () => jpeg });
+  try {
+    const state = await bridge.start();
+    const sessionId = "session-binary-exports";
+    const events = await fetch(`${state.baseUrl}/api/events?sessionId=${sessionId}`);
+    const reader = events.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    async function readExportCommand() {
+      while (true) {
+        const chunk = await reader.read();
+        assert.equal(chunk.done, false);
+        buffer += decoder.decode(chunk.value, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop();
+        for (const frame of frames) {
+          if (!frame.startsWith("event: editor-command")) continue;
+          const data = frame.split("\n").find((line) => line.startsWith("data: "));
+          return JSON.parse(data.slice(6));
+        }
+      }
+    }
+
+    const fixtures = [
+      { format: "png", fileName: "diagram.png", mime: "image/png", content: png, expected: png },
+      { format: "pdf", fileName: "diagram.pdf", mime: "image/png", content: png, expected: jpeg },
+      { format: "jpeg", fileName: "diagram.jpg", mime: "image/png", content: png, expected: jpeg },
+    ];
+
+    for (const fixture of fixtures) {
+      const exportResponsePromise = fetch(`${state.baseUrl}/api/export?sessionId=${sessionId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: fixture.format, fileName: fixture.fileName }),
+      });
+      const command = await readExportCommand();
+      assert.equal(command.format, fixture.format);
+
+      const editorResponse = await fetch(`${state.baseUrl}/api/editor-export?sessionId=${sessionId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          format: fixture.format,
+          requestId: command.requestId,
+          data: `data:${fixture.mime};base64,${fixture.content.toString("base64")}`,
+        }),
+      });
+      assert.equal(editorResponse.status, 200);
+
+      const exported = await exportResponsePromise.then((response) => response.json());
+      assert.equal(exported.ok, true);
+      assert.equal(exported.format, fixture.format);
+      const saved = await readFile(exported.outputPath);
+      if (fixture.format === "pdf") {
+        assert.equal(saved.subarray(0, 5).toString("ascii"), "%PDF-");
+        assert.equal(saved.includes(fixture.expected), true);
+      } else {
+        assert.deepEqual(saved, fixture.expected);
+      }
+    }
     await reader.cancel();
   } finally {
     await bridge.stop();

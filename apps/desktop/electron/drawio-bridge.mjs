@@ -9,7 +9,10 @@ const DEFAULT_EDITOR_URL = "http://127.0.0.1:18080/";
 const EXPORT_FORMATS = {
   svg: { fileName: "diagram.svg", label: "SVG" },
   xmlsvg: { fileName: "diagram.editable.svg", label: "Editable SVG" },
+  png: { fileName: "diagram.png", label: "PNG" },
   xmlpng: { fileName: "diagram.editable.png", label: "Editable PNG" },
+  pdf: { fileName: "diagram.pdf", label: "PDF" },
+  jpeg: { fileName: "diagram.jpg", label: "JPEG" },
   html2: { fileName: "diagram.html", label: "HTML" },
 };
 const EMPTY_DRAWIO_XML = [
@@ -75,7 +78,10 @@ function bridgePage(editorUrl) {
       <strong>Export</strong>
       <button type="button" data-format="svg">SVG</button>
       <button type="button" data-format="xmlsvg">Editable SVG</button>
+      <button type="button" data-format="png">PNG</button>
       <button type="button" data-format="xmlpng">Editable PNG</button>
+      <button type="button" data-format="pdf">PDF</button>
+      <button type="button" data-format="jpeg">JPEG</button>
       <button type="button" data-format="html2">HTML</button>
     </div>
     <div id="status" role="status"></div>
@@ -145,7 +151,7 @@ function bridgePage(editorUrl) {
           const active = pendingExport;
           editorMessage({
             action: "export",
-            format: active.format,
+            format: active.format === "jpeg" || active.format === "pdf" ? "png" : active.format,
             currentPage: true,
             allPages: false,
             message: { requestId: active.requestId },
@@ -272,6 +278,73 @@ function decodeDataUri(value) {
     : Buffer.from(decodeURIComponent(match[3]), "utf8");
 }
 
+function isJpeg(content) {
+  return content.length >= 4
+    && content[0] === 0xff
+    && content[1] === 0xd8
+    && content[content.length - 2] === 0xff
+    && content[content.length - 1] === 0xd9;
+}
+
+function isPng(content) {
+  return content.length >= 8 && content.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+}
+
+function jpegDimensions(content) {
+  for (let offset = 2; offset + 8 < content.length;) {
+    if (content[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    const marker = content[offset + 1];
+    if (marker === 0xd8 || marker === 0xd9) {
+      offset += 2;
+      continue;
+    }
+    const length = content.readUInt16BE(offset + 2);
+    if (length < 2 || offset + length + 2 > content.length) break;
+    if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker)) {
+      return { height: content.readUInt16BE(offset + 5), width: content.readUInt16BE(offset + 7) };
+    }
+    offset += length + 2;
+  }
+  throw new Error("Draw.io returned JPEG content without dimensions.");
+}
+
+function jpegToPdf(jpeg) {
+  const { width, height } = jpegDimensions(jpeg);
+  const drawing = Buffer.from(`q\n${width} 0 0 ${height} 0 0 cm\n/Im0 Do\nQ\n`, "ascii");
+  const objects = [
+    Buffer.from("<< /Type /Catalog /Pages 2 0 R >>", "ascii"),
+    Buffer.from("<< /Type /Pages /Kids [3 0 R] /Count 1 >>", "ascii"),
+    Buffer.from(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>`, "ascii"),
+    Buffer.concat([Buffer.from(`<< /Length ${drawing.length} >>\nstream\n`, "ascii"), drawing, Buffer.from("endstream", "ascii")]),
+    Buffer.concat([
+      Buffer.from(`<< /Type /XObject /Subtype /Image /Width ${width} /Height ${height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpeg.length} >>\nstream\n`, "ascii"),
+      jpeg,
+      Buffer.from("\nendstream", "ascii"),
+    ]),
+  ];
+  const parts = [Buffer.from("%PDF-1.4\n%\xe2\xe3\xcf\xd3\n", "latin1")];
+  const offsets = [0];
+  let size = parts[0].length;
+  for (let index = 0; index < objects.length; index += 1) {
+    const object = Buffer.concat([
+      Buffer.from(`${index + 1} 0 obj\n`, "ascii"),
+      objects[index],
+      Buffer.from("\nendobj\n", "ascii"),
+    ]);
+    offsets.push(size);
+    parts.push(object);
+    size += object.length;
+  }
+  const xrefOffset = size;
+  const xref = ["xref", `0 ${objects.length + 1}`, "0000000000 65535 f "];
+  for (const offset of offsets.slice(1)) xref.push(`${String(offset).padStart(10, "0")} 00000 n `);
+  parts.push(Buffer.from(`${xref.join("\n")}\ntrailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`, "ascii"));
+  return Buffer.concat(parts);
+}
+
 async function requestJson(request) {
   const chunks = [];
   let size = 0;
@@ -296,6 +369,7 @@ export function createDrawioBridge({
   host = "127.0.0.1",
   port = 0,
   editorUrl = process.env.OPENWORK_DRAWIO_WEB_URL || DEFAULT_EDITOR_URL,
+  convertPngToJpeg = null,
 }) {
   if (!storageDir) throw new Error("Draw.io bridge storageDir is required.");
   const drawioEditorUrl = validEditorUrl(editorUrl);
@@ -354,10 +428,24 @@ export function createDrawioBridge({
   }
 
   async function saveExport(sessionId, format, data, fileName) {
-    const content = decodeDataUri(data);
+    let content = decodeDataUri(data);
     if (content.length === 0 || content.length > MAX_BODY_BYTES) throw new Error("Draw.io returned an invalid export size.");
+    if ((format === "jpeg" || format === "pdf") && isPng(content)) {
+      if (typeof convertPngToJpeg !== "function") throw new Error("PNG-to-JPEG conversion is unavailable.");
+      content = await convertPngToJpeg(content);
+    }
+    if (format === "pdf" && isJpeg(content)) content = jpegToPdf(content);
     if ((format === "svg" || format === "xmlsvg") && !content.subarray(0, 4096).toString("utf8").includes("<svg")) {
       throw new Error("Draw.io did not return SVG content.");
+    }
+    if ((format === "png" || format === "xmlpng") && !isPng(content)) {
+      throw new Error("Draw.io did not return PNG content.");
+    }
+    if (format === "pdf" && content.subarray(0, 5).toString("ascii") !== "%PDF-") {
+      throw new Error("Draw.io did not return PDF content.");
+    }
+    if (format === "jpeg" && !isJpeg(content)) {
+      throw new Error("Draw.io did not return JPEG content.");
     }
     const safeName = path.basename(fileName || EXPORT_FORMATS[format].fileName);
     const outputDir = path.join(storageDir, "exports", createHash("sha256").update(sessionId).digest("hex"));

@@ -10,7 +10,7 @@ When the user asks to create or edit a diagram:
 3. Preserve the user's existing cells and changes unless the user explicitly asks to replace them.
 4. Call drawio_update_state with the exact revision returned by drawio_get_state and the complete updated draw.io XML.
 5. If the update reports revision_conflict, call drawio_get_state again, reconcile your intended edit with the new XML, and retry. Never resubmit stale XML.
-6. When the user asks for SVG, editable SVG, editable PNG, or HTML, keep the side panel open and call drawio_side_panel_export.
+6. When the user asks for SVG, PNG, editable SVG, editable PNG, PDF, JPEG, or HTML, keep the side panel open and call drawio_side_panel_export.
 
 The XML state is the source of truth. Do not rely on screenshots or overwrite a newer revision.`;
 
@@ -24,8 +24,8 @@ const updateArgsSchema = z.object({
 });
 
 const exportArgsSchema = z.object({
-  format: z.enum(["svg", "xmlsvg", "xmlpng", "html2"]).describe(
-    "Draw.io Web export format: svg, editable SVG, editable PNG, or HTML.",
+  format: z.enum(["svg", "xmlsvg", "png", "xmlpng", "pdf", "jpeg", "html2"]).describe(
+    "Draw.io Web export format: SVG, editable SVG, PNG, editable PNG, PDF, JPEG, or HTML.",
   ),
   fileName: z.string().min(1).max(255).optional().describe(
     "Optional output file name. Directory components are ignored by the desktop bridge.",

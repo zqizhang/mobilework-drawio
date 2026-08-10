@@ -975,6 +975,7 @@ const browserPanel = createBrowserPanel({
 });
 const drawioBridge = createDrawioBridge({
   storageDir: path.join(app.getPath("userData"), "drawio-bridge"),
+  convertPngToJpeg: (content) => nativeImage.createFromBuffer(content).toJPEG(92),
 });
 
 const workspaceStore = createWorkspaceStore({
