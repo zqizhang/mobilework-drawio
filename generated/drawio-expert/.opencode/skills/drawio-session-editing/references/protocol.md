@@ -50,7 +50,8 @@ as a required read-merge-retry operation, not as a transient network retry.
 - The wrapper uses the official Draw.io JSON embed protocol. The wrapper adds an
   "添加注释" button that requests `{action:'export', format:'json', selection:true,
   currentPage:true, allPages:false}` from the editor, then posts the selected
-  cells (stable ids) plus the user's instruction to the annotation endpoints below.
+  cells (stable ids), the user's instruction and one of three scope policies to
+  the annotation endpoints below.
 - The bridge binds only to loopback and requires the short-lived token returned
   by `drawio_open`.
 
@@ -58,8 +59,10 @@ as a required read-merge-retry operation, not as a transient network retry.
 
 A new annotation is a single independent task tied to the bound session/file. It
 records the selected stable cell ids, the page, the union bounding box (region,
-computed by the bridge from the latest XML), the instruction and the revision at
-submit time. Tasks persist to `<basename>.annotations.json` next to the diagram.
+computed by the bridge from the latest XML), the instruction, scope policy and
+revision at submit time. Tasks persist to `<basename>.annotations.json` next to
+the diagram. Scope is `selection_only`, `selection_and_edges` or
+`surrounding_layout`.
 
 ```http
 GET /api/annotations?sessionId=...&status=open
@@ -74,6 +77,7 @@ Content-Type: application/json
 
 {
   "instruction": "把该节点改名为 Redis 缓存层",
+  "scope": "selection_only",
   "pageId": "p1",
   "pageName": "Page-1",
   "cells": [{ "id": "node", "kind": "node", "label": "MobileWork" }]
@@ -82,6 +86,15 @@ Content-Type: application/json
 
 Returns `201` with `{ ok, annotation }`. The `region` and `baseRevision` are
 filled in by the bridge.
+
+Before an Agent write, it must perform a dry-run and call
+`drawio_authorize_annotation_change`. That custom tool is configured with
+OpenCode permission `ask`, so the host shows an approval popup before execution.
+Approval creates a one-time token bound to the annotation, current revision,
+requested scope and complete proposed stable-ID list. Formal `drawio_patch` or
+`drawio_update_state` calls must pass both `annotation_id` and `approval_token`.
+The runtime rejects missing, expired, reused, undeclared or out-of-scope changes.
+Scope escalation requires a non-empty reason and a new approval popup.
 
 ```http
 GET /api/annotations/{id}?sessionId=...
