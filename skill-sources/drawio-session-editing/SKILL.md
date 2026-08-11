@@ -120,4 +120,15 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 
 用户也可以在浏览器注释面板手动标记已解决；agent 看到 `resolved` 的注释跳过即可，无需再次处理。
 
+## 历史版本恢复
+
+用户在浏览器右下角"历史"弹窗中可以查看最近 20 个持久化版本、通过缩略图和大图预览识别版本，并选择某个旧版本执行恢复。恢复是追加式新提交：它以新 revision 写入目标快照内容并新建一个 `restore` 历史检查点，恢复前的当前版本不会被删除，因此恢复本身也可以再次恢复回退。`restore` 不需要、也不存在 agent 可直接调用的工具，恢复只能由用户在浏览器中确认触发。
+
+恢复发生后 agent 必须按以下规则行动：
+
+- 重新调用 `drawio_get_state` 读取最新 XML 和 revision，把恢复后的内容作为新基线；禁止继续沿用恢复前的旧 XML。
+- 所有未完成注释仍然存在，但它们的 `freshness` 会基于恢复后的 XML 重新计算，旧版本上的审批授权已被显式清空，`activeAnnotationId` 也会被清除。恢复后旧的 `approval_token` 一律失效；必须重新 `drawio_get_annotation`、重新 dry-run、重新调用 `drawio_authorize_annotation_change` 并等待新的审批弹窗，才能再次正式写入。
+- 已解决注释不会因恢复自动重新打开。
+- 恢复只更新 `.drawio` XML；同名 PNG 等派生文件可能暂时落后，直到下一次 `drawio_finalize` 刷新，不得宣称这些导出文件也已恢复。
+
 诊断Bridge或实现宿主适配时读取[references/protocol.md](references/protocol.md)。需要理解基础XML模式时读取[references/xml-patterns.md](references/xml-patterns.md)；复杂绘图知识以`drawio-skill`为准。

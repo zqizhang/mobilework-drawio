@@ -114,3 +114,63 @@ Regardless of stored legacy state, API payloads expose stale unfinished tasks as
 records `summary`, `changedIds`, `revision` and `updatedAt` in `result` without
 modifying the diagram — diagram changes go through the revision protocol above.
 Both Agent tools (`drawio_resolve_annotation`) and the wrapper UI can resolve.
+
+## Version history
+
+User-visible history is separate from the per-revision session window. A
+`snapshot sequence` only advances when a meaningful checkpoint is formed; a
+`session revision` advances on every successful write. Every snapshot gets a
+stable `snapshot id` and restore must use that id (never an array index).
+
+Checkpoints are stored under `<workspace>/.mobilework/drawio-history/v1/`
+(durable across runtime restarts) and are created for: the first bind (`initial`),
+quiet editor saves merged over a 2s debounce (`editor`), every successful Agent
+commit (`agent`), external file changes (`external`) and append-only restores
+(`restore`). Identical consecutive normal checkpoints are deduplicated; restore
+always records a new entry. At most 20 snapshots are kept per file, newest wins.
+
+```http
+GET /api/history?sessionId=...
+```
+
+Returns `{ ok, file, currentRevision, currentSnapshotId, count, entries }`.
+Entries are ordered newest-first and contain `id`, `sequence`, `createdAt`,
+`source`, `isCurrent`, `restoredFromSequence`, `pages` and `previewState`.
+The list response never includes the full XML.
+
+```http
+GET /api/history/{snapshotId}/preview?sessionId=...&pageId=p1&mode=thumb
+GET /api/history/{snapshotId}/preview?sessionId=...&pageId=p1&mode=preview
+```
+
+Returns `image/png` (cached with `Cache-Control: private`). `mode` is
+`thumb | preview`; `pageId` must belong to the snapshot. A snapshot is
+immutable, so previews are generated from its stored XML without touching the
+user's live editor.
+
+```http
+POST /api/history/{snapshotId}/restore?sessionId=...
+Content-Type: application/json
+
+{
+  "baseRevision": 18,
+  "clientId": "browser-uuid"
+}
+```
+
+Restore is **append-only**: it verifies `baseRevision` inside the same per-file
+write queue, persists the current checkpoint, then writes the target snapshot
+XML as a new revision (`updatedBy: "restore"`) and records a new `restore`
+checkpoint with `restoredFromSnapshotId`. The pre-restore current version and
+the restored-from version both remain in history, so a restore can itself be
+undone. A stale `baseRevision` returns `409 revision_conflict`; the client must
+show the latest state and never auto-retry with a new revision.
+
+Restoring never rewinds annotations, exported PNG/PDF files or chat records.
+After a restore, all unconsumed annotation approvals are invalidated and the
+active annotation is cleared: an Agent must re-read `drawio_get_annotation` and
+the latest state, dry-run again, and request a fresh approval before writing.
+
+SSE `event: history` carries `snapshot-created`, `preview-ready`,
+`preview-failed` and `snapshot-evicted`; restore still broadcasts the existing
+`event: diagram` so every live editor refreshes its revision.

@@ -199,6 +199,16 @@ try {
   assert.match(editorPage, /只修改选区/)
   assert.match(editorPage, /允许调整关联连线/)
   assert.match(editorPage, /允许调整周边布局/)
+  assert.match(editorPage, /id="history-btn"/, "editor page must include the history entry")
+  assert.match(editorPage, /版本历史/, "editor page must include the history modal")
+  assert.match(editorPage, /将图表恢复为 v/, "editor page must include the restore confirmation text")
+  assert.match(editorPage, /恢复会创建新版本，当前版本不会被删除/, "editor page must explain append-only restore")
+  assert.match(editorPage, /重新加载最新版本/, "editor page must offer an explicit reload action on conflict")
+  assert.doesNotMatch(
+    editorPage,
+    /return writeState\(xml, result\.current\.revision\)/,
+    "browser must not blind-retry an old XML with a new revision on 409",
+  )
 
   const apiUrl = new URL(openResult.openUrl)
   apiUrl.pathname = "/api/diagram"

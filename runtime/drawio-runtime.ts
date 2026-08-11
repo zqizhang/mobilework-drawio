@@ -116,6 +116,16 @@ const DEFAULT_EXPORT_URL = "http://127.0.0.1:18765/ImageExport4/export"
 const DEFAULT_EXPORT_BACKGROUND = "#ffffff"
 const BRIDGE_TOKEN_TTL_MS = 12 * 60 * 60 * 1000
 const SESSION_HISTORY_LIMIT = 20
+// User-visible persistent history settings. The in-memory `session.history`
+// window above is a short-lived per-revision conflict window; this store is a
+// separate durable checkpoint repository that survives runtime restarts.
+const HISTORY_MAX_ENTRIES = 20
+const HISTORY_EDITOR_DEBOUNCE_MS = 2000
+const HISTORY_PREVIEW_CONCURRENCY = 2
+const HISTORY_THUMB_SCALE = 0.25
+const HISTORY_PREVIEW_MAX_BYTES = 8 * 1024 * 1024
+const HISTORY_SCHEMA_VERSION = 1
+const HISTORY_SNAPSHOT_ID_RE = /^h_[A-Za-z0-9_-]+_[A-Fa-f0-9]{8,}$/
 const ARTIFACT_MARKER = "drawio-expert-artifact:v1"
 const SAFE_ID = /^[A-Za-z0-9_.:-]+$/
 const DRAWIO_ENVIRONMENT_KEYS = [
@@ -2288,7 +2298,7 @@ function buildDrawioArtifactHtml(options: {
 type IntegratedSessionHistory = {
   revision: number
   xml: string
-  updatedBy: "editor" | "agent" | "external" | "initial"
+  updatedBy: "editor" | "agent" | "external" | "initial" | "restore"
   updatedAt: string
 }
 
@@ -2300,11 +2310,44 @@ type IntegratedSession = {
   revision: number
   xml: string
   fileHash: string
-  updatedBy: "editor" | "agent" | "external" | "initial"
+  updatedBy: "editor" | "agent" | "external" | "initial" | "restore"
   updatedAt: string
   history: IntegratedSessionHistory[]
   backupFile: string | null
   activeAnnotationId: string | null
+  historyWarning: string | null
+}
+
+type HistorySource = "initial" | "editor" | "agent" | "external" | "restore"
+
+type HistoryPageMeta = { id: string; name: string }
+
+type HistorySnapshotMeta = {
+  id: string
+  sequence: number
+  createdAt: string
+  source: HistorySource
+  sessionId: string | null
+  sessionRevision: number
+  contentHash: string
+  parentSnapshotId: string | null
+  restoredFromSnapshotId: string | null
+  pages: HistoryPageMeta[]
+  previewState: "pending" | "ready" | "failed" | "unavailable"
+}
+
+type HistoryManifest = {
+  schemaVersion: 1
+  file: { relativePath: string; pathKey: string }
+  nextSequence: number
+  entries: HistorySnapshotMeta[]
+}
+
+type HistoryPendingEditor = {
+  timer: NodeJS.Timeout
+  sessionId: string
+  revision: number
+  hash: string
 }
 
 type IntegratedToken = {
@@ -2383,6 +2426,11 @@ type IntegratedBridgeState = {
   eventClients: Map<string, Set<import("node:http").ServerResponse>>
   writeQueues: Map<string, Promise<unknown>>
   annotations: Map<string, Map<string, AnnotationTask>>
+  historyWriteQueues: Map<string, Promise<unknown>>
+  historyDebounce: Map<string, HistoryPendingEditor>
+  previewInFlight: Map<string, Promise<Buffer>>
+  previewActive: number
+  previewWaiters: Array<() => void>
 }
 
 const integratedBridgeGlobal = globalThis as typeof globalThis & {
@@ -2401,10 +2449,20 @@ function getIntegratedBridgeState(): IntegratedBridgeState {
       eventClients: new Map(),
       writeQueues: new Map(),
       annotations: new Map(),
+      historyWriteQueues: new Map(),
+      historyDebounce: new Map(),
+      previewInFlight: new Map(),
+      previewActive: 0,
+      previewWaiters: [],
     }
   }
   integratedBridgeGlobal.__drawioIntegratedBridge.writeQueues ||= new Map()
   integratedBridgeGlobal.__drawioIntegratedBridge.annotations ||= new Map()
+  integratedBridgeGlobal.__drawioIntegratedBridge.historyWriteQueues ||= new Map()
+  integratedBridgeGlobal.__drawioIntegratedBridge.historyDebounce ||= new Map()
+  integratedBridgeGlobal.__drawioIntegratedBridge.previewInFlight ||= new Map()
+  integratedBridgeGlobal.__drawioIntegratedBridge.previewActive ||= 0
+  integratedBridgeGlobal.__drawioIntegratedBridge.previewWaiters ||= []
   return integratedBridgeGlobal.__drawioIntegratedBridge
 }
 
@@ -2491,6 +2549,7 @@ async function refreshIntegratedSession(session: IntegratedSession) {
   session.updatedBy = "external"
   session.updatedAt = new Date().toISOString()
   broadcastIntegratedRevision(session)
+  await createHistorySnapshot(session, { source: "external", xml: diskXml, sessionRevision: session.revision })
   return session
 }
 
@@ -2547,6 +2606,17 @@ async function integratedCommit(
     session.updatedBy = source
     session.updatedAt = new Date().toISOString()
     broadcastIntegratedRevision(session, clientId)
+    if (source === "agent") {
+      // A history-record failure must never roll back or fail the actual save.
+      // Only the pre-restore checkpoint in the restore transaction is mandatory.
+      try {
+        await createHistorySnapshot(session, { source: "agent", xml, sessionRevision: session.revision })
+      } catch (error) {
+        console.warn(`history snapshot record failed for ${session.file}: ${(error as Error).message}`)
+      }
+    } else {
+      scheduleEditorHistoryCheckpoint(session)
+    }
     return {
       conflict: false as const,
       document: session,
@@ -2554,7 +2624,7 @@ async function integratedCommit(
     }
   })
   state.writeQueues.set(queueKey, operation)
-  void operation.finally(() => {
+  void operation.catch(() => undefined).finally(() => {
     if (state.writeQueues.get(queueKey) === operation) state.writeQueues.delete(queueKey)
   })
   return operation
@@ -2622,6 +2692,709 @@ function broadcastIntegratedRevision(session: IntegratedSession, clientId: strin
   }
 }
 
+// ---------------------------------------------------------------------------
+// Persistent user-visible diagram history
+// ---------------------------------------------------------------------------
+// Storage layout (runtime data, never part of the generated Expert package):
+//   <workspace>/.mobilework/drawio-history/v1/<basename>--<pathHash12>/
+//     manifest.json
+//     snapshots/<snapshotId>.drawio
+//     previews/<snapshotId>/<pageKey>-thumb.png
+//     previews/<snapshotId>/<pageKey>-preview.png
+// Every manifest and snapshot write is atomic (temp file + rename).
+
+function historyRoot(workspace: string): string {
+  return path.join(workspace, ".mobilework", "drawio-history", "v1")
+}
+
+function historyPathHash(relativePath: string): string {
+  return createHash("sha256").update(relativePath.replace(/\\/g, "/"), "utf8").digest("hex").slice(0, 12)
+}
+
+function historyFileKey(session: IntegratedSession): string {
+  const relative = path.relative(session.workspace, session.file).split(path.sep).join("/")
+  return `${path.basename(session.file)}--${historyPathHash(relative)}`
+}
+
+function assertHistoryContained(root: string, target: string): string {
+  const resolved = path.resolve(target)
+  const rootResolved = path.resolve(root)
+  if (resolved !== rootResolved && !resolved.startsWith(rootResolved + path.sep)) {
+    throw new Error("history path escapes the history directory")
+  }
+  return resolved
+}
+
+function historyDirectoryFor(session: IntegratedSession): string {
+  return assertHistoryContained(
+    historyRoot(session.workspace),
+    path.join(historyRoot(session.workspace), historyFileKey(session)),
+  )
+}
+
+function historyManifestPath(session: IntegratedSession): string {
+  return path.join(historyDirectoryFor(session), "manifest.json")
+}
+
+function snapshotFileFor(session: IntegratedSession, snapshotId: string): string {
+  if (!HISTORY_SNAPSHOT_ID_RE.test(snapshotId)) throw new Error("invalid snapshot id")
+  return assertHistoryContained(
+    historyDirectoryFor(session),
+    path.join(historyDirectoryFor(session), "snapshots", `${snapshotId}.drawio`),
+  )
+}
+
+function historyPageKey(pageId: string): string {
+  const sanitized = String(pageId).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 120)
+  if (!sanitized) throw new Error("invalid page id")
+  return sanitized
+}
+
+function previewFileFor(
+  session: IntegratedSession,
+  snapshotId: string,
+  pageId: string,
+  mode: "thumb" | "preview",
+): string {
+  if (!HISTORY_SNAPSHOT_ID_RE.test(snapshotId)) throw new Error("invalid snapshot id")
+  const pageKey = historyPageKey(pageId)
+  const name = mode === "preview" ? `${pageKey}-preview.png` : `${pageKey}-thumb.png`
+  return assertHistoryContained(
+    historyDirectoryFor(session),
+    path.join(historyDirectoryFor(session), "previews", snapshotId, name),
+  )
+}
+
+function isHistorySnapshotMeta(value: unknown): value is HistorySnapshotMeta {
+  if (!integratedRecord(value)) return false
+  if (typeof value.id !== "string" || !HISTORY_SNAPSHOT_ID_RE.test(value.id)) return false
+  if (!Number.isInteger(value.sequence)) return false
+  if (typeof value.createdAt !== "string") return false
+  if (!["initial", "editor", "agent", "external", "restore"].includes(value.source)) return false
+  if (value.sessionId !== null && typeof value.sessionId !== "string") return false
+  if (!Number.isInteger(value.sessionRevision)) return false
+  if (typeof value.contentHash !== "string") return false
+  if (value.parentSnapshotId !== null && typeof value.parentSnapshotId !== "string") return false
+  if (value.restoredFromSnapshotId !== null && typeof value.restoredFromSnapshotId !== "string") return false
+  if (!Array.isArray(value.pages)) return false
+  for (const page of value.pages) {
+    if (!integratedRecord(page) || typeof page.id !== "string" || typeof page.name !== "string") return false
+  }
+  if (!["pending", "ready", "failed", "unavailable"].includes(value.previewState)) return false
+  return true
+}
+
+function isHistoryManifest(value: unknown): value is HistoryManifest {
+  if (!integratedRecord(value)) return false
+  if (value.schemaVersion !== HISTORY_SCHEMA_VERSION) return false
+  if (!integratedRecord(value.file)) return false
+  if (typeof value.file.relativePath !== "string" || typeof value.file.pathKey !== "string") return false
+  if (!Number.isInteger(value.nextSequence) || (value.nextSequence as number) < 1) return false
+  if (!Array.isArray(value.entries)) return false
+  for (const entry of value.entries) {
+    if (!isHistorySnapshotMeta(entry)) return false
+  }
+  return true
+}
+
+async function readHistoryManifest(session: IntegratedSession): Promise<HistoryManifest | null> {
+  const file = historyManifestPath(session)
+  let raw: string
+  try {
+    raw = await fs.readFile(file, "utf8")
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null
+    throw error
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    throw new Error(
+      `history manifest for ${historyFileKey(session)} is corrupted: ${(error as Error).message}`,
+    )
+  }
+  if (!isHistoryManifest(parsed)) {
+    throw new Error(`history manifest for ${historyFileKey(session)} failed schema validation`)
+  }
+  return parsed
+}
+
+async function writeHistoryManifestAtomic(session: IntegratedSession, manifest: HistoryManifest): Promise<void> {
+  if (testFaultInjected("manifest")) throw new Error("injected history manifest write failure")
+  const target = historyManifestPath(session)
+  await fs.mkdir(path.dirname(target), { recursive: true })
+  const temporary = `${target}.${process.pid}.${Date.now()}.tmp`
+  await fs.writeFile(temporary, JSON.stringify(manifest, null, 2), "utf8")
+  await fs.rename(temporary, target)
+}
+
+// Test-only fault injection. Used by the integration tests to prove the
+// partial-success and retention-atomicity guarantees; never enabled in normal
+// operation. Set via globalThis.__drawioHistoryFaults = { snapshotXml: true, ... }.
+function testFaultInjected(kind: "snapshotXml" | "manifest" | "preRestoreCheckpoint" | "annotationsFile"): boolean {
+  const faults = (globalThis as typeof globalThis & {
+    __drawioHistoryFaults?: Record<string, boolean>
+  }).__drawioHistoryFaults
+  return faults?.[kind] === true
+}
+
+function historySnapshotId(): string {
+  const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")
+  return `h_${timestamp}_${randomBytes(4).toString("hex")}`
+}
+
+function historySourceForUpdatedBy(updatedBy: IntegratedSession["updatedBy"]): HistorySource {
+  if (
+    updatedBy === "editor" || updatedBy === "agent"
+    || updatedBy === "external" || updatedBy === "initial" || updatedBy === "restore"
+  ) return updatedBy
+  return "initial"
+}
+
+function broadcastHistory(
+  session: IntegratedSession,
+  kind: string,
+  payload: Record<string, unknown>,
+): void {
+  const data = `event: history\\ndata: ${JSON.stringify({ kind, ...payload })}\\n\\n`
+  for (const response of getIntegratedBridgeState().eventClients.get(session.sessionId) || []) {
+    response.write(data)
+  }
+}
+
+function historyQueueKey(session: IntegratedSession): string {
+  return path.resolve(historyDirectoryFor(session)).toLowerCase()
+}
+
+function enqueueHistoryTask<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const state = getIntegratedBridgeState()
+  const previous = state.historyWriteQueues.get(key) || Promise.resolve()
+  const operation = previous.catch(() => undefined).then(task)
+  state.historyWriteQueues.set(key, operation)
+  // Swallow the rejection on the cleanup chain so a failed task never surfaces
+  // as an unhandled rejection; the original `operation` is still returned to
+  // the awaiting caller.
+  void operation.catch(() => undefined).finally(() => {
+    if (state.historyWriteQueues.get(key) === operation) state.historyWriteQueues.delete(key)
+  })
+  return operation
+}
+
+async function cleanupEvictedHistoryFiles(session: IntegratedSession, snapshotIds: string[]): Promise<void> {
+  try {
+    for (const id of snapshotIds) {
+      await fs.rm(snapshotFileFor(session, id), { force: true })
+      const previewDir = assertHistoryContained(
+        historyDirectoryFor(session),
+        path.join(historyDirectoryFor(session), "previews", id),
+      )
+      await fs.rm(previewDir, { recursive: true, force: true })
+    }
+  } catch (error) {
+    // Retention cleanup is best-effort; a failed cleanup never rolls back a
+    // committed snapshot. Orphan files are retried on the next write.
+    console.warn(`history cleanup failed for ${historyFileKey(session)}: ${(error as Error).message}`)
+  }
+}
+
+function retainHistoryEntries(manifest: HistoryManifest): string[] {
+  const evicted: string[] = []
+  while (manifest.entries.length > HISTORY_MAX_ENTRIES) {
+    const oldest = manifest.entries.shift()
+    if (oldest) evicted.push(oldest.id)
+  }
+  // Deliberately does not touch disk: files are only removed after the new
+  // manifest has been durably committed (see createHistorySnapshot).
+  return evicted
+}
+
+async function createHistorySnapshot(
+  session: IntegratedSession,
+  options: {
+    source: HistorySource
+    xml: string
+    sessionRevision?: number
+    sessionId?: string | null
+    restoredFromSnapshotId?: string | null
+    force?: boolean
+  },
+): Promise<{ created: boolean; snapshot: HistorySnapshotMeta | null }> {
+  return enqueueHistoryTask(historyQueueKey(session), async () => {
+    const manifest = (await readHistoryManifest(session)) || {
+      schemaVersion: HISTORY_SCHEMA_VERSION,
+      file: {
+        relativePath: path.relative(session.workspace, session.file).split(path.sep).join("/"),
+        pathKey: historyFileKey(session),
+      },
+      nextSequence: 1,
+      entries: [],
+    }
+    const contentHash = integratedHash(options.xml)
+    const pages = parseDrawio(options.xml).map((page) => ({ id: page.id, name: page.name }))
+    const latest = manifest.entries[manifest.entries.length - 1] || null
+    if (!options.force && latest && latest.contentHash === contentHash) {
+      return { created: false, snapshot: latest }
+    }
+    const id = historySnapshotId()
+    const snapshot: HistorySnapshotMeta = {
+      id,
+      sequence: manifest.nextSequence,
+      createdAt: new Date().toISOString(),
+      source: options.source,
+      sessionId: options.sessionId ?? session.sessionId,
+      sessionRevision: options.sessionRevision ?? session.revision,
+      contentHash,
+      parentSnapshotId: latest ? latest.id : null,
+      restoredFromSnapshotId: options.restoredFromSnapshotId ?? null,
+      pages,
+      previewState: "pending",
+    }
+    const snapshotFile = snapshotFileFor(session, id)
+    if (testFaultInjected("snapshotXml")) throw new Error("injected snapshot xml write failure")
+    await fs.mkdir(path.dirname(snapshotFile), { recursive: true })
+    const temporary = `${snapshotFile}.${process.pid}.${Date.now()}.tmp`
+    await fs.writeFile(temporary, options.xml, "utf8")
+    await fs.rename(temporary, snapshotFile)
+    manifest.entries.push(snapshot)
+    manifest.nextSequence += 1
+    // Retention only computes which entries to evict; the disk files for the
+    // evicted snapshots are deleted only after the new manifest is committed.
+    const evicted = retainHistoryEntries(manifest)
+    await writeHistoryManifestAtomic(session, manifest)
+    if (evicted.length > 0) {
+      void cleanupEvictedHistoryFiles(session, evicted)
+    }
+    if (pages.length > 0) {
+      void enqueueHistoryPreview(session, snapshot.id, pages[0].id, "thumb")
+    }
+    for (const evictedId of evicted) {
+      broadcastHistory(session, "snapshot-evicted", { snapshotId: evictedId })
+    }
+    broadcastHistory(session, "snapshot-created", {
+      snapshotId: snapshot.id,
+      sequence: snapshot.sequence,
+      source: snapshot.source,
+    })
+    return { created: true, snapshot }
+  })
+}
+
+async function setSnapshotPreviewState(
+  session: IntegratedSession,
+  snapshotId: string,
+  previewState: HistorySnapshotMeta["previewState"],
+): Promise<void> {
+  await enqueueHistoryTask(historyQueueKey(session), async () => {
+    const manifest = await readHistoryManifest(session)
+    if (!manifest) return
+    const entry = manifest.entries.find((candidate) => candidate.id === snapshotId)
+    if (!entry) return
+    entry.previewState = previewState
+    await writeHistoryManifestAtomic(session, manifest)
+  })
+}
+
+async function readSnapshotXml(session: IntegratedSession, snapshotId: string, expectedHash?: string): Promise<string> {
+  const raw = await fs.readFile(snapshotFileFor(session, snapshotId), "utf8")
+  if (Buffer.byteLength(raw, "utf8") > MAX_FILE_BYTES) {
+    throw new Error("snapshot exceeds the size limit")
+  }
+  if (expectedHash && integratedHash(raw) !== expectedHash) {
+    throw new Error("snapshot content hash mismatch")
+  }
+  return raw
+}
+
+async function acquirePreviewSlot(): Promise<void> {
+  const state = getIntegratedBridgeState()
+  while (state.previewActive >= HISTORY_PREVIEW_CONCURRENCY) {
+    await new Promise<void>((resolve) => state.previewWaiters.push(resolve))
+  }
+  state.previewActive += 1
+}
+
+function releasePreviewSlot(): void {
+  const state = getIntegratedBridgeState()
+  state.previewActive -= 1
+  const next = state.previewWaiters.shift()
+  if (next) next()
+}
+
+async function generateHistoryPreview(
+  session: IntegratedSession,
+  snapshotId: string,
+  pageId: string,
+  mode: "thumb" | "preview",
+): Promise<Buffer> {
+  const state = getIntegratedBridgeState()
+  const key = `${snapshotId}|${historyPageKey(pageId)}|${mode}`
+  const inFlight = state.previewInFlight.get(key)
+  if (inFlight) return inFlight
+  const task = (async () => {
+    await acquirePreviewSlot()
+    try {
+      const manifest = await readHistoryManifest(session)
+      const entry = manifest?.entries.find((candidate) => candidate.id === snapshotId)
+      if (!entry) throw new Error("snapshot not found in preview")
+      const xml = await readSnapshotXml(session, snapshotId, entry.contentHash)
+      const page = parseDrawio(xml).find((candidate) => candidate.id === pageId)
+      if (!page) throw new Error("page not found in snapshot")
+      const exported = await requestDrawioExport(xml, "png", {
+        pageId,
+        scale: mode === "thumb" ? HISTORY_THUMB_SCALE : 1,
+        background: "#ffffff",
+      })
+      if (exported.content.length > HISTORY_PREVIEW_MAX_BYTES) {
+        throw new Error("preview exceeds the size limit")
+      }
+      const target = previewFileFor(session, snapshotId, pageId, mode)
+      await fs.mkdir(path.dirname(target), { recursive: true })
+      const temporary = `${target}.${process.pid}.${Date.now()}.tmp`
+      await fs.writeFile(temporary, exported.content)
+      await fs.rename(temporary, target)
+      if (mode === "thumb") await setSnapshotPreviewState(session, snapshotId, "ready")
+      broadcastHistory(session, "preview-ready", { snapshotId, pageId, mode })
+      return exported.content
+    } catch (error) {
+      if (mode === "thumb") await setSnapshotPreviewState(session, snapshotId, "failed")
+      broadcastHistory(session, "preview-failed", {
+        snapshotId,
+        pageId,
+        mode,
+        error: (error as Error).message,
+      })
+      throw error
+    } finally {
+      releasePreviewSlot()
+      state.previewInFlight.delete(key)
+    }
+  })()
+  state.previewInFlight.set(key, task)
+  return task
+}
+
+function enqueueHistoryPreview(
+  session: IntegratedSession,
+  snapshotId: string,
+  pageId: string,
+  mode: "thumb" | "preview",
+): void {
+  void generateHistoryPreview(session, snapshotId, pageId, mode).catch(() => undefined)
+}
+
+// Editor checkpoint debounce: consecutive quick user saves merge into a single
+// "editor" checkpoint that is created after a quiet 2s window.
+function scheduleEditorHistoryCheckpoint(session: IntegratedSession): void {
+  const state = getIntegratedBridgeState()
+  const key = historyFileKey(session)
+  const pending = state.historyDebounce.get(key)
+  if (pending) clearTimeout(pending.timer)
+  const timer = setTimeout(() => {
+    void flushEditorHistoryCheckpointNow(session.sessionId, key)
+      .catch(error => console.warn(`editor history checkpoint failed for ${session.file}: ${(error as Error).message}`))
+  }, HISTORY_EDITOR_DEBOUNCE_MS)
+  if (typeof timer.unref === "function") timer.unref()
+  state.historyDebounce.set(key, {
+    timer,
+    sessionId: session.sessionId,
+    revision: session.revision,
+    hash: session.fileHash,
+  })
+}
+
+async function flushEditorHistoryCheckpointNow(
+  sessionId: string,
+  key: string,
+): Promise<void> {
+  const state = getIntegratedBridgeState()
+  const pending = state.historyDebounce.get(key)
+  if (pending) {
+    clearTimeout(pending.timer)
+    state.historyDebounce.delete(key)
+  }
+  if (!pending) return
+  const session = state.sessions.get(sessionId)
+  if (!session) return
+  // The checkpoint is skipped when a newer commit (agent/external/restore) has
+  // already superseded the pending editor state.
+  if (session.revision !== pending.revision || session.fileHash !== pending.hash) return
+  await createHistorySnapshot(session, {
+    source: "editor",
+    xml: session.xml,
+    sessionRevision: pending.revision,
+  })
+}
+
+async function flushEditorHistoryCheckpoint(session: IntegratedSession): Promise<void> {
+  await flushEditorHistoryCheckpointNow(session.sessionId, historyFileKey(session))
+}
+
+// On first bind, record an initial snapshot. On re-bind after a runtime
+// restart, record a rediscovered "external" checkpoint when the on-disk
+// content differs from the last durable snapshot.
+async function quarantineCorruptHistory(session: IntegratedSession): Promise<void> {
+  try {
+    const target = historyManifestPath(session)
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
+    await fs.rename(target, `${target}.corrupt-${timestamp}`)
+    console.warn(
+      `quarantined corrupt history manifest for ${historyFileKey(session)} to ${path.basename(target)}.corrupt-${timestamp}`,
+    )
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(
+        `unable to quarantine corrupt history manifest for ${historyFileKey(session)}: ${(error as Error).message}`,
+      )
+    }
+  }
+}
+
+async function reconcileCurrentCheckpoint(session: IntegratedSession): Promise<void> {
+  const manifest = await readHistoryManifest(session)
+  const latest = manifest && manifest.entries.length > 0
+    ? manifest.entries[manifest.entries.length - 1]
+    : null
+  if (!latest) {
+    await createHistorySnapshot(session, {
+      source: historySourceForUpdatedBy(session.updatedBy),
+      xml: session.xml,
+      sessionRevision: session.revision,
+    })
+    return
+  }
+  if (latest.contentHash !== session.fileHash) {
+    await createHistorySnapshot(session, {
+      source: historySourceForUpdatedBy(session.updatedBy),
+      xml: session.xml,
+      sessionRevision: session.revision,
+    })
+  }
+}
+
+async function bindHistoryCheckpoint(session: IntegratedSession): Promise<void> {
+  // History is an auxiliary capability: a corrupted manifest or an unwritable
+  // history directory must never prevent a valid .drawio file from opening,
+  // reading or continuing to be edited. On corruption we quarantine the bad
+  // manifest so history can be re-initialized, and surface a diagnostic.
+  let manifest: HistoryManifest | null = null
+  try {
+    manifest = await readHistoryManifest(session)
+  } catch (error) {
+    session.historyWarning = `history re-initialized: previous manifest was corrupted (${(error as Error).message})`
+    console.warn(`${session.historyWarning} for ${historyFileKey(session)}`)
+    await quarantineCorruptHistory(session)
+    return
+  }
+  const latest = manifest && manifest.entries.length > 0
+    ? manifest.entries[manifest.entries.length - 1]
+    : null
+  try {
+    if (!latest) {
+      await createHistorySnapshot(session, {
+        source: "initial",
+        xml: session.xml,
+        sessionRevision: session.revision,
+      })
+    } else if (latest.contentHash !== session.fileHash) {
+      // A fresh session cannot know who changed the file while the runtime was
+      // stopped or history lagged, so a rediscovered version is recorded as
+      // "external" (the checkpoint-type convention for re-discovered content).
+      await createHistorySnapshot(session, {
+        source: "external",
+        xml: session.xml,
+        sessionRevision: session.revision,
+      })
+    }
+  } catch (error) {
+    session.historyWarning = `history disabled: ${(error as Error).message}`
+    console.warn(`${session.historyWarning} for ${historyFileKey(session)}`)
+  }
+}
+
+// Restore transaction: verify revision, persist the current checkpoint, then
+// write the target snapshot as a brand new revision inside the file write queue.
+async function restoreHistorySnapshot(
+  session: IntegratedSession,
+  snapshotId: string,
+  baseRevision: number,
+  clientId: string | null,
+): Promise<
+  | { ok: true; document: IntegratedSession; snapshot: HistorySnapshotMeta; restoredFromSequence: number; annotationInvalidationWarning: string | null }
+  | { conflict: true; current: IntegratedSession }
+  | { invalid: true; error: string }
+  | { checkpointFailed: true; error: string }
+  | { partFailed: true; document: IntegratedSession; message: string }
+> {
+  const state = getIntegratedBridgeState()
+  const queueKey = path.resolve(session.file).toLowerCase()
+  const previous = state.writeQueues.get(queueKey) || Promise.resolve()
+  const operation = previous.catch(() => undefined).then(async () => {
+    await refreshIntegratedSession(session)
+    if (baseRevision !== session.revision) {
+      return { conflict: true as const, current: session }
+    }
+    const manifest = await readHistoryManifest(session)
+    if (!manifest) return { invalid: true as const, error: "snapshot_not_found" }
+    const target = manifest.entries.find((entry) => entry.id === snapshotId)
+    if (!target) return { invalid: true as const, error: "snapshot_not_found" }
+
+    // 1. Persist the pre-restore current version. Failing this aborts restore
+    //    before any target XML is written; file, revision and annotations stay
+    //    untouched.
+    if (testFaultInjected("preRestoreCheckpoint")) {
+      return {
+        checkpointFailed: true as const,
+        error: "injected pre-restore checkpoint failure",
+      }
+    }
+    try {
+      await flushEditorHistoryCheckpoint(session)
+      await createHistorySnapshot(session, {
+        source: historySourceForUpdatedBy(session.updatedBy),
+        xml: session.xml,
+        sessionRevision: session.revision,
+      })
+    } catch (error) {
+      return {
+        checkpointFailed: true as const,
+        error: `pre-restore checkpoint failed: ${(error as Error).message}`,
+      }
+    }
+
+    // 2. Read and validate the target snapshot XML. The stored contentHash must
+    //    match the on-disk bytes; a valid-but-tampered snapshot is still rejected.
+    //    Damage is detected before the no-op decision, so a damaged snapshot is
+    //    always reported as damaged even when it describes the current content.
+    let snapshotXml: string
+    try {
+      snapshotXml = await readSnapshotXml(session, target.id, target.contentHash)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { invalid: true as const, error: "snapshot_not_found" }
+      }
+      return {
+        invalid: true as const,
+        error: `snapshot_damaged: ${(error as Error).message}`,
+      }
+    }
+    let report: ReturnType<typeof validationReport>
+    try {
+      report = validationReport(parseDrawio(snapshotXml))
+    } catch (error) {
+      return {
+        invalid: true as const,
+        error: `snapshot_damaged: ${(error as Error).message}`,
+      }
+    }
+    if (!report.valid) {
+      return {
+        invalid: true as const,
+        error: `snapshot_damaged: ${JSON.stringify(report.errors)}`,
+      }
+    }
+    // Restoring the current content would only create a meaningless revision;
+    // the UI disables it and the server rejects it as well. "Current" is decided
+    // by content hash against the live diagram, NOT by the last manifest entry:
+    // after a history-record failure the manifest tail may still be an older
+    // version while the file is already the new one.
+    if (target.contentHash === session.fileHash) {
+      return { invalid: true as const, error: "current_snapshot" }
+    }
+
+    // 3. Write the restored XML as a new current revision.
+    await replaceDiagramWithoutBackup(session.file, snapshotXml)
+    integratedHistoryPush(session)
+    session.revision += 1
+    session.xml = snapshotXml
+    session.fileHash = integratedHash(snapshotXml)
+    session.updatedBy = "restore"
+    session.updatedAt = new Date().toISOString()
+
+    // 4. Invalidate unconsumed annotation authorizations and the active task.
+    //    The in-memory invalidation happens first; a sidecar file write failure
+    //    must not turn a successful restore into a plain 500. The revision bump
+    //    already makes any stale approval token unusable regardless.
+    let annotationInvalidationWarning: string | null = null
+    try {
+      await invalidateAnnotationAuthorizations(session)
+    } catch (error) {
+      annotationInvalidationWarning =
+        `diagram restored, but annotation invalidation could not be persisted: ${(error as Error).message}`
+      console.warn(annotationInvalidationWarning)
+    }
+    try {
+      broadcastIntegratedRevision(session, clientId)
+    } catch (error) {
+      console.warn(`diagram revision broadcast failed: ${(error as Error).message}`)
+    }
+
+    // 5. Record the append-only restore snapshot (never deduped). Any failure
+    //    here must surface as an explicit partial success: the diagram HAS been
+    //    restored, but history recording failed. Never collapse that into a
+    //    plain 500 that leaves the client believing nothing changed.
+    const restoredFromSequence = target.sequence
+    let created: { created: boolean; snapshot: HistorySnapshotMeta | null }
+    try {
+      created = await createHistorySnapshot(session, {
+        source: "restore",
+        xml: snapshotXml,
+        sessionRevision: session.revision,
+        restoredFromSnapshotId: target.id,
+        force: true,
+      })
+    } catch (error) {
+      return {
+        partFailed: true as const,
+        document: session,
+        message: annotationInvalidationWarning
+          ? `${annotationInvalidationWarning} restore snapshot also failed: ${(error as Error).message}`
+          : `diagram restored, but the restore snapshot could not be recorded: ${(error as Error).message}`,
+      }
+    }
+    if (!created.created || !created.snapshot) {
+      return {
+        partFailed: true as const,
+        document: session,
+        message: annotationInvalidationWarning
+          ? annotationInvalidationWarning
+          : "diagram restored, but the restore snapshot could not be recorded",
+      }
+    }
+    return {
+      ok: true as const,
+      document: session,
+      snapshot: created.snapshot,
+      restoredFromSequence,
+      annotationInvalidationWarning,
+    }
+  })
+  state.writeQueues.set(queueKey, operation)
+  void operation.catch(() => undefined).finally(() => {
+    if (state.writeQueues.get(queueKey) === operation) state.writeQueues.delete(queueKey)
+  })
+  return operation
+}
+
+async function invalidateAnnotationAuthorizations(session: IntegratedSession): Promise<void> {
+  const map = getSessionAnnotations(session.sessionId)
+  const now = new Date().toISOString()
+  let changed = false
+  for (const task of map.values()) {
+    if (task.status === "resolved") continue
+    if (task.authorization) {
+      task.authorization = null
+      task.updatedAt = now
+      changed = true
+    }
+  }
+  if (session.activeAnnotationId) {
+    session.activeAnnotationId = null
+    changed = true
+  }
+  if (changed) await persistStoredAnnotations(session)
+}
+
 function annotationStorePath(session: IntegratedSession): string {
   const base = session.file.replace(/\.(drawio|xml)$/i, "")
   return `${base}.annotations.json`
@@ -2664,6 +3437,7 @@ async function loadStoredAnnotations(session: IntegratedSession): Promise<void> 
 }
 
 async function persistStoredAnnotations(session: IntegratedSession): Promise<void> {
+  if (testFaultInjected("annotationsFile")) throw new Error("injected annotation sidecar write failure")
   const map = getSessionAnnotations(session.sessionId)
   const store = [...map.values()].map((task) => ({
     id: task.id,
@@ -2892,7 +3666,17 @@ function requireAnnotationAuthorization(
   approvalToken: string | undefined,
 ): { task: AnnotationTask; authorization: NonNullable<AnnotationAuthorization>; scope: AnnotationScopeContext } | null {
   const active = activeAnnotationTask(session)
-  if (!active) return null
+  if (!active) {
+    // After a restore the active annotation is explicitly cleared and any
+    // unconsumed authorization is dropped. Passing a stale annotation id must
+    // never silently fall back to an unapproved write.
+    if (annotationId) {
+      throw new Error(
+        `annotation ${annotationId} is not active; restore or resolution invalidated its approval. Re-read the annotation and latest state with drawio_get_annotation, then request approval again before writing`,
+      )
+    }
+    return null
+  }
   if (!annotationId || annotationId !== active.id) {
     throw new Error(
       `annotation ${active.id} is active; formal writes require its annotation_id and a pre-approved approval_token`,
@@ -3145,6 +3929,9 @@ const eventsUrl = new URL("/api/events", options.bridgeUrl)
   const annotationsUrl = new URL("/api/annotations", options.bridgeUrl)
   annotationsUrl.searchParams.set("sessionId", options.session.sessionId)
   annotationsUrl.searchParams.set("token", options.token)
+  const historyUrl = new URL("/api/history", options.bridgeUrl)
+  historyUrl.searchParams.set("sessionId", options.session.sessionId)
+  historyUrl.searchParams.set("token", options.token)
   const config = safeScriptJson({
     file: path.relative(options.session.workspace, options.session.file).split(path.sep).join("/"),
     drawioUrl: options.editorUrl.toString(),
@@ -3152,6 +3939,7 @@ const eventsUrl = new URL("/api/events", options.bridgeUrl)
     apiUrl: apiUrl.toString(),
     eventsUrl: eventsUrl.toString(),
     annotationsUrl: annotationsUrl.toString(),
+    historyUrl: historyUrl.toString(),
   })
 
 return `<!doctype html>
@@ -3167,15 +3955,107 @@ return `<!doctype html>
       border-radius: 8px; background: rgba(15, 23, 42, .88); color: white; opacity: 0;
       pointer-events: none; transition: opacity .15s; }
     #status.visible { opacity: 1; }
-    #ann-btn { position: fixed; z-index: 3; right: 14px; bottom: 14px; display: flex;
-      align-items: center; gap: 6px; padding: 8px 12px; border: 1px solid #c8d0dc;
-      border-radius: 999px; background: #fff; color: #1f2937; cursor: pointer;
-      box-shadow: 0 2px 8px rgba(15,23,42,.12); }
-    #ann-btn:hover { background: #f1f5f9; }
+    #fab-group { position: fixed; z-index: 3; right: 14px; bottom: 14px; display: flex;
+      align-items: center; gap: 8px; }
+    #history-btn, #ann-btn { display: flex; align-items: center; gap: 6px; padding: 8px 12px;
+      border: 1px solid #c8d0dc; border-radius: 999px; background: #fff; color: #1f2937;
+      cursor: pointer; box-shadow: 0 2px 8px rgba(15,23,42,.12); }
+    #history-btn:hover, #ann-btn:hover { background: #f1f5f9; }
+    #history-btn:disabled, #ann-btn:disabled { opacity: .5; cursor: not-allowed; }
     #ann-btn .dot { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px;
       background: #2563eb; color: #fff; font-size: 11px; font-weight: 600;
       display: inline-flex; align-items: center; justify-content: center; }
     #ann-btn .dot.zero { background: #cbd5e1; color: #475569; }
+    #conflict-banner { position: fixed; z-index: 9; top: 12px; left: 50%; transform: translateX(-50%);
+      display: none; align-items: center; gap: 10px; max-width: 92vw; padding: 10px 14px;
+      border: 1px solid #f59e0b; border-radius: 10px; background: #fffbeb; color: #92400e;
+      box-shadow: 0 4px 16px rgba(15,23,42,.16); }
+    #conflict-banner.visible { display: flex; }
+    #conflict-banner button { border: 1px solid #d97706; border-radius: 6px; background: #fff;
+      color: #92400e; padding: 4px 10px; cursor: pointer; }
+    #history-modal { position: fixed; z-index: 7; inset: 0; display: none; align-items: center;
+      justify-content: center; background: rgba(15, 23, 42, .5); }
+    #history-modal.open { display: flex; }
+    #history-modal .modal { width: min(920px, 96vw); height: min(78vh, 92vh); display: flex;
+      flex-direction: column; background: #fff; border-radius: 14px; box-shadow: 0 16px 48px rgba(15,23,42,.28);
+      overflow: hidden; }
+    #history-modal header { display: flex; align-items: center; gap: 8px; padding: 12px 16px;
+      border-bottom: 1px solid #e2e8f0; }
+    #history-modal header strong { font-size: 15px; }
+    #history-modal header .spacer { flex: 1; }
+    #history-modal header button { border: 1px solid #c8d0dc; border-radius: 6px; background: #fff;
+      padding: 4px 10px; cursor: pointer; }
+    .h-body { flex: 1; display: flex; min-height: 0; }
+    .h-list-pane { width: 300px; min-width: 240px; border-right: 1px solid #e2e8f0; overflow-y: auto;
+      padding: 10px 12px; }
+    .h-preview-pane { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 14px; }
+    .h-card { display: flex; gap: 10px; padding: 10px; border: 1px solid #e2e8f0; border-radius: 10px;
+      margin-bottom: 10px; background: #fafbfc; cursor: pointer; }
+    .h-card.selected { border-color: #2563eb; background: #eff6ff; }
+    .h-card.current { opacity: .92; }
+    .h-card .h-thumb { width: 96px; height: 72px; flex-shrink: 0; border: 1px solid #e2e8f0;
+      border-radius: 6px; background: #fff; display: flex; align-items: center; justify-content: center;
+      overflow: hidden; }
+    .h-card .h-thumb img { width: 100%; height: 100%; object-fit: contain; }
+    .h-thumb .ph { font-size: 10px; color: #94a3b8; text-align: center; padding: 2px; }
+    .h-card .h-meta { min-width: 0; }
+    .h-card .h-ver { font-weight: 700; font-size: 13px; }
+    .h-card .h-badges { display: flex; flex-wrap: wrap; gap: 4px; margin: 3px 0; }
+    .h-badge { font-size: 10px; padding: 1px 6px; border-radius: 999px; font-weight: 600; }
+    .h-badge.cur { background: #2563eb; color: #fff; }
+    .h-badge.initial { background: #e2e8f0; color: #475569; }
+    .h-badge.editor { background: #dbeafe; color: #1d4ed8; }
+    .h-badge.agent { background: #f3e8ff; color: #7e22ce; }
+    .h-badge.external { background: #fef3c7; color: #b45309; }
+    .h-badge.restore { background: #dcfce7; color: #15803d; }
+    .h-card .h-time, .h-card .h-pages { font-size: 11px; color: #64748b; }
+    .h-card .h-restored { font-size: 11px; color: #15803d; }
+    .h-preview-pane .h-preview-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+    .h-preview-pane .h-preview-head select { padding: 4px 6px; border: 1px solid #cbd5e1; border-radius: 6px;
+      background: #fff; }
+    .h-preview-box { flex: 1; border: 1px solid #e2e8f0; border-radius: 10px; background: #fff;
+      display: flex; align-items: center; justify-content: center; overflow: hidden; min-height: 0; }
+    .h-preview-box img { max-width: 100%; max-height: 100%; object-fit: contain; }
+    .h-preview-box .ph { color: #94a3b8; font-size: 13px; text-align: center; padding: 16px; }
+    .h-preview-box .ph button { margin-top: 8px; border: 1px solid #c8d0dc; border-radius: 6px;
+      background: #fff; padding: 4px 10px; cursor: pointer; }
+    .h-foot { padding: 12px 16px; border-top: 1px solid #e2e8f0; display: flex; align-items: center;
+      gap: 10px; }
+    .h-foot .note { flex: 1; font-size: 11px; color: #64748b; }
+    .h-foot button { border: 1px solid #c8d0dc; border-radius: 8px; background: #fff; padding: 7px 14px;
+      cursor: pointer; }
+    .h-foot .primary { border-color: #2563eb; background: #2563eb; color: #fff; }
+    .h-foot .primary:disabled { opacity: .5; cursor: not-allowed; }
+    .h-list-skeleton { border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px; margin-bottom: 10px;
+      background: #f8fafc; }
+    .h-list-skeleton .ln { height: 10px; border-radius: 5px; background: #e2e8f0; margin-bottom: 8px; }
+    #history-confirm { position: fixed; z-index: 8; inset: 0; display: none; align-items: center;
+      justify-content: center; background: rgba(15, 23, 42, .45); }
+    #history-confirm.open { display: flex; }
+    #history-confirm .box { width: min(420px, 92vw); background: #fff; border-radius: 12px; padding: 18px;
+      box-shadow: 0 16px 48px rgba(15,23,42,.3); }
+    #history-confirm .box p { margin: 0 0 8px; font-size: 14px; font-weight: 600; color: #1f2937; }
+    #history-confirm .box small { color: #64748b; }
+    #history-confirm .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+    #history-confirm .actions button { border: 1px solid #c8d0dc; border-radius: 8px; background: #fff;
+      padding: 7px 14px; cursor: pointer; }
+    #history-confirm .actions .primary { border-color: #2563eb; background: #2563eb; color: #fff; }
+    #restore-overlay { position: fixed; z-index: 10; inset: 0; display: none; align-items: center;
+      justify-content: center; background: rgba(15, 23, 42, .35); color: #fff; }
+    #restore-overlay.visible { display: flex; }
+    #restore-overlay .box { background: #1e293b; border-radius: 12px; padding: 20px 26px; text-align: center; }
+    #restore-overlay .spin { width: 28px; height: 28px; margin: 0 auto 10px; border: 3px solid #475569;
+      border-top-color: #2563eb; border-radius: 50%; animation: h-spin .8s linear infinite; }
+    @keyframes h-spin { to { transform: rotate(360deg); } }
+    .h-msg { padding: 8px 12px; border-radius: 8px; font-size: 12px; }
+    .h-msg.error { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+    .h-msg.error button { margin-left: 8px; border: 1px solid #b91c1c; border-radius: 6px; background: #fff;
+      color: #b91c1c; padding: 2px 8px; cursor: pointer; }
+    @media (max-width: 700px) {
+      .h-body { flex-direction: column; }
+      .h-list-pane { width: auto; min-width: 0; border-right: 0; border-bottom: 1px solid #e2e8f0;
+        max-height: 42%; }
+    }
     #ann-drawer { position: fixed; z-index: 5; top: 0; right: 0; height: 100%; width: 360px;
       max-width: 90vw; transform: translateX(100%); transition: transform .2s ease;
       background: #fff; border-left: 1px solid #e2e8f0; box-shadow: -4px 0 16px rgba(15,23,42,.08);
@@ -3223,8 +4103,8 @@ return `<!doctype html>
     #ann-form .actions .primary:disabled { opacity: .5; cursor: not-allowed; }
     @media (prefers-color-scheme: dark) {
       body { background: #0f172a; }
-      #ann-btn, #ann-drawer { background: #1e293b; color: #e2e8f0; border-color: #334155; }
-      #ann-btn:hover, #ann-drawer header button { background: #243049; }
+      #history-btn, #ann-btn, #ann-drawer { background: #1e293b; color: #e2e8f0; border-color: #334155; }
+      #history-btn:hover, #ann-btn:hover, #ann-drawer header button { background: #243049; }
       #ann-list .item { background: #243049; border-color: #334155; }
       #ann-list .item .instruction { color: #e2e8f0; }
       #ann-list .item .meta, #ann-list .item .cells { color: #94a3b8; }
@@ -3233,15 +4113,46 @@ return `<!doctype html>
       #ann-form fieldset { border-color: #334155; }
       #ann-form fieldset legend, #ann-form fieldset small { color: #94a3b8; }
       #ann-none { color: #475569; }
+      #history-modal .modal { background: #1e293b; }
+      #history-modal header, .h-list-pane, .h-foot { border-color: #334155; }
+      #history-modal header button, .h-foot button, #history-confirm .actions button {
+        background: #243049; color: #e2e8f0; border-color: #475569; }
+      .h-card { background: #243049; border-color: #334155; }
+      .h-card.selected { border-color: #3b82f6; background: #1e3a5f; }
+      .h-card .h-thumb { border-color: #334155; background: #0f172a; }
+      .h-card .h-time, .h-card .h-pages { color: #94a3b8; }
+      .h-thumb .ph, .h-preview-box .ph { color: #64748b; }
+      .h-preview-pane .h-preview-head select { background: #0f172a; color: #e2e8f0; border-color: #334155; }
+      .h-preview-box { background: #0f172a; border-color: #334155; }
+      .h-preview-box .ph button { background: #243049; color: #e2e8f0; border-color: #475569; }
+      .h-foot .note { color: #94a3b8; }
+      .h-badge.initial { background: #334155; color: #cbd5e1; }
+      #history-confirm .box { background: #1e293b; }
+      #history-confirm .box p { color: #e2e8f0; }
+      #history-confirm .box small { color: #94a3b8; }
+      .h-list-skeleton { background: #243049; border-color: #334155; }
+      .h-list-skeleton .ln { background: #334155; }
+      #conflict-banner { background: #451a03; border-color: #b45309; color: #fde68a; }
+      #conflict-banner button { background: #451a03; color: #fde68a; border-color: #d97706; }
     }
   </style>
 </head>
 <body>
   <iframe id="editor" title="Draw.io editor"></iframe>
   <div id="status" role="status"></div>
-  <button id="ann-btn" type="button" title="注释与修改任务">
-    <span>注释</span><span class="dot zero" id="ann-count">0</span>
-  </button>
+  <div id="conflict-banner" role="alert">
+    <span id="conflict-message">图表刚发生变化，当前画布暂未保存，请确认最新版本。</span>
+    <button type="button" id="conflict-retry" style="display:none">重试加载</button>
+    <button type="button" id="conflict-reload">重新加载最新版本</button>
+  </div>
+  <div id="fab-group">
+    <button id="history-btn" type="button" title="查看历史版本">
+      <span aria-hidden="true">🕘</span><span>历史</span>
+    </button>
+    <button id="ann-btn" type="button" title="注释与修改任务">
+      <span>注释</span><span class="dot zero" id="ann-count">0</span>
+    </button>
+  </div>
   <div id="ann-drawer" aria-hidden="true">
     <header>
       <strong>注释任务</strong>
@@ -3273,6 +4184,49 @@ return `<!doctype html>
       </div>
     </div>
   </div>
+  <div id="history-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-label="版本历史">
+    <div class="modal">
+      <header>
+        <strong>版本历史</strong>
+        <span class="spacer"></span>
+        <button type="button" id="hist-refresh">刷新</button>
+        <button type="button" id="hist-close">关闭</button>
+      </header>
+      <div class="h-body">
+        <div class="h-list-pane" id="hist-list" tabindex="0"></div>
+        <div class="h-preview-pane">
+          <div class="h-preview-head">
+            <label for="hist-page">页面：</label>
+            <select id="hist-page" disabled></select>
+          </div>
+          <div class="h-preview-box" id="hist-preview">
+            <div class="ph">选择左侧版本查看预览</div>
+          </div>
+        </div>
+      </div>
+      <div class="h-foot">
+        <div class="note" id="hist-note">恢复会创建新版本，当前版本不会被删除。</div>
+        <button type="button" id="hist-cancel">取消</button>
+        <button type="button" class="primary" id="hist-restore" disabled>恢复此版本</button>
+      </div>
+    </div>
+  </div>
+  <div id="history-confirm" aria-hidden="true" role="dialog" aria-modal="true" aria-label="确认恢复">
+    <div class="box">
+      <p id="hist-confirm-text">将图表恢复为 v8 的内容？</p>
+      <small>当前版本不会被删除，恢复操作会创建一个新的版本。</small>
+      <div class="actions">
+        <button type="button" id="hist-confirm-cancel">取消</button>
+        <button type="button" class="primary" id="hist-confirm-ok">确认恢复</button>
+      </div>
+    </div>
+  </div>
+  <div id="restore-overlay" aria-hidden="true">
+    <div class="box">
+      <div class="spin"></div>
+      <div>正在恢复历史版本…</div>
+    </div>
+  </div>
   <script>
     (() => {
       const CONFIG = ${config};
@@ -3284,7 +4238,16 @@ return `<!doctype html>
       let externalTimer = null;
       let pendingSelection = null;
       let awaitingSelection = false;
+      let editorMode = "editing"; // editing | restoring | loading-restored-xml | conflict
+      let historyOpen = false;
+      let selectedSnapshot = null;
+      let confirmSnapshot = null;
+      let restoreTargetXml = null;
+      let preRestoreXml = null;
+      let pendingRestore = null; // { xml } kept so a load timeout can retry the same target
+      let restoreLoadTimer = null;
 
+      const historyBtn = document.getElementById("history-btn");
       const annBtn = document.getElementById("ann-btn");
       const annCount = document.getElementById("ann-count");
       const annDrawer = document.getElementById("ann-drawer");
@@ -3293,6 +4256,15 @@ return `<!doctype html>
       const annSelection = document.getElementById("ann-selection");
       const annInstruction = document.getElementById("ann-instruction");
       const annSubmit = document.getElementById("ann-submit");
+      const conflictBanner = document.getElementById("conflict-banner");
+      const histModal = document.getElementById("history-modal");
+      const histList = document.getElementById("hist-list");
+      const histPreview = document.getElementById("hist-preview");
+      const histPage = document.getElementById("hist-page");
+      const histRestore = document.getElementById("hist-restore");
+      const histNote = document.getElementById("hist-note");
+      const histConfirm = document.getElementById("history-confirm");
+      const restoreOverlay = document.getElementById("restore-overlay");
 
       function selectedAnnotationScope() {
         return document.querySelector('input[name="ann-scope"]:checked')?.value || "selection_only";
@@ -3323,8 +4295,13 @@ return `<!doctype html>
         });
         const result = await response.json();
         if (response.status === 409) {
-          // 浏览器保存发生竞争时，以用户当前画布为新的会话版本；后续Agent修改会先读取此版本。
-          return writeState(xml, result.current.revision);
+          // Never blind-retry the same old XML with the server's new revision:
+          // that could overwrite content another writer just produced. Surface
+          // the conflict and let the user choose to reload the latest version.
+          const error = new Error(result.error || "图表刚发生变化，请检查最新版本后重新确认");
+          error.status = 409;
+          error.current = result.current;
+          throw error;
         }
         if (!response.ok) throw new Error(result.error || "保存图表失败");
         return result;
@@ -3332,16 +4309,75 @@ return `<!doctype html>
 
       function queueSave(xml) {
         saveChain = saveChain.then(async () => {
+          if (editorMode === "restoring" || editorMode === "loading-restored-xml") return;
           if (typeof xml !== "string" || xml === current?.xml) return;
           current = await writeState(xml, current?.revision ?? 0);
           showStatus("已保存 revision " + current.revision, 1000);
-        }).catch(error => showStatus(error.message || "保存失败", 5000));
+        }).catch(error => {
+          if (error && error.status === 409) {
+            enterConflict(error.current);
+          } else {
+            showStatus(error.message || "保存失败", 5000);
+          }
+        });
+      }
+
+      function showConflictBanner(message, showRetry) {
+        document.getElementById("conflict-message").textContent = message;
+        document.getElementById("conflict-retry").style.display = showRetry ? "" : "none";
+        conflictBanner.classList.add("visible");
+      }
+
+      function enterConflict(latest, message, showRetry) {
+        editorMode = "conflict";
+        showConflictBanner(message || "图表刚发生变化，当前画布暂未保存，请确认最新版本。", !!showRetry);
+        void refreshAnnotations();
+        if (latest) showStatus("保存冲突：图表刚发生变化，已保留你的本地画布（revision " + (current?.revision ?? 0) + "，最新 revision " + latest.revision + "）", 6000);
+      }
+
+      async function reloadLatest() {
+        await saveChain;
+        try {
+          const latest = await readLatest();
+          current = latest;
+          editorMode = "editing";
+          clearTimeout(restoreLoadTimer);
+          restoreTargetXml = null;
+          preRestoreXml = null;
+          pendingRestore = null;
+          conflictBanner.classList.remove("visible");
+          sendEditor({ action: "load", xml: latest.xml, autosave: 1, diffSync: true, title: CONFIG.file });
+          showStatus("已加载最新版本 revision " + latest.revision, 2000);
+          void refreshAnnotations();
+        } catch (error) {
+          showStatus(error.message || "读取最新版本失败", 5000);
+        }
+      }
+
+      function retryRestoreLoad() {
+        if (!pendingRestore) { void reloadLatest(); return; }
+        conflictBanner.classList.remove("visible");
+        editorMode = "loading-restored-xml";
+        restoreTargetXml = pendingRestore.xml;
+        sendEditor({ action: "load", xml: pendingRestore.xml, autosave: 1, diffSync: true, title: CONFIG.file });
+        clearTimeout(restoreLoadTimer);
+        restoreLoadTimer = setTimeout(() => {
+          if (editorMode !== "loading-restored-xml") return;
+          editorMode = "conflict";
+          restoreTargetXml = null;
+          showConflictBanner("恢复内容加载超时，请确认最新版本；可重试加载或重新加载服务端当前版本。", true);
+        }, 15000);
       }
 
       async function applyExternalRevision(revision) {
         await saveChain;
+        // The user's queued save may have returned 409 and flipped us into
+        // "conflict" while we waited. Loading the external revision then would
+        // overwrite their still-pending local canvas, so bail out here.
+        if (editorMode !== "editing") return;
         if (revision <= (current?.revision ?? 0)) return;
         const latest = await readLatest();
+        if (editorMode !== "editing") return;
         if (latest.revision <= (current?.revision ?? 0)) return;
         current = latest;
         sendEditor({ action: "load", xml: latest.xml, autosave: 1, diffSync: true, title: CONFIG.file });
@@ -3349,7 +4385,369 @@ return `<!doctype html>
         void refreshAnnotations();
       }
 
+      /* === TESTABLE HISTORY SAVE DECISION START === */
+      function normalizeHistoryXml(value) {
+        return String(value).replace(/>\\s+</g, "><").trim();
+      }
+      function historyXmlEquals(a, b) {
+        return normalizeHistoryXml(a) === normalizeHistoryXml(b);
+      }
+      // Decide what to do with an incoming autosave/save message:
+      //   "queue"   -> safe to enqueue a normal save
+      //   "confirm" -> the editor confirmed it loaded the restore target
+      //   "drop"    -> ignore (late pre-restore autosave or unreconciled copy)
+      // While loading the restored XML, ONLY a message equal to the restore
+      // target counts as confirmation. Nothing else may enter the save queue,
+      // so a late autosave from the old canvas can never overwrite the restore.
+      function decideHistoryAutosave(mode, xml, restoreTargetXml) {
+        if (mode === "restoring" || mode === "conflict") return "drop";
+        if (mode === "loading-restored-xml") {
+          if (restoreTargetXml && historyXmlEquals(xml, restoreTargetXml)) return "confirm";
+          return "drop";
+        }
+        return "queue";
+      }
+      /* === TESTABLE HISTORY SAVE DECISION END === */
+
+      function historySourceLabel(source) {
+        return ({ initial: "初始版本", editor: "用户编辑", agent: "Agent 修改", external: "外部修改", restore: "历史恢复" }[source] || source);
+      }
+
+      function relativeTime(iso) {
+        const elapsed = Date.now() - new Date(iso).getTime();
+        if (elapsed < 60000) return "刚刚";
+        if (elapsed < 3600000) return Math.floor(elapsed / 60000) + " 分钟前";
+        if (elapsed < 86400000) return Math.floor(elapsed / 3600000) + " 小时前";
+        return Math.floor(elapsed / 86400000) + " 天前";
+      }
+
+      function previewUrl(snapshotId, pageId, mode) {
+        const url = new URL(CONFIG.historyUrl);
+        url.pathname = "/api/history/" + encodeURIComponent(snapshotId) + "/preview";
+        url.searchParams.set("pageId", pageId);
+        url.searchParams.set("mode", mode);
+        return url.toString();
+      }
+
+      function wrapThumb(snapshotId, pageId) {
+        const img = document.createElement("img");
+        img.dataset.snapshot = snapshotId;
+        img.dataset.page = pageId;
+        img.dataset.src = previewUrl(snapshotId, pageId, "thumb");
+        img.alt = "缩略图";
+        return img;
+      }
+
+      async function openHistory() {
+        if (editorMode === "restoring" || editorMode === "loading-restored-xml") return;
+        closeDrawer();
+        historyOpen = true;
+        histModal.classList.add("open");
+        histModal.setAttribute("aria-hidden", "false");
+        document.body.style.overflow = "hidden";
+        document.getElementById("hist-close").focus();
+        // Let the last debounced autosave land before asking the server to flush.
+        await saveChain;
+        await new Promise(resolve => setTimeout(resolve, 300));
+        await saveChain;
+        await refreshHistoryList();
+      }
+
+      function closeHistory() {
+        if (!historyOpen && !histModal.classList.contains("open")) {
+          histModal.classList.remove("open");
+          histModal.setAttribute("aria-hidden", "true");
+          return;
+        }
+        historyOpen = false;
+        selectedSnapshot = null;
+        confirmSnapshot = null;
+        histConfirm.classList.remove("open");
+        histConfirm.setAttribute("aria-hidden", "true");
+        histModal.classList.remove("open");
+        histModal.setAttribute("aria-hidden", "true");
+        document.body.style.overflow = "";
+        // Only a normal editing state is restored when the modal closes. A
+        // conflict (e.g. a restore load timeout) must survive, otherwise a
+        // late pre-restore autosave could be re-admitted to the save queue.
+        if (editorMode === "editing" || editorMode === "opening-history") {
+          editorMode = "editing";
+        }
+        if (editorMode !== "conflict") {
+          conflictBanner.classList.remove("visible");
+        }
+        historyBtn.focus();
+      }
+
+      function showHistoryError(message, withReload) {
+        histNote.innerHTML = "";
+        const box = document.createElement("span");
+        box.className = "h-msg error";
+        box.textContent = message;
+        if (withReload) {
+          const reload = document.createElement("button");
+          reload.type = "button";
+          reload.textContent = "重新加载最新版本";
+          reload.addEventListener("click", () => void reloadLatestFromHistory());
+          box.appendChild(reload);
+        }
+        histNote.appendChild(box);
+      }
+
+      function clearHistoryError() {
+        histNote.textContent = "恢复会创建新版本，当前版本不会被删除。";
+      }
+
+      async function refreshHistoryList() {
+        clearHistoryError();
+        histList.innerHTML = Array(3).fill(
+          '<div class="h-list-skeleton"><div class="ln" style="width:80%"></div><div class="ln" style="width:60%"></div><div class="ln" style="width:40%"></div></div>'
+        ).join("");
+        histRestore.disabled = true;
+        try {
+          const response = await fetch(CONFIG.historyUrl, { cache: "no-store" });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || "读取历史失败");
+          renderHistoryList(result.entries || []);
+          if (result.historyWarning) {
+            const warning = document.createElement("div");
+            warning.className = "h-msg error";
+            warning.textContent = result.historyWarning;
+            warning.style.marginBottom = "10px";
+            histList.prepend(warning);
+          }
+        } catch (error) {
+          histList.innerHTML = '<div class="h-card" style="cursor:default"><div class="h-meta"><div style="color:#94a3b8">历史加载失败</div><div style="font-size:11px;color:#64748b">' + escapeHtml(error.message || "") + '</div></div></div>';
+        }
+      }
+
+      function escapeHtml(value) {
+        return String(value).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+      }
+
+      function renderHistoryList(entries) {
+        if (entries.length === 0) {
+          histList.innerHTML = '<div style="color:#94a3b8;text-align:center;padding:24px 8px">还没有历史版本。保存图表后这里会出现可恢复的版本。</div>';
+          return;
+        }
+        histList.innerHTML = entries.map((entry) => {
+          const currentBadge = entry.isCurrent ? '<span class="h-badge cur">当前版本</span>' : "";
+          const badges = '<span class="h-badge ' + entry.source + '">' + escapeHtml(historySourceLabel(entry.source)) + '</span>';
+          const pages = entry.pages && entry.pages.length > 1 ? '<span class="h-pages">· ' + entry.pages.length + ' 页</span>' : "";
+          const restored = entry.restoredFromSequence ? '<div class="h-restored">恢复自 v' + entry.restoredFromSequence + '</div>' : "";
+          const time = '<span class="h-time" title="' + escapeHtml(entry.createdAt) + '">' + relativeTime(entry.createdAt) + '</span>';
+          const firstPageId = escapeHtml(entry.pages?.[0]?.id || "");
+          const thumb = entry.previewState === "failed" || entry.previewState === "unavailable"
+            ? '<div class="ph" data-snapshot="' + entry.id + '" data-page="' + firstPageId + '">预览不可用，<br>可重试</div>'
+            : '<img data-src="' + previewUrl(entry.id, entry.pages?.[0]?.id || "", "thumb") + '" data-snapshot="' + entry.id + '" data-page="' + firstPageId + '" alt="v' + entry.sequence + ' 缩略图">';
+          return '<div class="h-card' + (entry.isCurrent ? " current" : "") + '" data-id="' + entry.id + '" data-sequence="' + entry.sequence + '">'
+            + '<div class="h-thumb">' + thumb + '</div>'
+            + '<div class="h-meta"><div class="h-ver">v' + entry.sequence + '</div>'
+            + '<div class="h-badges">' + currentBadge + badges + '</div>'
+            + '<div>' + time + pages + '</div>' + restored + '</div></div>';
+        }).join("");
+
+        // lazy-load visible thumbnails; failed thumbnails offer click-to-retry
+        // with the original snapshot id and page id (never a silent p1 fallback)
+        const wireThumb = (img) => {
+          if (img.dataset.loaded) return;
+          const snapshot = img.dataset.snapshot;
+          const page = img.dataset.page;
+          img.addEventListener("error", () => {
+            const ph = document.createElement("div");
+            ph.className = "ph";
+            ph.dataset.snapshot = snapshot;
+            ph.dataset.page = page;
+            ph.textContent = "预览不可用，可重试";
+            ph.title = "点击重试";
+            ph.addEventListener("click", (event) => {
+              event.stopPropagation();
+              const replacement = wrapThumb(snapshot, page);
+              img.replaceWith(replacement);
+              wireThumb(replacement);
+            });
+            img.replaceWith(ph);
+          });
+          img.src = img.dataset.src;
+          img.dataset.loaded = "1";
+        };
+        histList.querySelectorAll(".h-thumb img").forEach(wireThumb);
+        histList.querySelectorAll(".h-thumb .ph").forEach((ph) => {
+          ph.title = "点击重试";
+          ph.addEventListener("click", (event) => {
+            event.stopPropagation();
+            const snapshot = ph.dataset.snapshot || "";
+            const page = ph.dataset.page || "";
+            if (!snapshot) return;
+            const replacement = wrapThumb(snapshot, page);
+            ph.replaceWith(replacement);
+            wireThumb(replacement);
+          });
+        });
+
+        // re-select previously selected card
+        if (selectedSnapshot) {
+          const card = histList.querySelector('[data-id="' + selectedSnapshot.id + '"]');
+          if (card) card.classList.add("selected");
+          updateRestoreButton();
+        }
+      }
+
+      function selectHistoryCard(entry) {
+        selectedSnapshot = entry;
+        histList.querySelectorAll(".h-card").forEach((card) => {
+          card.classList.toggle("selected", card.getAttribute("data-id") === entry.id);
+        });
+        const pages = entry.pages || [];
+        histPage.innerHTML = "";
+        histPage.disabled = pages.length === 0;
+        pages.forEach((page) => {
+          const option = document.createElement("option");
+          option.value = page.id;
+          option.textContent = page.name || page.id;
+          histPage.appendChild(option);
+        });
+        updateRestoreButton();
+        if (pages.length > 0) void loadPagePreview(entry.id, pages[0].id);
+      }
+
+      function updateRestoreButton() {
+        histRestore.disabled = !(selectedSnapshot && !selectedSnapshot.isCurrent);
+      }
+
+      function loadPagePreview(snapshotId, pageId) {
+        histPreview.innerHTML = '<div class="ph">预览生成中…</div>';
+        const img = new Image();
+        const url = previewUrl(snapshotId, pageId, "preview");
+        img.addEventListener("load", () => {
+          histPreview.innerHTML = "";
+          img.style.maxWidth = "100%";
+          img.style.maxHeight = "100%";
+          histPreview.appendChild(img);
+        });
+        img.addEventListener("error", () => {
+          const box = document.createElement("div");
+          box.className = "ph";
+          box.textContent = "预览不可用，可重试";
+          const retry = document.createElement("button");
+          retry.type = "button";
+          retry.textContent = "重试";
+          retry.addEventListener("click", () => void loadPagePreview(snapshotId, pageId));
+          box.appendChild(document.createElement("br"));
+          box.appendChild(retry);
+          histPreview.innerHTML = "";
+          histPreview.appendChild(box);
+        });
+        img.src = url;
+      }
+
+      function showConfirmRestore() {
+        if (!selectedSnapshot || selectedSnapshot.isCurrent) return;
+        confirmSnapshot = selectedSnapshot;
+        histConfirm.querySelector("p").textContent = "将图表恢复为 v" + selectedSnapshot.sequence + " 的内容？";
+        histConfirm.classList.add("open");
+        histConfirm.setAttribute("aria-hidden", "false");
+        document.getElementById("hist-confirm-cancel").focus();
+      }
+
+      function cancelConfirmRestore() {
+        confirmSnapshot = null;
+        histConfirm.classList.remove("open");
+        histConfirm.setAttribute("aria-hidden", "true");
+        if (histModal.classList.contains("open")) histRestore.focus();
+      }
+
+      async function confirmRestore() {
+        if (!confirmSnapshot) return;
+        await saveChain;
+        editorMode = "restoring";
+        restoreOverlay.classList.add("visible");
+        restoreOverlay.setAttribute("aria-hidden", "false");
+        histRestore.disabled = true;
+        histConfirm.classList.remove("open");
+        histConfirm.setAttribute("aria-hidden", "true");
+        const snapshot = confirmSnapshot;
+        confirmSnapshot = null;
+        try {
+          const url = new URL(CONFIG.historyUrl);
+          url.pathname = "/api/history/" + encodeURIComponent(snapshot.id) + "/restore";
+          const response = await fetch(url.toString(), {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ baseRevision: current?.revision ?? 0, clientId }),
+          });
+          const result = await response.json();
+          if (response.status === 409) {
+            editorMode = "editing";
+            showHistoryError("图表刚发生变化，请加载最新版本后重新确认。", true);
+            void refreshHistoryList();
+            return;
+          }
+          if (!response.ok) {
+            editorMode = "editing";
+            if (response.status === 404) {
+              showHistoryError("该版本已不可用，历史列表已刷新。", false);
+              void refreshHistoryList();
+            } else if (result.error === "current_checkpoint_failed") {
+              showHistoryError("无法安全保存当前版本，因此未执行恢复。", false);
+            } else {
+              showHistoryError(result.detail || "该版本无法恢复，当前画布保持不变。", false);
+            }
+            return;
+          }
+          // Success: the returned XML is the only allowed load target.
+          preRestoreXml = current?.xml || null;
+          restoreTargetXml = result.xml;
+          pendingRestore = { xml: result.xml };
+          current = {
+            revision: result.revision,
+            xml: result.xml,
+            updatedBy: result.updatedBy,
+            updatedAt: result.updatedAt,
+          };
+          editorMode = "loading-restored-xml";
+          sendEditor({ action: "load", xml: result.xml, autosave: 1, diffSync: true, title: CONFIG.file });
+          clearTimeout(restoreLoadTimer);
+          // The load confirmation is authoritative; the timer only guards
+          // against a stuck editor. On timeout we enter an explicit conflict
+          // state that keeps blocking old autosaves, never silent editing.
+          restoreLoadTimer = setTimeout(() => {
+            if (editorMode !== "loading-restored-xml") return;
+            editorMode = "conflict";
+            restoreTargetXml = null;
+            showConflictBanner("恢复内容加载超时，请确认最新版本；可重试加载或重新加载服务端当前版本。", true);
+          }, 15000);
+          closeHistory();
+          showStatus(result.partial
+            ? "图表已恢复，但历史记录异常：" + result.message
+            : "已恢复为 v" + result.restoredFromSequence + " 的内容，已创建新版本 v" + result.sequence, 5000);
+          void refreshAnnotations();
+        } catch (error) {
+          editorMode = "editing";
+          showHistoryError("网络或服务暂时失败：" + (error.message || "未知错误") + "，请重试。", false);
+        } finally {
+          restoreOverlay.classList.remove("visible");
+          restoreOverlay.setAttribute("aria-hidden", "true");
+        }
+      }
+
+      async function reloadLatestFromHistory() {
+        await saveChain;
+        try {
+          const latest = await readLatest();
+          current = latest;
+          editorMode = "editing";
+          sendEditor({ action: "load", xml: latest.xml, autosave: 1, diffSync: true, title: CONFIG.file });
+          showStatus("已加载最新版本 revision " + latest.revision, 2000);
+          await refreshHistoryList();
+        } catch (error) {
+          showHistoryError("读取最新版本失败：" + (error.message || "未知错误"), true);
+        }
+      }
+
       function openDrawer() {
+        if (editorMode === "restoring" || editorMode === "loading-restored-xml") return;
+        closeHistory();
         annDrawer.classList.add("open");
         annDrawer.setAttribute("aria-hidden", "false");
         void refreshAnnotations();
@@ -3515,6 +4913,62 @@ return `<!doctype html>
         if (id) void resolveAnnotation(id, target);
       });
 
+      historyBtn.addEventListener("click", () => void openHistory());
+      document.getElementById("hist-close").addEventListener("click", closeHistory);
+      document.getElementById("hist-refresh").addEventListener("click", () => void refreshHistoryList());
+      document.getElementById("hist-cancel").addEventListener("click", closeHistory);
+      histRestore.addEventListener("click", showConfirmRestore);
+      document.getElementById("hist-confirm-cancel").addEventListener("click", cancelConfirmRestore);
+      document.getElementById("hist-confirm-ok").addEventListener("click", () => void confirmRestore());
+      histPage.addEventListener("change", () => {
+        if (selectedSnapshot) void loadPagePreview(selectedSnapshot.id, histPage.value);
+      });
+      histList.addEventListener("click", (event) => {
+        const node = event.target instanceof Element ? event.target : null;
+        const card = node ? node.closest(".h-card") : null;
+        if (!card || !(card instanceof HTMLElement)) return;
+        const id = card.getAttribute("data-id");
+        if (selectedSnapshot && selectedSnapshot.id === id) { selectHistoryCard(selectedSnapshot); return; }
+        void fetch(CONFIG.historyUrl, { cache: "no-store" }).then((response) => response.json()).then((result) => {
+          const found = (result.entries || []).find((candidate) => candidate.id === id);
+          if (found) selectHistoryCard(found);
+        }).catch(() => showStatus("读取历史失败", 4000));
+      });
+      document.getElementById("conflict-reload").addEventListener("click", () => void reloadLatest());
+      document.getElementById("conflict-retry").addEventListener("click", retryRestoreLoad);
+      histModal.addEventListener("click", (event) => {
+        if (event.target === histModal) closeHistory();
+      });
+      histConfirm.addEventListener("click", (event) => {
+        if (event.target === histConfirm) cancelConfirmRestore();
+      });
+      // Focus management: open moves focus into the top dialog, Escape closes
+      // only the top dialog, and Tab/Shift+Tab stays inside the top dialog.
+      function trapFocus(container, event) {
+        const focusables = container.querySelectorAll('button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+        if (focusables.length === 0) { event.preventDefault(); return; }
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          if (histConfirm.classList.contains("open")) cancelConfirmRestore();
+          else if (histModal.classList.contains("open")) closeHistory();
+          return;
+        }
+        if (event.key === "Tab") {
+          if (histConfirm.classList.contains("open")) { trapFocus(histConfirm, event); return; }
+          if (histModal.classList.contains("open")) { trapFocus(histModal, event); return; }
+        }
+      });
+
       editor.src = CONFIG.drawioUrl;
       window.addEventListener("message", async event => {
         if (event.origin !== CONFIG.drawioOrigin || event.source !== editor.contentWindow) return;
@@ -3532,6 +4986,19 @@ return `<!doctype html>
         } else if (message.event === "export" && message.format === "json" && awaitingSelection) {
           applySelectionExport(message.data);
         } else if ((message.event === "autosave" || message.event === "save") && typeof message.xml === "string") {
+          const action = decideHistoryAutosave(editorMode, message.xml, restoreTargetXml);
+          if (action === "drop") return;
+          if (action === "confirm") {
+            // Draw.io confirmed it loaded the restore target. Resume normal
+            // saves and clear the load guard.
+            editorMode = "editing";
+            clearTimeout(restoreLoadTimer);
+            restoreTargetXml = null;
+            preRestoreXml = null;
+            pendingRestore = null;
+            conflictBanner.classList.remove("visible");
+            return;
+          }
           queueSave(message.xml);
         }
       });
@@ -3541,10 +5008,29 @@ return `<!doctype html>
         const update = JSON.parse(event.data);
         if (update.clientId === clientId) return;
         clearTimeout(externalTimer);
-        externalTimer = setTimeout(() => void applyExternalRevision(update.revision), 250);
+        externalTimer = setTimeout(() => {
+          if (editorMode === "restoring" || editorMode === "loading-restored-xml" || editorMode === "conflict") return;
+          void applyExternalRevision(update.revision);
+        }, 250);
       });
       events.addEventListener("annotation", () => {
         void refreshAnnotations();
+      });
+      events.addEventListener("history", event => {
+        if (!historyOpen) return;
+        const update = JSON.parse(event.data);
+        if (update.kind === "snapshot-created" || update.kind === "snapshot-evicted") {
+          void refreshHistoryList();
+        } else if (update.kind === "preview-ready" || update.kind === "preview-failed") {
+          if (selectedSnapshot && update.snapshotId === selectedSnapshot.id) {
+            void refreshHistoryList();
+            if (update.kind === "preview-ready" && histPage.value) {
+              void loadPagePreview(update.snapshotId, histPage.value);
+            }
+          } else {
+            void refreshHistoryList();
+          }
+        }
       });
       events.onerror = () => showStatus("正在重连图表同步服务…", 5000);
     })();
@@ -3656,6 +5142,214 @@ state.eventClients.set(session.sessionId, clients)
     request.on("close", () => {
       clients.delete(response)
       if (clients.size === 0) state.eventClients.delete(session.sessionId)
+    })
+    return
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/history") {
+    await flushEditorHistoryCheckpoint(session)
+    await refreshIntegratedSession(session)
+    // If history recording lagged behind (e.g. an Agent commit whose snapshot
+    // write failed earlier), capture the true current content now so the UI
+    // never marks an old snapshot as the current version and blocks restoring it.
+    try {
+      await reconcileCurrentCheckpoint(session)
+    } catch (error) {
+      console.warn(`history reconcile failed for ${session.file}: ${(error as Error).message}`)
+    }
+    let manifest: HistoryManifest | null = null
+    try {
+      manifest = await readHistoryManifest(session)
+    } catch (error) {
+      session.historyWarning = `history disabled: ${(error as Error).message}`
+      console.warn(session.historyWarning)
+      await quarantineCorruptHistory(session)
+      manifest = null
+    }
+    const entries = manifest ? [...manifest.entries].sort((a, b) => b.sequence - a.sequence) : []
+    // The current version is the NEWEST snapshot whose content hash matches the
+    // live diagram. When the same content appears in several snapshots (e.g. an
+    // initial version plus a later re-discovered or restored copy of it), the
+    // newest one is the live current version, not the oldest.
+    const currentSnapshotId = manifest
+      ? [...manifest.entries].reverse().find((entry) => entry.contentHash === session.fileHash)?.id ?? null
+      : null
+    integratedJsonResponse(response, 200, {
+      ok: true,
+      file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
+      currentRevision: session.revision,
+      currentSnapshotId,
+      historyWarning: session.historyWarning,
+      count: entries.length,
+      entries: entries.map((entry) => ({
+        id: entry.id,
+        sequence: entry.sequence,
+        createdAt: entry.createdAt,
+        source: entry.source,
+        isCurrent: entry.id === currentSnapshotId,
+        restoredFromSnapshotId: entry.restoredFromSnapshotId,
+        restoredFromSequence: entry.restoredFromSnapshotId
+          ? manifest?.entries.find((candidate) => candidate.id === entry.restoredFromSnapshotId)?.sequence ?? null
+          : null,
+        pages: entry.pages,
+        previewState: entry.previewState,
+      })),
+    })
+    return
+  }
+
+  const previewMatch = requestUrl.pathname.match(/^\/api\/history\/([^/]+)\/preview$/)
+  if (request.method === "GET" && previewMatch) {
+    const snapshotId = decodeURIComponent(previewMatch[1])
+    if (!HISTORY_SNAPSHOT_ID_RE.test(snapshotId)) {
+      integratedJsonResponse(response, 400, { ok: false, error: "invalid snapshot id" })
+      return
+    }
+    const pageId = requestUrl.searchParams.get("pageId") || ""
+    const mode = requestUrl.searchParams.get("mode") || "thumb"
+    if (mode !== "thumb" && mode !== "preview") {
+      integratedJsonResponse(response, 400, { ok: false, error: "mode must be thumb or preview" })
+      return
+    }
+    if (!pageId) {
+      integratedJsonResponse(response, 400, { ok: false, error: "pageId is required" })
+      return
+    }
+    try {
+      const manifest = await readHistoryManifest(session)
+      const entry = manifest?.entries.find((candidate) => candidate.id === snapshotId)
+      if (!entry) {
+        integratedJsonResponse(response, 404, { ok: false, error: "snapshot not found" })
+        return
+      }
+      if (!entry.pages.some((page) => page.id === pageId)) {
+        integratedJsonResponse(response, 404, { ok: false, error: "page not found in snapshot" })
+        return
+      }
+      // Validate the on-disk snapshot against its recorded contentHash before
+      // serving any (possibly cached) preview, so a tampered snapshot can never
+      // masquerade as the version described by the manifest.
+      try {
+        await readSnapshotXml(session, snapshotId, entry.contentHash)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          integratedJsonResponse(response, 404, { ok: false, error: "snapshot not found" })
+          return
+        }
+        integratedJsonResponse(response, 503, {
+          ok: false,
+          error: "preview_unavailable",
+          detail: (error as Error).message,
+        })
+        return
+      }
+      let content: Buffer | null = null
+      const cached = previewFileFor(session, snapshotId, pageId, mode)
+      try {
+        content = await fs.readFile(cached)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+      }
+      if (!content) {
+        try {
+          content = await generateHistoryPreview(session, snapshotId, pageId, mode)
+        } catch (error) {
+          if (/page not found in snapshot/.test((error as Error).message)) {
+            integratedJsonResponse(response, 404, { ok: false, error: "page not found in snapshot" })
+            return
+          }
+          integratedJsonResponse(response, 503, {
+            ok: false,
+            error: "preview_unavailable",
+            detail: (error as Error).message,
+          })
+          return
+        }
+      }
+      response.writeHead(200, {
+        "Content-Type": "image/png",
+        "Cache-Control": "private, max-age=86400",
+        "Content-Length": String(content.length),
+      })
+      response.end(content)
+    } catch (error) {
+      integratedJsonResponse(response, 500, { ok: false, error: (error as Error).message })
+    }
+    return
+  }
+
+  const restoreMatch = requestUrl.pathname.match(/^\/api\/history\/([^/]+)\/restore$/)
+  if (request.method === "POST" && restoreMatch) {
+    const snapshotId = decodeURIComponent(restoreMatch[1])
+    if (!HISTORY_SNAPSHOT_ID_RE.test(snapshotId)) {
+      integratedJsonResponse(response, 400, { ok: false, error: "invalid snapshot id" })
+      return
+    }
+    let body: Record<string, unknown>
+    try {
+      body = await integratedRequestJson(request)
+    } catch (error) {
+      integratedJsonResponse(response, 400, { ok: false, error: (error as Error).message })
+      return
+    }
+    const baseRevision = body.baseRevision
+    if (!Number.isInteger(baseRevision)) {
+      integratedJsonResponse(response, 400, { ok: false, error: "baseRevision must be an integer" })
+      return
+    }
+    const result = await restoreHistorySnapshot(
+      session,
+      snapshotId,
+      baseRevision as number,
+      typeof body.clientId === "string" ? body.clientId : null,
+    )
+    if (result.conflict) {
+      integratedJsonResponse(response, 409, {
+        ok: false,
+        error: "revision_conflict",
+        current: integratedDocumentPayload(result.current),
+      })
+      return
+    }
+    if (result.invalid) {
+      if (result.error === "snapshot_not_found") {
+        integratedJsonResponse(response, 404, { ok: false, error: "snapshot_not_found" })
+      } else if (result.error === "current_snapshot") {
+        integratedJsonResponse(response, 400, { ok: false, error: "current_snapshot" })
+      } else {
+        integratedJsonResponse(response, 422, {
+          ok: false,
+          error: "snapshot_damaged",
+          detail: result.error,
+        })
+      }
+      return
+    }
+    if (result.checkpointFailed) {
+      integratedJsonResponse(response, 500, {
+        ok: false,
+        error: "current_checkpoint_failed",
+        detail: result.error,
+      })
+      return
+    }
+    if (result.partFailed) {
+      integratedJsonResponse(response, 200, {
+        ok: true,
+        partial: true,
+        message: result.message,
+        ...integratedDocumentPayload(result.document),
+      })
+      return
+    }
+    integratedJsonResponse(response, 200, {
+      ok: true,
+      ...integratedDocumentPayload(result.document),
+      snapshotId: result.snapshot.id,
+      sequence: result.snapshot.sequence,
+      restoredFromSnapshotId: result.snapshot.restoredFromSnapshotId,
+      restoredFromSequence: result.restoredFromSequence,
+      annotationInvalidationWarning: result.annotationInvalidationWarning,
     })
     return
   }
@@ -3889,10 +5583,12 @@ async function bindIntegratedSession(
       }],
       backupFile: null,
       activeAnnotationId: null,
+      historyWarning: null,
     }
 state.sessions.set(context.sessionID, session)
   session.activeAnnotationId ??= null
   await loadStoredAnnotations(session)
+  await bindHistoryCheckpoint(session)
   const bridge = await ensureIntegratedBridgeStarted()
   const token = randomBytes(24).toString("base64url")
   state.tokens.set(token, {
