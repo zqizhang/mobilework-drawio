@@ -128,6 +128,11 @@ try {
   {
     const session = await makeSession(plugin, "fix-p01", "p01.drawio", BASE_XML)
     const editorPage = await fetch(session.open.openUrl).then((response) => response.text())
+    assert.match(
+      editorPage,
+      /message\.event === "load"[\s\S]*?confirmRestoreTargetLoaded\(message\.xml\)/,
+      'the real Draw.io event:"load" acknowledgement must confirm the restore target',
+    )
     const marker = editorPage.match(
       /\/\* === TESTABLE HISTORY SAVE DECISION START === \*\/([\s\S]*?)\/\* === TESTABLE HISTORY SAVE DECISION END === \*\//,
     )

@@ -4409,6 +4409,20 @@ return `<!doctype html>
       }
       /* === TESTABLE HISTORY SAVE DECISION END === */
 
+      function confirmRestoreTargetLoaded(xml) {
+        if (editorMode !== "loading-restored-xml"
+          || !restoreTargetXml
+          || !historyXmlEquals(xml, restoreTargetXml)) return false;
+        editorMode = "editing";
+        clearTimeout(restoreLoadTimer);
+        restoreLoadTimer = null;
+        restoreTargetXml = null;
+        preRestoreXml = null;
+        pendingRestore = null;
+        conflictBanner.classList.remove("visible");
+        return true;
+      }
+
       function historySourceLabel(source) {
         return ({ initial: "初始版本", editor: "用户编辑", agent: "Agent 修改", external: "外部修改", restore: "历史恢复" }[source] || source);
       }
@@ -4985,18 +4999,18 @@ return `<!doctype html>
           } catch (error) { showStatus(error.message || "读取失败", 5000); }
         } else if (message.event === "export" && message.format === "json" && awaitingSelection) {
           applySelectionExport(message.data);
+        } else if (message.event === "load" && typeof message.xml === "string") {
+          // Draw.io acknowledges action:"load" with event:"load". Only the
+          // exact restore target may release the save guard; a delayed initial
+          // load acknowledgement must not confirm a different document.
+          confirmRestoreTargetLoaded(message.xml);
         } else if ((message.event === "autosave" || message.event === "save") && typeof message.xml === "string") {
           const action = decideHistoryAutosave(editorMode, message.xml, restoreTargetXml);
           if (action === "drop") return;
           if (action === "confirm") {
-            // Draw.io confirmed it loaded the restore target. Resume normal
-            // saves and clear the load guard.
-            editorMode = "editing";
-            clearTimeout(restoreLoadTimer);
-            restoreTargetXml = null;
-            preRestoreXml = null;
-            pendingRestore = null;
-            conflictBanner.classList.remove("visible");
+            // Keep accepting a matching autosave/save as a compatibility
+            // fallback for editor builds that emit it after loading.
+            confirmRestoreTargetLoaded(message.xml);
             return;
           }
           queueSave(message.xml);
