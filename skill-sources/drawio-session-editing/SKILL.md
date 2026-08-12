@@ -1,6 +1,6 @@
 ---
 name: drawio-session-editing
-description: 当用户需要在MobileWork内置浏览器中手动编辑Draw.io工作区文件，或Agent需要在人工编辑后继续修改时使用。负责读取最新会话revision、把用户保存版本作为新的修改基线、以乐观并发方式提交XML，并在revision_conflict时重新读取和重试，避免旧快照造成内容丢失。同时覆盖框选注释任务流程：用户在内置浏览器框选图元并提交修改说明，每条注释形成包含稳定ID、页面、区域和说明的独立任务；每轮对话需同时探测"手动编辑"和"待处理注释"两种用户意图，合并为同一基线后再决定是否自动处理，user手调过画布时必须先确认再改动，避免与用户中间状态冲突。
+description: 当用户需要在MobileWork内置浏览器中手动编辑Draw.io工作区文件，或Agent需要在人工编辑后继续修改时使用。负责读取最新会话revision、把用户保存版本作为新的修改基线、以乐观并发方式提交XML，并在revision_conflict时重新读取和重试，避免旧快照造成内容丢失。同时覆盖按图表持久化的框选注释任务流程：用户提交稳定ID、页面、区域、说明和允许修改范围（含整个图表）；Agent必须先dry-run和说明计划，再通过OpenCode审批弹窗获得当前session的一次性授权，运行时拒绝未授权、越界或过期revision写入，禁止先修改后确认。
 ---
 
 # Draw.io 会话同步与并发控制
@@ -39,7 +39,18 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 
 ## 注释任务（框选评审）
 
-用户在内置浏览器中框选一个或多个图元并填写修改说明后，每条注释是一条独立任务，记录选中图元的稳定 ID、页面、区域范围、修改说明和提交时的 revision。注释随文件持久化到 `<basename>.annotations.json`，重启后仍可恢复。
+用户在内置浏览器中框选一个或多个图元并填写修改说明后，还必须选择允许修改范围。每条注释记录选中图元的稳定 ID、页面、区域范围、修改说明、范围策略和提交时的图表基线。注释按图表文件持久化到 `<basename>.annotations.json`，不绑定对话session；重启或换新对话后打开同一图表仍可恢复。
+
+范围策略只有三种：
+
+| 策略 | 允许修改 | 明确禁止 |
+|---|---|---|
+| `selection_only`（只修改选区） | 仅用户选中的稳定 ID | 未选中的节点、关联线、周边布局以及新增图元 |
+| `selection_and_edges`（允许调整关联连线） | 选中图元、与选中节点直接相连的边；可新增端点包含选中节点的边 | 其它节点和无关连线 |
+| `surrounding_layout`（允许调整周边布局） | 选区附近、一跳关联节点及它们之间的连线；新增节点必须落在运行时计算的周边区域内 | 更远节点、其它页面或未披露的稳定 ID |
+| `diagram_wide`（允许修改整个图表） | 当前 `.drawio` 文件的所有页面、节点、连线和布局；可修改计划中披露的新增/删除图元 | 工作区其它文件或未披露的 `pageId:cellId` |
+
+范围是上限，不是自动修改许可。选择`diagram_wide`时浏览器先显示高风险确认；无论选择哪一种，Agent在正式写入前都必须再次展示具体计划并触发OpenCode审批弹窗。运行时按图表、session、稳定ID、范围、revision和一次性token强制校验。`diagram_wide`的稳定ID必须写成`pageId:cellId`。
 
 ### 每轮同时关注注释与手动编辑（重要）
 
@@ -53,8 +64,8 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 | 注释 | `updatedBy` | 本轮动作 |
 |---|---|---|
 | 无 | 任意 | 按用户本轮意图正常处理（无关问答/创建/导出等）。 |
-| 有 | `agent`/`initial` | 用户没手调、意图明确交给 agent：立即按"处理一条注释的标准闭环"逐条处理，全部处理完再回话。 |
-| 有 | `editor`/`external` | 用户手动改过画布。**先 `drawio_get_state(since_revision=注释的 baseRevision)` 拿手动编辑的 diff**，在回话里同时说出：手动改了哪些（diff 摘要）+ 还有多少条注释待处理；并问"要我基于你当前画布处理这些注释吗？"。**得到用户确认后才开始 patch**，不要擅自下手。看到 stale 注释同样先确认。 |
+| 有 | `agent`/`initial` | 用户没手调：准备dry-run和精确稳定ID计划，调用`drawio_authorize_annotation_change`触发写前审批；批准后才正式写入。 |
+| 有 | `editor`/`external` | 用户手动改过画布。先`drawio_get_state(since_revision=注释的 baseRevision)`拿diff，把手动变化并入计划；然后调用`drawio_authorize_annotation_change`展示计划并等待写前审批。看到stale注释同样重新规划并审批。 |
 | 用户本轮明确提了其它动作 | 任意 | 先做用户明确要的，注释放到之后或在本轮回话里提示还有几条待处理。 |
 | 用户明确说"先不动注释 / 我先看看" | 任意 | 尊重意愿，跳过或仅列出。 |
 
@@ -63,16 +74,32 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 ### 工具
 
 - `drawio_list_annotations(file, status="open")`：列出待处理注释。每轮第一句对话必调一次。`status` 可用 `"open"`、`"resolved"`、`"stale"`、`"all"`。
-- `drawio_get_annotation(id)`：取注释详情，含选中 id、region、过时标记和最新图元快照，省去重新解析 XML。
+- `drawio_get_annotation(id)`：取注释详情并把它设为当前活动注释，含选中id、region、范围、过时标记和最新图元快照。
+- `drawio_authorize_annotation_change(id, plan, proposed_changed_ids, requested_scope, escalation_reason?)`：必须在正式写入前调用；该工具权限固定为`ask`，OpenCode先弹窗，用户批准后才返回绑定当前revision和计划ID的一次性token。请求比用户原选项更宽的范围时，`escalation_reason`必填。
 - `drawio_resolve_annotation(id, summary, changed_ids?)`：标记已解决并记录 summary；只改任务状态，不改图。
 
 ### 处理一条注释的标准闭环
 
 1. `drawio_get_annotation(id)` 取详情；
 2. `drawio_get_state` 取最新 XML 与 revision——这一步拿到的 XML 已经包含用户全部手动编辑（用户保存即 bump revision，agent 拿到的是最新版），patch 在这个基线上完成增量修改；
-3. 用 `drawio_patch` 或 `drawio_update_state` 执行修改并携带上一步返回的 revision；
-4. `drawio_resolve_annotation(id, summary, changed_ids)`；
-5. `drawio_finalize` 刷新 PNG 与浏览器。
+3. 用`drawio_patch(dry_run=true)`或等价差异分析形成精确计划，列出所有会改变的稳定ID和所需范围；此时不得写入；
+4. 调`drawio_authorize_annotation_change`。OpenCode弹窗出现前，Agent先用`plan`说明将改什么；用户拒绝或关闭弹窗则立即停止，不得改图；
+5. 用户批准后，把返回的`approvalToken`、`annotation_id`和同一`base_revision`传给一次正式`drawio_patch`或`drawio_update_state`。token仅能使用一次，revision变化后必须重新规划和审批；
+6. `drawio_resolve_annotation(id, summary, changed_ids)`；
+7. `drawio_finalize`刷新PNG与浏览器。
+
+正式`drawio_polish`会重排整页，活动注释期间只有取得`diagram_wide`审批并携带`annotation_id`与`approval_token`才能使用。完整XML写入也会进行跨页稳定ID差异校验；新增图元优先使用带明确operation的`drawio_patch`。
+
+### 越界申请
+
+如果当前要求客观上无法在用户选择的范围内完成，先停止在dry-run阶段，不得尝试写入。随后：
+
+1. 说明具体受阻点、必须越界的稳定ID以及不越界会造成什么问题；
+2. 选择所需的更宽`requested_scope`，把原因写入`escalation_reason`；
+3. 再调用`drawio_authorize_annotation_change`触发新的审批弹窗；
+4. 只有用户批准后才使用新token写入；拒绝则保持原图不变。
+
+禁止先改完再让用户检查，也禁止用普通`write`、`edit`、脚本或省略`annotation_id`绕过范围守卫。
 
 一次只处理一条以避免 revision 冲突；处理完一条后回到第 1 步处理下一条。`stale` 注释表示提交后图元被改动——有时是 agent 上一次处理触发的，有时是用户手调的；不要盲 patch，先 `drawio_get_state` 看最新状态，必要时用 `since_revision` 取手动编辑 diff 弄清"谁改的、怎么改的"，再在新基线上重新核对这条注释到底要怎么落地。
 

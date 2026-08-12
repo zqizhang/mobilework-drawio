@@ -23,7 +23,9 @@
         },
         "task": {
           "*": "deny"
-        }
+        },
+        "question": "allow",
+        "drawio_authorize_annotation_change": "ask"
       }
     }
   },
