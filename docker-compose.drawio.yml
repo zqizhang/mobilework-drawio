@@ -1,0 +1,32 @@
+services:
+  image-export:
+    image: jgraph/export-server
+    ports:
+      - "18765:8000"
+    networks:
+      - drawionet
+    volumes:
+      - fonts_volume:/usr/share/fonts/drawio
+    environment:
+      DRAWIO_BASE_URL: http://drawio:8080
+
+  drawio:
+    image: jgraph/drawio
+    ports:
+      - "8443:8443"
+      - "18080:8080"
+    depends_on:
+      - image-export
+    networks:
+      - drawionet
+    environment:
+      DRAWIO_SELF_CONTAINED: "1"
+      EXPORT_URL: http://image-export:8000/
+      DRAWIO_BASE_URL: ${DRAWIO_BASE_URL:-http://127.0.0.1:18080}
+      DRAWIO_SERVER_URL: ${DRAWIO_SERVER_URL:-http://127.0.0.1:18080/}
+
+networks:
+  drawionet:
+
+volumes:
+  fonts_volume:

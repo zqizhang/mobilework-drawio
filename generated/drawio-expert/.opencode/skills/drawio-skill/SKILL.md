@@ -80,7 +80,9 @@ metadata: {"openclaw":{"emoji":"📐","os":["darwin","linux","win32"]},"hermes":
 
 根据需求选择生成方式：
 
-**(a) `drawio_create`** —— 优先用于标准节点、单向连线和自动分层布局。双向关系可用两条反向边近似，简单图例可用普通节点表示。
+**(a) `drawio_create`** —— 优先用于标准节点、单向连线和自动分层布局。单页图可传`title/nodes/edges`；多页图传`pages`数组，每个页面包含`id/title/nodes/edges/direction`。双向关系可用两条反向边近似，简单图例可用普通节点表示。
+
+**(a2) `drawio_pages`** —— 用于已有文件的页面管理：`list`查看页面，`add`新增页面，`rename`重命名，`remove`删除，`move`调整顺序。目标文件已通过`drawio_open`绑定时，写入类操作仍必须先调用`drawio_get_state`并携带准确`base_revision`。
 
 **(b) 原生XML** —— 当任务依赖`drawio_create`尚未提供的嵌套parent、泳道、双端箭头、成组图例或精确样式/几何字段时使用。只说明具体缺失字段。**先读`references/xml-authoring.md`**。当前专家不执行Mermaid到`.drawio`的自动转换。
 
@@ -255,6 +257,17 @@ drawio_export(
 - 大幅修改图表后
 - 怀疑XML结构或页面信息异常时
 - 导出服务返回图表解析错误时
+
+### drawio_pages
+
+管理已有`.drawio`文件的页面。不直接编辑XML时，应优先用该工具处理页面级操作。
+
+**常用动作：**
+- `action="list"`：返回页面ID、名称、顺序、节点数和连线数。
+- `action="add"`：通过`title/page_id/nodes/edges/direction`新增页面。
+- `action="rename"`：通过`page`定位页面并用`title`改名。
+- `action="remove"`：通过`page`删除页面；不能删除唯一页面。
+- `action="move"`：通过`page`和`index`调整页面顺序。
 
 ### drawio_health_check
 

@@ -1,0 +1,142 @@
+<mxfile host="127.0.0.1" agent="drawio-expert" pages="3">
+  <diagram id="p-overview" name="系统总览">
+    <mxGraphModel dx="1588" dy="1910" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="user" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=1.5;dashed=1;fillColor=#f5f5f5;strokeColor=#666666;" value="用户" vertex="1">
+          <mxGeometry height="70" width="160" x="80" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="openwork" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=1.5;fillColor=#d5e8d4;strokeColor=#82b366;" value="OpenWork" vertex="1">
+          <mxGeometry height="70" width="160" x="380" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="drawio-expert" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=1.5;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Draw.io专家" vertex="1">
+          <mxGeometry height="70" width="160" x="680" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="docker-export" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=1.5;dashed=1;fillColor=#f5f5f5;strokeColor=#666666;" value="Docker导出服务" vertex="1">
+          <mxGeometry height="70" width="160" x="980" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="e-user-openwork" edge="1" parent="1" source="user" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;jumpStyle=arc;jumpSize=10;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="openwork" value="请求">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="310" y="115" />
+              <mxPoint x="310" y="115" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-openwork-expert" edge="1" parent="1" source="openwork" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;jumpStyle=arc;jumpSize=10;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="drawio-expert" value="调用">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="610" y="115" />
+              <mxPoint x="610" y="115" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-expert-export" edge="1" parent="1" source="drawio-expert" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;jumpStyle=arc;jumpSize=10;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="docker-export" value="导出PNG/PDF">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="910" y="115" />
+              <mxPoint x="910" y="115" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="p-pages" name="页面管理流程">
+    <mxGraphModel dx="907" dy="1091" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="step-create" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=1.5;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="创建页面" vertex="1">
+          <mxGeometry height="70" width="160" x="80" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="step-rename" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=1.5;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="重命名页面" vertex="1">
+          <mxGeometry height="70" width="160" x="320" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="step-move" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=1.5;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="移动页面" vertex="1">
+          <mxGeometry height="70" width="160" x="560" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="step-delete" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=1.5;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="删除页面" vertex="1">
+          <mxGeometry height="70" width="160" x="800" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="e-create-rename" edge="1" parent="1" source="step-create" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;jumpStyle=arc;jumpSize=10;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="step-rename" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="280" y="115" />
+              <mxPoint x="280" y="115" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-rename-move" edge="1" parent="1" source="step-rename" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;jumpStyle=arc;jumpSize=10;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="step-move" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="520" y="115" />
+              <mxPoint x="520" y="115" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-move-delete" edge="1" parent="1" source="step-move" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;jumpStyle=arc;jumpSize=10;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="step-delete" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="760" y="115" />
+              <mxPoint x="760" y="115" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="p-deploy" name="部署资源">
+    <mxGraphModel dx="635" dy="764" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="docker-desktop" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=1.5;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Docker Desktop" vertex="1">
+          <mxGeometry height="70" width="160" x="80" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="drawio-container" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=1.5;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="drawio容器" vertex="1">
+          <mxGeometry height="70" width="160" x="80" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="image-export-container" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=1.5;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="image-export容器" vertex="1">
+          <mxGeometry height="70" width="160" x="460" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="workspace" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=1.5;fillColor=#d5e8d4;strokeColor=#82b366;" value="OpenWork工作区" vertex="1">
+          <mxGeometry height="70" width="160" x="460" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="e-dd-dc" edge="1" parent="1" source="docker-desktop" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;jumpStyle=arc;jumpSize=10;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="drawio-container" value="托管运行">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="160" y="205" />
+              <mxPoint x="160" y="205" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-dd-iec" edge="1" parent="1" source="docker-desktop" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;jumpStyle=arc;jumpSize=10;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="image-export-container" value="托管运行">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="160" y="190" />
+              <mxPoint x="540" y="190" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-ws-dc" edge="1" parent="1" source="workspace" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;jumpStyle=arc;jumpSize=10;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="drawio-container" value="打开.drawio源文件">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="540" y="225" />
+              <mxPoint x="160" y="225" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-dc-iec" edge="1" parent="1" source="drawio-container" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;jumpStyle=arc;jumpSize=10;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="image-export-container" value="请求导出PNG/PDF">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="350" y="295" />
+              <mxPoint x="350" y="295" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

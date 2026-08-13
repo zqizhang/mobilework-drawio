@@ -104,6 +104,7 @@ try {
   assert.equal(typeof plugin.tool.drawio_validate.execute, "function")
   assert.equal(typeof plugin.tool.drawio_health_check.execute, "function")
   assert.equal(typeof plugin.tool.drawio_finalize.execute, "function")
+  assert.equal(typeof plugin.tool.drawio_pages.execute, "function")
   const systemOutput = { system: [] }
   await plugin["experimental.chat.system.transform"]({}, systemOutput)
   assert.match(systemOutput.system.join("\n"), /人工编辑不是只读内容/)
@@ -126,6 +127,71 @@ try {
   }, context))
   assert.equal(validateResult.success, true)
   assert.equal(validateResult.page_count, 1)
+
+  const multiCreateResult = JSON.parse(await plugin.tool.drawio_create.execute({
+    file: "multi-page.drawio",
+    pages: [
+      {
+        id: "overview",
+        title: "Overview",
+        nodes: [{ id: "app", label: "Application", kind: "application" }],
+        edges: [],
+      },
+      {
+        id: "details",
+        title: "Details",
+        nodes: [
+          { id: "api", label: "API", kind: "service" },
+          { id: "db", label: "Database", kind: "database" },
+        ],
+        edges: [{ id: "api-db", source: "api", target: "db", label: "reads" }],
+        direction: "top-to-bottom",
+      },
+    ],
+    direction: "left-to-right",
+    compressed: false,
+    overwrite: false,
+  }, context))
+  assert.equal(multiCreateResult.valid, true)
+  assert.equal(multiCreateResult.page_count, 2)
+  assert.deepEqual(multiCreateResult.pages.map((page) => page.id), ["overview", "details"])
+
+  const pagesList = JSON.parse(await plugin.tool.drawio_pages.execute({
+    file: "multi-page.drawio",
+    action: "list",
+  }, context))
+  assert.equal(pagesList.page_count, 2)
+  assert.deepEqual(pagesList.pages.map((page) => page.name), ["Overview", "Details"])
+
+  const pageAdd = JSON.parse(await plugin.tool.drawio_pages.execute({
+    file: "multi-page.drawio",
+    action: "add",
+    page_id: "operations",
+    title: "Operations",
+    nodes: [{ id: "queue", label: "Queue", kind: "service" }],
+    edges: [],
+    direction: "left-to-right",
+    compressed: false,
+  }, context))
+  assert.equal(pageAdd.valid, true)
+  assert.equal(pageAdd.page_count, 3)
+
+  const pageRename = JSON.parse(await plugin.tool.drawio_pages.execute({
+    file: "multi-page.drawio",
+    action: "rename",
+    page: "operations",
+    title: "Runbook",
+  }, context))
+  assert.equal(pageRename.valid, true)
+  assert.equal(pageRename.pages.at(-1).name, "Runbook")
+
+  const pageRemove = JSON.parse(await plugin.tool.drawio_pages.execute({
+    file: "multi-page.drawio",
+    action: "remove",
+    page: "Runbook",
+  }, context))
+  assert.equal(pageRemove.valid, true)
+  assert.equal(pageRemove.page_count, 2)
 
   const inspectResult = JSON.parse(await plugin.tool.drawio_inspect.execute({
     file: "architecture.drawio",

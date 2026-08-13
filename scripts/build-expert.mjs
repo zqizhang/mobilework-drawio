@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process"
+import { existsSync } from "node:fs"
 import { promises as fs } from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -16,6 +17,13 @@ const managerScripts = path.join(
   "mobilework-expert-manager",
   "scripts",
 )
+const createExpertScript = path.join(managerScripts, "create_expert.py")
+const validateExpertScript = path.join(managerScripts, "validate_expert.py")
+const bunCommand = process.platform === "win32"
+  ? (existsSync(path.join(os.homedir(), ".bun", "bin", "bun.exe"))
+    ? path.join(os.homedir(), ".bun", "bin", "bun.exe")
+    : "bun")
+  : "bun"
 
 function run(command, args, cwd = projectDirectory) {
   const result = spawnSync(command, args, {
@@ -114,16 +122,63 @@ async function verifyNoCaches(root) {
   if (failures.length) throw new Error(`Generated package contains caches:\n${failures.join("\n")}`)
 }
 
-run(process.platform === "win32" ? "bun.cmd" : "bun", ["install", "--frozen-lockfile"])
+async function syncPackageFromManifestFallback() {
+  if (!existsSync(packageDirectory)) {
+    throw new Error(
+      `mobilework-expert-manager is not installed and ${packageDirectory} does not exist`,
+    )
+  }
+  const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"))
+  await fs.copyFile(manifestPath, path.join(packageDirectory, "expert.json"))
+
+  const localPlugins = manifest.runtime_extensions?.plugins?.local
+  const runtimePlugin = Array.isArray(localPlugins)
+    ? localPlugins.find((entry) => entry.path === "drawio-runtime.js")
+    : null
+  if (!runtimePlugin?.content) {
+    throw new Error("expert.json does not contain bundled drawio-runtime.js content")
+  }
+  const pluginDirectory = path.join(packageDirectory, ".opencode", "plugins")
+  await fs.mkdir(pluginDirectory, { recursive: true })
+  await fs.writeFile(path.join(pluginDirectory, "drawio-runtime.js"), runtimePlugin.content, "utf8")
+
+  const commandDirectory = path.join(packageDirectory, ".opencode", "commands")
+  await fs.rm(commandDirectory, { recursive: true, force: true })
+  await fs.mkdir(commandDirectory, { recursive: true })
+  for (const command of manifest.runtime_extensions?.commands || []) {
+    await fs.writeFile(
+      path.join(commandDirectory, `${command.name}.md`),
+      [
+        "---",
+        `description: ${command.description}`,
+        `agent: ${command.agent}`,
+        "---",
+        "",
+        command.template,
+        "",
+      ].join("\n"),
+      "utf8",
+    )
+  }
+  console.warn(
+    `mobilework-expert-manager not found; refreshed existing package shell at ${packageDirectory}`,
+  )
+}
+
+run(bunCommand, ["install", "--frozen-lockfile"])
 run("node", [path.join(scriptDirectory, "sync-expert-source.mjs")])
-run("python", [
-  path.join(managerScripts, "create_expert.py"),
-  "--manifest",
-  manifestPath,
-  "--output-dir",
-  outputRoot,
-  "--force",
-])
+if (existsSync(createExpertScript)) {
+  run("python", [
+    createExpertScript,
+    "--manifest",
+    manifestPath,
+    "--output-dir",
+    outputRoot,
+    "--force",
+  ])
+} else {
+  await syncPackageFromManifestFallback()
+}
 
 for (const skill of ["drawio-skill", "drawio-session-editing"]) {
   await copyDirectory(
@@ -146,5 +201,9 @@ await verifyMarkdownLinks(path.join(packageDirectory, ".opencode", "skills"))
 await verifyNoDesktopFallback(path.join(packageDirectory, ".opencode", "skills", "drawio-skill"))
 await verifyNoCaches(packageDirectory)
 
-run("python", [path.join(managerScripts, "validate_expert.py"), packageDirectory])
+if (existsSync(validateExpertScript)) {
+  run("python", [validateExpertScript, packageDirectory])
+} else {
+  console.warn("mobilework-expert-manager validate_expert.py not found; skipped package shell validation")
+}
 console.log(`Built and validated ${packageDirectory}`)

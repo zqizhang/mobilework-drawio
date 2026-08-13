@@ -39,3 +39,6 @@ Thumbs.db
 Desktop.ini
 
 # generated/drawio-expert is intentionally versioned as the installable package.
+
+# Local Claude Code settings
+.claude/

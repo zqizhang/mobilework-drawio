@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process"
+import { existsSync } from "node:fs"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -8,6 +9,11 @@ const scriptDirectory = path.dirname(fileURLToPath(import.meta.url))
 const projectDirectory = path.resolve(scriptDirectory, "..")
 const manifestPath = path.join(projectDirectory, "expert.json")
 const pluginPath = path.join(projectDirectory, "runtime", "drawio-runtime.ts")
+const bunCommand = process.platform === "win32"
+  ? (existsSync(path.join(os.homedir(), ".bun", "bin", "bun.exe"))
+    ? path.join(os.homedir(), ".bun", "bin", "bun.exe")
+    : "bun")
+  : "bun"
 
 const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
 const localPlugins = manifest.runtime_extensions?.plugins?.local
@@ -23,7 +29,7 @@ if (!plugin) {
 const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "drawio-runtime-bundle-"))
 const bundlePath = path.join(temporaryDirectory, "drawio-runtime.js")
 try {
-  const build = spawnSync(process.platform === "win32" ? "bun.cmd" : "bun", [
+  const build = spawnSync(bunCommand, [
     "build",
     pluginPath,
     "--outfile",
@@ -39,7 +45,7 @@ try {
     cwd: projectDirectory,
     encoding: "utf8",
     stdio: "pipe",
-    shell: process.platform === "win32",
+    shell: false,
   })
   if (build.stdout) process.stdout.write(build.stdout)
   if (build.stderr) process.stderr.write(build.stderr)

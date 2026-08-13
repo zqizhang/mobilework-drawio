@@ -42,7 +42,7 @@ flowchart LR
 
 ### 1. 启动自包含 Draw.io Docker 服务
 
-使用 jGraph 官方 [self-contained/docker-compose.yml](https://github.com/jgraph/docker-drawio/blob/dev/self-contained/docker-compose.yml)，将两个服务的端口改为：
+本仓库已提供基于 jGraph 官方 [self-contained/docker-compose.yml](https://github.com/jgraph/docker-drawio/blob/dev/self-contained/docker-compose.yml) 调整后的 `docker-compose.drawio.yml`，端口已固定为：
 
 ```yaml
 services:
@@ -56,7 +56,7 @@ services:
       - "18080:8080"
 ```
 
-在 `docker-compose.yml` 同目录创建 `.env`：
+如果你自己使用官方 compose 文件，则在 `docker-compose.yml` 同目录创建 `.env`：
 
 ```dotenv
 DRAWIO_SERVER_URL=http://127.0.0.1:18080/
@@ -64,9 +64,9 @@ DRAWIO_BASE_URL=http://127.0.0.1:18080
 ```
 
 ```powershell
-docker compose pull
-docker compose up -d
-docker compose ps
+docker compose -f .\docker-compose.drawio.yml pull
+docker compose -f .\docker-compose.drawio.yml up -d
+docker compose -f .\docker-compose.drawio.yml ps
 ```
 
 ### 2. 配置工作区环境变量
