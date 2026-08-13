@@ -42,7 +42,7 @@ const exportServer = createServer(async (request, response) => {
 await new Promise((resolve) => exportServer.listen(0, "127.0.0.1", resolve))
 const exportAddress = exportServer.address()
 
-const XML = '<mxfile host="test"><diagram id="p1" name="Page-1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="node" value="MobileWork" vertex="1" parent="1"><mxGeometry x="20" y="20" width="120" height="60" as="geometry"/></mxCell><mxCell id="neighbor" value="Neighbor" vertex="1" parent="1"><mxGeometry x="300" y="20" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>'
+const XML = '<mxfile host="test"><diagram id="p1" name="Page-1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="node" value="MobileWork" vertex="1" parent="1"><mxGeometry x="20" y="20" width="120" height="60" as="geometry"/></mxCell><mxCell id="neighbor" value="Neighbor" vertex="1" parent="1"><mxGeometry x="300" y="20" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram><diagram id="p2" name="Page-2"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="remote" value="Remote" vertex="1" parent="1"><mxGeometry x="40" y="40" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>'
 const NESTED_XML = `<mxfile host="test"><diagram id="nested" name="Nested containers"><mxGraphModel><root>
   <mxCell id="0"/><mxCell id="1" parent="0"/>
   <mxCell id="user" value="User" vertex="1" parent="1"><mxGeometry x="390" y="60" width="160" height="60" as="geometry"/></mxCell>
@@ -199,6 +199,8 @@ try {
   assert.match(editorPage, /只修改选区/)
   assert.match(editorPage, /允许调整关联连线/)
   assert.match(editorPage, /允许调整周边布局/)
+  assert.match(editorPage, /允许修改整个图表/)
+  assert.match(editorPage, /所有页面、节点、连线和布局/)
   assert.match(editorPage, /id="history-btn"/, "editor page must include the history entry")
   assert.match(editorPage, /版本历史/, "editor page must include the history modal")
   assert.match(editorPage, /将图表恢复为 v/, "editor page must include the restore confirmation text")
@@ -448,6 +450,8 @@ try {
   const storedAnnotations = await fs.readFile(path.join(workspace, "architecture.annotations.json"), "utf8")
   assert.match(storedAnnotations, /architecture\/|architecture\.drawio|"file":\s*"architecture.drawio"/)
   assert.match(storedAnnotations, /已将节点改名为 Draw\.io/)
+  assert.match(storedAnnotations, /"schemaVersion":\s*2/)
+  assert.doesNotMatch(storedAnnotations, /"sessionId"/)
   assert.doesNotMatch(storedAnnotations, /approvalToken|"authorization"|base64url/)
 
   const openAfterResolve = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
@@ -455,6 +459,152 @@ try {
     status: "open",
   }, context))
   assert.equal(openAfterResolve.count, 0)
+
+  const globalAnn = await fetch(annotationsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "把第二页的 Remote 节点改名为 Global Remote",
+      scope: "diagram_wide",
+      pageId,
+      pageName,
+      cells: [{ id: "node", kind: "node", label: "Draw.io" }],
+    }),
+  }).then((response) => response.json())
+  assert.equal(globalAnn.annotation.scope, "diagram_wide")
+  assert.equal(globalAnn.annotation.scopeLabel, "允许修改整个图表")
+
+  // Simulate a fresh conversation/process cache: annotations must reload from
+  // the diagram sidecar even though its legacy creator session differs.
+  const v2BeforeMigration = JSON.parse(await fs.readFile(
+    path.join(workspace, "architecture.annotations.json"),
+    "utf8",
+  ))
+  await fs.writeFile(
+    path.join(workspace, "architecture.annotations.json"),
+    JSON.stringify(v2BeforeMigration.annotations.map((task) => ({
+      ...task,
+      sessionId: "legacy-foreign-session",
+    })), null, 2),
+    "utf8",
+  )
+  globalThis.__drawioIntegratedBridge.annotationsByDiagram.clear()
+  const secondApprovalRequests = []
+  const secondContext = {
+    ...context,
+    sessionID: "integrated-session-2",
+    messageID: "integrated-message-2",
+    async ask(input) { secondApprovalRequests.push(input) },
+  }
+  const secondOpen = JSON.parse(await plugin.tool.drawio_open.execute({
+    file: "architecture.drawio",
+  }, secondContext))
+  assert.equal(secondOpen.ok, true)
+  const secondList = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
+    file: "architecture.drawio",
+    status: "open",
+  }, secondContext))
+  assert.equal(secondList.count, 1)
+  assert.equal(secondList.annotations[0].id, globalAnn.annotation.id)
+
+  await plugin.tool.drawio_get_annotation.execute({
+    file: "architecture.drawio",
+    id: globalAnn.annotation.id,
+  }, secondContext)
+  const secondState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, secondContext))
+  const globalAuthorization = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
+    file: "architecture.drawio",
+    id: globalAnn.annotation.id,
+    plan: "修改第二页的 remote 节点",
+    proposed_changed_ids: ["p2:remote"],
+    requested_scope: "diagram_wide",
+  }, secondContext))
+  assert.equal(secondApprovalRequests.length, 1)
+  assert.equal(secondApprovalRequests[0].metadata.file, "architecture.drawio")
+  assert.equal(globalAuthorization.allowedExistingIds.includes("p2:remote"), true)
+
+  await plugin.tool.drawio_get_annotation.execute({
+    file: "architecture.drawio",
+    id: globalAnn.annotation.id,
+  }, context)
+  const firstState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
+  await assert.rejects(
+    plugin.tool.drawio_patch.execute({
+      file: "architecture.drawio",
+      page: "p2",
+      operations: [{ type: "update-node", id: "remote", label: "Cross-session token" }],
+      dry_run: false,
+      base_revision: firstState.revision,
+      annotation_id: globalAnn.annotation.id,
+      approval_token: globalAuthorization.approvalToken,
+    }, context),
+    /has not been approved|different diagram session/,
+  )
+
+  const globalPatch = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    page: "p2",
+    operations: [{ type: "update-node", id: "remote", label: "Global Remote" }],
+    dry_run: false,
+    base_revision: secondState.revision,
+    annotation_id: globalAnn.annotation.id,
+    approval_token: globalAuthorization.approvalToken,
+  }, secondContext))
+  assert.deepEqual(globalPatch.changedIds, ["remote"])
+  await plugin.tool.drawio_resolve_annotation.execute({
+    file: "architecture.drawio",
+    id: globalAnn.annotation.id,
+    summary: "已修改第二页节点",
+    changed_ids: ["p2:remote"],
+  }, secondContext)
+  const migratedStore = await fs.readFile(path.join(workspace, "architecture.annotations.json"), "utf8")
+  assert.match(migratedStore, /"schemaVersion":\s*2/)
+  assert.doesNotMatch(migratedStore, /legacy-foreign-session|"sessionId"/)
+
+  const polishAnn = await fetch(annotationsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "重新整理第一页的整体布局",
+      scope: "diagram_wide",
+      pageId,
+      pageName,
+      cells: [{ id: "node", kind: "node", label: "Draw.io" }],
+    }),
+  }).then((response) => response.json())
+  await plugin.tool.drawio_get_annotation.execute({ id: polishAnn.annotation.id }, context)
+  const beforePolish = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
+  const polishDryRun = JSON.parse(await plugin.tool.drawio_polish.execute({
+    file: "architecture.drawio",
+    page: "p1",
+    direction: "top-to-bottom",
+    threshold: 0,
+    dry_run: true,
+    base_revision: beforePolish.revision,
+  }, context))
+  assert.ok(polishDryRun.changedIds.length > 0)
+  const polishAuthorization = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
+    id: polishAnn.annotation.id,
+    plan: "重新布局第一页中的全部节点和连线",
+    proposed_changed_ids: polishDryRun.changedIds.map((id) => `p1:${id}`),
+    requested_scope: "diagram_wide",
+  }, context))
+  const polished = JSON.parse(await plugin.tool.drawio_polish.execute({
+    file: "architecture.drawio",
+    page: "p1",
+    direction: "top-to-bottom",
+    threshold: 0,
+    dry_run: false,
+    base_revision: beforePolish.revision,
+    annotation_id: polishAnn.annotation.id,
+    approval_token: polishAuthorization.approvalToken,
+  }, context))
+  assert.equal(polished.accepted, true)
+  await plugin.tool.drawio_resolve_annotation.execute({
+    id: polishAnn.annotation.id,
+    summary: "已重新整理第一页布局",
+    changed_ids: polishDryRun.changedIds.map((id) => `p1:${id}`),
+  }, context)
 
   const staleAnn = await fetch(annotationsUrl, {
     method: "POST",
@@ -554,10 +704,15 @@ try {
     file: "architecture.drawio",
     status: "resolved",
   }, context))
-  assert.equal(finalResolvedAnnotations.count, 2)
+  assert.equal(finalResolvedAnnotations.count, 4)
   assert.deepEqual(
     new Set(finalResolvedAnnotations.annotations.map((annotation) => annotation.id)),
-    new Set([submitted.annotation.id, staleAnn.annotation.id]),
+    new Set([
+      submitted.annotation.id,
+      globalAnn.annotation.id,
+      polishAnn.annotation.id,
+      staleAnn.annotation.id,
+    ]),
   )
 
   const annotationFinalize = JSON.parse(await plugin.tool.drawio_finalize.execute({
@@ -586,12 +741,16 @@ try {
     annotationLifecycle: true,
     annotationRegionComputation: true,
     annotationPersistence: true,
+    annotationDiagramBinding: true,
     annotationStalenessDetection: true,
     annotationFreshAutoClosure: true,
     annotationStaleConfirmationClosure: true,
     annotationPageBinding: true,
     annotationFinalizationGate: true,
     annotationScopeEnforcement: true,
+    annotationDiagramWideScope: true,
+    annotationSessionBoundApproval: true,
+    annotationDiagramWidePolish: true,
     annotationPreWriteApproval: true,
   }, null, 2))
 } finally {

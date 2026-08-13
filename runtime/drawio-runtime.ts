@@ -2315,6 +2315,7 @@ type IntegratedSession = {
   history: IntegratedSessionHistory[]
   backupFile: string | null
   activeAnnotationId: string | null
+  annotationAuthorizations: Map<string, AnnotationAuthorization>
   historyWarning: string | null
 }
 
@@ -2377,10 +2378,12 @@ type AnnotationResult = {
   updatedAt: string
 } | null
 
-type AnnotationScope = "selection_only" | "selection_and_edges" | "surrounding_layout"
+type AnnotationScope = "selection_only" | "selection_and_edges" | "surrounding_layout" | "diagram_wide"
 
 type AnnotationAuthorization = {
   token: string
+  sessionId: string
+  diagramKey: string
   scope: AnnotationScope
   plan: string
   proposedChangedIds: string[]
@@ -2388,11 +2391,10 @@ type AnnotationAuthorization = {
   baseRevision: number
   approvedAt: string
   consumedAt: string | null
-} | null
+}
 
 type AnnotationTask = {
   id: string
-  sessionId: string
   file: string
   pageId: string
   pageName: string
@@ -2400,9 +2402,10 @@ type AnnotationTask = {
   region: AnnotationRegion | null
   instruction: string
   scope: AnnotationScope
-  authorization: AnnotationAuthorization
   status: "open" | "resolved" | "stale"
   baseRevision: number
+  baseFileHash: string
+  baseCellHashes: Record<string, string>
   result: AnnotationResult
   createdAt: string
   updatedAt: string
@@ -2425,7 +2428,8 @@ type IntegratedBridgeState = {
   tokens: Map<string, IntegratedToken>
   eventClients: Map<string, Set<import("node:http").ServerResponse>>
   writeQueues: Map<string, Promise<unknown>>
-  annotations: Map<string, Map<string, AnnotationTask>>
+  annotationWriteQueues: Map<string, Promise<unknown>>
+  annotationsByDiagram: Map<string, Map<string, AnnotationTask>>
   historyWriteQueues: Map<string, Promise<unknown>>
   historyDebounce: Map<string, HistoryPendingEditor>
   previewInFlight: Map<string, Promise<Buffer>>
@@ -2448,7 +2452,8 @@ function getIntegratedBridgeState(): IntegratedBridgeState {
       tokens: new Map(),
       eventClients: new Map(),
       writeQueues: new Map(),
-      annotations: new Map(),
+      annotationWriteQueues: new Map(),
+      annotationsByDiagram: new Map(),
       historyWriteQueues: new Map(),
       historyDebounce: new Map(),
       previewInFlight: new Map(),
@@ -2457,7 +2462,8 @@ function getIntegratedBridgeState(): IntegratedBridgeState {
     }
   }
   integratedBridgeGlobal.__drawioIntegratedBridge.writeQueues ||= new Map()
-  integratedBridgeGlobal.__drawioIntegratedBridge.annotations ||= new Map()
+  integratedBridgeGlobal.__drawioIntegratedBridge.annotationWriteQueues ||= new Map()
+  integratedBridgeGlobal.__drawioIntegratedBridge.annotationsByDiagram ||= new Map()
   integratedBridgeGlobal.__drawioIntegratedBridge.historyWriteQueues ||= new Map()
   integratedBridgeGlobal.__drawioIntegratedBridge.historyDebounce ||= new Map()
   integratedBridgeGlobal.__drawioIntegratedBridge.previewInFlight ||= new Map()
@@ -2479,17 +2485,19 @@ function integratedSource(value: unknown): "editor" | "agent" {
 }
 
 function annotationScope(value: unknown): AnnotationScope {
-  if (value === "selection_and_edges" || value === "surrounding_layout") return value
+  if (value === "selection_and_edges" || value === "surrounding_layout" || value === "diagram_wide") return value
   return "selection_only"
 }
 
 function annotationScopeLabel(scope: AnnotationScope): string {
+  if (scope === "diagram_wide") return "允许修改整个图表"
   if (scope === "selection_and_edges") return "允许调整关联连线"
   if (scope === "surrounding_layout") return "允许调整周边布局"
   return "只修改选区"
 }
 
 function annotationScopeRank(scope: AnnotationScope): number {
+  if (scope === "diagram_wide") return 3
   if (scope === "selection_and_edges") return 1
   if (scope === "surrounding_layout") return 2
   return 0
@@ -2562,6 +2570,16 @@ function integratedSessionFor(
   const session = getIntegratedBridgeState().sessions.get(sessionId)
   if (!session || path.resolve(session.file) !== path.resolve(target)) return null
   return session
+}
+
+function annotationSessionFor(
+  context: { sessionID: string; directory: string; worktree?: string },
+  file?: string,
+): IntegratedSession | null {
+  if (file?.trim()) {
+    return integratedSessionFor(context, resolveWorkspacePath(context, file))
+  }
+  return getIntegratedBridgeState().sessions.get(context.sessionID) || null
 }
 
 async function integratedCommit(
@@ -3377,22 +3395,12 @@ async function restoreHistorySnapshot(
 }
 
 async function invalidateAnnotationAuthorizations(session: IntegratedSession): Promise<void> {
-  const map = getSessionAnnotations(session.sessionId)
-  const now = new Date().toISOString()
-  let changed = false
-  for (const task of map.values()) {
-    if (task.status === "resolved") continue
-    if (task.authorization) {
-      task.authorization = null
-      task.updatedAt = now
-      changed = true
-    }
+  const diagramKey = integratedDiagramKey(session.file)
+  for (const candidate of getIntegratedBridgeState().sessions.values()) {
+    if (integratedDiagramKey(candidate.file) !== diagramKey) continue
+    candidate.annotationAuthorizations.clear()
+    candidate.activeAnnotationId = null
   }
-  if (session.activeAnnotationId) {
-    session.activeAnnotationId = null
-    changed = true
-  }
-  if (changed) await persistStoredAnnotations(session)
 }
 
 function annotationStorePath(session: IntegratedSession): string {
@@ -3400,19 +3408,25 @@ function annotationStorePath(session: IntegratedSession): string {
   return `${base}.annotations.json`
 }
 
-function getSessionAnnotations(sessionId: string): Map<string, AnnotationTask> {
+function integratedDiagramKey(file: string): string {
+  const resolved = path.resolve(file)
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved
+}
+
+function getDiagramAnnotations(session: IntegratedSession): Map<string, AnnotationTask> {
   const state = getIntegratedBridgeState()
-  let map = state.annotations.get(sessionId)
+  const diagramKey = integratedDiagramKey(session.file)
+  let map = state.annotationsByDiagram.get(diagramKey)
   if (!map) {
     map = new Map()
-    state.annotations.set(sessionId, map)
+    state.annotationsByDiagram.set(diagramKey, map)
   }
   return map
 }
 
 async function loadStoredAnnotations(session: IntegratedSession): Promise<void> {
   if (session.workspace === undefined) return
-  const map = getSessionAnnotations(session.sessionId)
+  const map = getDiagramAnnotations(session)
   if (map.size > 0) return
   let store: string
   try {
@@ -3427,39 +3441,61 @@ async function loadStoredAnnotations(session: IntegratedSession): Promise<void> 
   } catch {
     return
   }
-  if (!Array.isArray(parsed)) return
-  for (const entry of parsed) {
-    if (!integratedRecord(entry) || typeof entry.id !== "string" || typeof entry.sessionId !== "string") continue
-    if (entry.sessionId !== session.sessionId) continue
+  const entries = Array.isArray(parsed)
+    ? parsed
+    : integratedRecord(parsed) && Array.isArray(parsed.annotations)
+      ? parsed.annotations
+      : []
+  for (const entry of entries) {
+    if (!integratedRecord(entry) || typeof entry.id !== "string") continue
     const task = normalizeAnnotationTask(entry, session)
     if (task) map.set(task.id, task)
   }
 }
 
 async function persistStoredAnnotations(session: IntegratedSession): Promise<void> {
-  if (testFaultInjected("annotationsFile")) throw new Error("injected annotation sidecar write failure")
-  const map = getSessionAnnotations(session.sessionId)
-  const store = [...map.values()].map((task) => ({
-    id: task.id,
-    sessionId: task.sessionId,
-    file: task.file,
-    pageId: task.pageId,
-    pageName: task.pageName,
-    cells: task.cells,
-    region: task.region,
-    instruction: task.instruction,
-    scope: task.scope,
-    status: task.status,
-    baseRevision: task.baseRevision,
-    result: task.result,
-    createdAt: task.createdAt,
-    updatedAt: task.updatedAt,
-    resolvedAt: task.resolvedAt,
-  }))
-  const target = annotationStorePath(session)
-  const temporary = `${target}.${process.pid}.${Date.now()}.tmp`
-  await fs.writeFile(temporary, JSON.stringify(store, null, 2), "utf8")
-  await fs.rename(temporary, target)
+  const state = getIntegratedBridgeState()
+  const diagramKey = integratedDiagramKey(session.file)
+  const previous = state.annotationWriteQueues.get(diagramKey) || Promise.resolve()
+  const operation = previous.catch(() => undefined).then(async () => {
+    if (testFaultInjected("annotationsFile")) throw new Error("injected annotation sidecar write failure")
+    const map = getDiagramAnnotations(session)
+    const annotations = [...map.values()].map((task) => ({
+      id: task.id,
+      file: task.file,
+      pageId: task.pageId,
+      pageName: task.pageName,
+      cells: task.cells,
+      region: task.region,
+      instruction: task.instruction,
+      scope: task.scope,
+      status: task.status,
+      baseRevision: task.baseRevision,
+      baseFileHash: task.baseFileHash,
+      baseCellHashes: task.baseCellHashes,
+      result: task.result,
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
+      resolvedAt: task.resolvedAt,
+    }))
+    const store = {
+      schemaVersion: 2,
+      file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
+      annotations,
+    }
+    const target = annotationStorePath(session)
+    const temporary = `${target}.${process.pid}.${Date.now()}.tmp`
+    await fs.writeFile(temporary, JSON.stringify(store, null, 2), "utf8")
+    await fs.rename(temporary, target)
+  })
+  state.annotationWriteQueues.set(diagramKey, operation)
+  try {
+    await operation
+  } finally {
+    if (state.annotationWriteQueues.get(diagramKey) === operation) {
+      state.annotationWriteQueues.delete(diagramKey)
+    }
+  }
 }
 
 function normalizeAnnotationTask(value: Record<string, unknown>, session: IntegratedSession): AnnotationTask | null {
@@ -3485,7 +3521,6 @@ function normalizeAnnotationTask(value: Record<string, unknown>, session: Integr
   const status = value.status === "resolved" || value.status === "stale" ? value.status : "open"
   return {
     id: String(value.id),
-    sessionId: session.sessionId,
     file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
     pageId: typeof value.pageId === "string" ? String(value.pageId) : "",
     pageName: typeof value.pageName === "string" ? String(value.pageName) : "",
@@ -3493,11 +3528,14 @@ function normalizeAnnotationTask(value: Record<string, unknown>, session: Integr
     region,
     instruction: typeof value.instruction === "string" ? String(value.instruction) : "",
     scope: annotationScope(value.scope),
-    // Approval tokens are deliberately process-local. Ignore tokens persisted
-    // by older packages so every restarted session requires fresh approval.
-    authorization: null,
     status,
     baseRevision: Number.isInteger(value.baseRevision) ? Number(value.baseRevision) : 0,
+    baseFileHash: typeof value.baseFileHash === "string" ? String(value.baseFileHash) : "",
+    baseCellHashes: integratedRecord(value.baseCellHashes)
+      ? Object.fromEntries(Object.entries(value.baseCellHashes).filter((entry): entry is [string, string] => (
+        typeof entry[1] === "string"
+      )))
+      : {},
     result: integratedRecord(value.result) && typeof value.result.summary === "string"
       ? {
         summary: String(value.result.summary),
@@ -3557,11 +3595,27 @@ function annotationRegion(pages: ParsedPage[], pageId: string, cellIds: string[]
   return { x: minX, y: minY, width: maxX - minX, height: maxY - minY }
 }
 
+function annotationBaseCellHashes(
+  pages: ParsedPage[],
+  pageId: string,
+  cellIds: string[],
+): Record<string, string> {
+  const page = pages.find((candidate) => candidate.id === pageId || !pageId)
+  if (!page) return {}
+  const byId = new Map(page.cells.map((cell) => [cell.id, cell]))
+  return Object.fromEntries(cellIds.flatMap((id) => {
+    const cell = byId.get(id)
+    return cell ? [[`${page.id}:${id}`, integratedHash(JSON.stringify(comparableCell(cell)))]] : []
+  }))
+}
+
 type AnnotationScopeContext = {
+  pages: ParsedPage[]
   page: ParsedPage
   selectedIds: Set<string>
   selectedNodeIds: Set<string>
   allowedIds: Set<string>
+  allowedQualifiedIds: Set<string>
   allowedVertexIds: Set<string>
   expandedRegion: AnnotationRegion | null
 }
@@ -3589,6 +3643,7 @@ function annotationScopeContext(
       .map((cell) => cell.id),
   )
   const allowedIds = new Set(selectedIds)
+  const allowedQualifiedIds = new Set<string>()
   const allowedVertexIds = new Set(selectedNodeIds)
   let expandedRegion: AnnotationRegion | null = null
 
@@ -3646,14 +3701,32 @@ function annotationScopeContext(
     }
   }
 
-  return { page, selectedIds, selectedNodeIds, allowedIds, allowedVertexIds, expandedRegion }
+  if (scope === "diagram_wide") {
+    for (const candidate of pages) {
+      for (const cell of candidate.cells) {
+        if (cell.vertex || cell.edge) allowedQualifiedIds.add(`${candidate.id}:${cell.id}`)
+      }
+    }
+  }
+
+  return {
+    pages,
+    page,
+    selectedIds,
+    selectedNodeIds,
+    allowedIds,
+    allowedQualifiedIds,
+    allowedVertexIds,
+    expandedRegion,
+  }
 }
 
 function activeAnnotationTask(session: IntegratedSession): AnnotationTask | null {
   const id = session.activeAnnotationId
   if (!id) return null
-  const task = getSessionAnnotations(session.sessionId).get(id)
+  const task = getDiagramAnnotations(session).get(id)
   if (!task || task.status === "resolved") {
+    session.annotationAuthorizations.delete(id)
     session.activeAnnotationId = null
     return null
   }
@@ -3664,7 +3737,7 @@ function requireAnnotationAuthorization(
   session: IntegratedSession,
   annotationId: string | undefined,
   approvalToken: string | undefined,
-): { task: AnnotationTask; authorization: NonNullable<AnnotationAuthorization>; scope: AnnotationScopeContext } | null {
+): { task: AnnotationTask; authorization: AnnotationAuthorization; scope: AnnotationScopeContext } | null {
   const active = activeAnnotationTask(session)
   if (!active) {
     // After a restore the active annotation is explicitly cleared and any
@@ -3682,7 +3755,7 @@ function requireAnnotationAuthorization(
       `annotation ${active.id} is active; formal writes require its annotation_id and a pre-approved approval_token`,
     )
   }
-  const authorization = active.authorization
+  const authorization = session.annotationAuthorizations.get(active.id)
   if (!authorization || !approvalToken || authorization.token !== approvalToken) {
     throw new Error(
       "annotation change has not been approved; call drawio_authorize_annotation_change and wait for the OpenCode approval popup before writing",
@@ -3690,6 +3763,12 @@ function requireAnnotationAuthorization(
   }
   if (authorization.consumedAt) {
     throw new Error("annotation approval token has already been used; request approval again before another write")
+  }
+  if (
+    authorization.sessionId !== session.sessionId
+    || authorization.diagramKey !== integratedDiagramKey(session.file)
+  ) {
+    throw new Error("annotation approval belongs to a different diagram session; request approval again")
   }
   if (authorization.baseRevision !== session.revision) {
     throw new Error(
@@ -3705,6 +3784,7 @@ function requireAnnotationAuthorization(
 
 function validateAnnotationPatchScope(
   guard: NonNullable<ReturnType<typeof requireAnnotationAuthorization>>,
+  pageId: string,
   operations: PatchOperation[],
   changedIds: string[],
 ): void {
@@ -3715,9 +3795,13 @@ function validateAnnotationPatchScope(
   )
 
   for (const operation of operations) {
-    if (!planned.has(operation.id)) {
-      throw new Error(`annotation scope violation: ${operation.id} was not disclosed in the approved change plan`)
+    const disclosedId = authorization.scope === "diagram_wide"
+      ? `${pageId}:${operation.id}`
+      : operation.id
+    if (!planned.has(disclosedId)) {
+      throw new Error(`annotation scope violation: ${disclosedId} was not disclosed in the approved change plan`)
     }
+    if (authorization.scope === "diagram_wide") continue
     if (scope.allowedIds.has(operation.id)) continue
 
     if (authorization.scope === "selection_and_edges" && operation.type === "add-edge") {
@@ -3756,9 +3840,11 @@ function validateAnnotationPatchScope(
   }
 
   for (const id of changedIds) {
-    if (!planned.has(id)) {
-      throw new Error(`annotation scope violation: actual change ${id} was not disclosed in the approved plan`)
+    const disclosedId = authorization.scope === "diagram_wide" ? `${pageId}:${id}` : id
+    if (!planned.has(disclosedId)) {
+      throw new Error(`annotation scope violation: actual change ${disclosedId} was not disclosed in the approved plan`)
     }
+    if (authorization.scope === "diagram_wide") continue
     const isPlannedNew = addedNodeIds.has(id)
       || operations.some((operation) => operation.type === "add-edge" && operation.id === id)
     if (!scope.allowedIds.has(id) && !isPlannedNew) {
@@ -3774,16 +3860,19 @@ function validateAnnotationXmlScope(
 ): string[] {
   const diff = diffParsedPages(before, after)
   const pagePrefix = `${guard.task.pageId}:`
-  const changedIds = [...diff.added, ...diff.removed, ...diff.changed]
-    .map((entry) => entry.key.startsWith(pagePrefix)
-      ? entry.key.slice(pagePrefix.length)
-      : entry.key)
+  const changedKeys = [...diff.added, ...diff.removed, ...diff.changed].map((entry) => entry.key)
+  const changedIds = guard.authorization.scope === "diagram_wide"
+    ? changedKeys
+    : changedKeys.map((key) => key.startsWith(pagePrefix) ? key.slice(pagePrefix.length) : key)
   const planned = new Set(guard.authorization.proposedChangedIds)
   for (const id of changedIds) {
     if (!planned.has(id)) {
       throw new Error(`annotation scope violation: actual change ${id} was not disclosed in the approved plan`)
     }
-    if (!guard.scope.allowedIds.has(id)) {
+    const allowed = guard.authorization.scope === "diagram_wide"
+      ? guard.scope.allowedQualifiedIds.has(id) || planned.has(id)
+      : guard.scope.allowedIds.has(id)
+    if (!allowed) {
       throw new Error(
         `annotation scope violation: full-XML update changes ${id} outside "${annotationScopeLabel(guard.authorization.scope)}"; use scoped drawio_patch or request wider approval`,
       )
@@ -3807,9 +3896,13 @@ function annotationStaleState(
   task: AnnotationTask,
 ): { stale: boolean; reason?: string } {
   if (task.status === "resolved") return { stale: false }
-  if (task.baseRevision >= session.revision) return { stale: false }
+  if (task.baseFileHash && task.baseFileHash === session.fileHash) return { stale: false }
+  if (!task.baseFileHash && task.baseRevision >= session.revision) return { stale: false }
   if (task.cells.length === 0) return { stale: false }
-  const base = session.history.find((entry) => entry.revision === task.baseRevision)
+  const revisionBase = session.history.find((entry) => entry.revision === task.baseRevision)
+  const base = revisionBase && (
+    !task.baseFileHash || integratedHash(revisionBase.xml) === task.baseFileHash
+  ) ? revisionBase : undefined
   if (!base) {
     // base revision no longer in memory; verify cells still resolve on latest XML instead
   }
@@ -3830,7 +3923,18 @@ function annotationStaleState(
       if (!after) {
         return { stale: true, reason: `selected cell "${selected.id}" was deleted since the annotation was created` }
       }
-      if (before && JSON.stringify(comparableCell(before)) !== JSON.stringify(comparableCell(after))) {
+      const expectedHash = task.baseCellHashes[`${task.pageId}:${selected.id}`]
+      if (expectedHash && integratedHash(JSON.stringify(comparableCell(after))) !== expectedHash) {
+        return { stale: true, reason: `selected cell "${selected.id}" changed since the annotation was created` }
+      }
+      if (!expectedHash && before && JSON.stringify(comparableCell(before)) !== JSON.stringify(comparableCell(after))) {
+        return { stale: true, reason: `selected cell "${selected.id}" changed since the annotation was created` }
+      }
+      if (!expectedHash && !before && (
+        (selected.label || "") !== (after.label || "")
+        || (selected.source || "") !== (after.source || "")
+        || (selected.target || "") !== (after.target || "")
+      )) {
         return { stale: true, reason: `selected cell "${selected.id}" changed since the annotation was created` }
       }
     }
@@ -3871,9 +3975,9 @@ function annotationPayload(
   task: AnnotationTask,
   state: AnnotationEffectiveState = annotationEffectiveState(session, task),
 ) {
+  const authorization = session.annotationAuthorizations.get(task.id) || null
   return {
     id: task.id,
-    sessionId: task.sessionId,
     file: task.file,
     page: { id: task.pageId, name: task.pageName },
     cells: task.cells,
@@ -3881,16 +3985,16 @@ function annotationPayload(
     instruction: task.instruction,
     scope: task.scope,
     scopeLabel: annotationScopeLabel(task.scope),
-    authorization: task.authorization
+    authorization: authorization
       ? {
-        scope: task.authorization.scope,
-        scopeLabel: annotationScopeLabel(task.authorization.scope),
-        plan: task.authorization.plan,
-        proposedChangedIds: task.authorization.proposedChangedIds,
-        escalationReason: task.authorization.escalationReason,
-        baseRevision: task.authorization.baseRevision,
-        approvedAt: task.authorization.approvedAt,
-        consumedAt: task.authorization.consumedAt,
+        scope: authorization.scope,
+        scopeLabel: annotationScopeLabel(authorization.scope),
+        plan: authorization.plan,
+        proposedChangedIds: authorization.proposedChangedIds,
+        escalationReason: authorization.escalationReason,
+        baseRevision: authorization.baseRevision,
+        approvedAt: authorization.approvedAt,
+        consumedAt: authorization.consumedAt,
       }
       : null,
     status: state.status,
@@ -3908,9 +4012,26 @@ function annotationPayload(
 }
 
 function broadcastAnnotation(session: IntegratedSession, task: AnnotationTask, kind: string): void {
-  const payload = `event: annotation\\ndata: ${JSON.stringify({ kind, annotation: annotationPayload(session, task) })}\\n\\n`
-  for (const response of getIntegratedBridgeState().eventClients.get(session.sessionId) || []) {
-    response.write(payload)
+  const state = getIntegratedBridgeState()
+  const diagramKey = integratedDiagramKey(session.file)
+  for (const candidate of state.sessions.values()) {
+    if (integratedDiagramKey(candidate.file) !== diagramKey) continue
+    const payload = `event: annotation\\ndata: ${JSON.stringify({
+      kind,
+      annotation: annotationPayload(candidate, task),
+    })}\\n\\n`
+    for (const response of state.eventClients.get(candidate.sessionId) || []) {
+      response.write(payload)
+    }
+  }
+}
+
+function clearAnnotationSessionState(session: IntegratedSession, annotationId: string): void {
+  const diagramKey = integratedDiagramKey(session.file)
+  for (const candidate of getIntegratedBridgeState().sessions.values()) {
+    if (integratedDiagramKey(candidate.file) !== diagramKey) continue
+    candidate.annotationAuthorizations.delete(annotationId)
+    if (candidate.activeAnnotationId === annotationId) candidate.activeAnnotationId = null
   }
 }
 
@@ -4176,6 +4297,8 @@ return `<!doctype html>
           <span>允许调整关联连线<small>可同时调整与选中节点直接相连的连线。</small></span></label>
         <label><input type="radio" name="ann-scope" value="surrounding_layout">
           <span>允许调整周边布局<small>可调整选区附近及一跳关联的节点和连线。</small></span></label>
+        <label><input type="radio" name="ann-scope" value="diagram_wide">
+          <span>允许修改整个图表<small>可调整当前图表全部页面中的节点、连线和布局，不包括其它文件。</small></span></label>
       </fieldset>
       <div style="margin:0 14px 10px;font-size:11px;color:#64748b">提交注释不会立即改图。Agent会先展示具体修改计划，OpenCode弹出确认后才执行。</div>
       <div class="actions">
@@ -4831,12 +4954,16 @@ return `<!doctype html>
         if (!pendingSelection) return;
         const instruction = annInstruction.value.trim();
         if (!instruction) { annInstruction.focus(); return; }
+        const scope = selectedAnnotationScope();
+        if (scope === "diagram_wide" && !window.confirm(
+          "这将允许 Agent 修改当前图表的所有页面、节点、连线和布局。正式写入前仍会展示具体计划并再次请求审批。是否继续提交？"
+        )) return;
         annSubmit.disabled = true;
         try {
           const response = await fetch(CONFIG.annotationsUrl, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ instruction, scope: selectedAnnotationScope(), pageId: pendingSelection.pageId, pageName: pendingSelection.pageName, cells: pendingSelection.cells }),
+            body: JSON.stringify({ instruction, scope, pageId: pendingSelection.pageId, pageName: pendingSelection.pageName, cells: pendingSelection.cells }),
           });
           const result = await response.json();
           if (!response.ok) throw new Error(result.error || "提交注释失败");
@@ -5373,7 +5500,7 @@ state.eventClients.set(session.sessionId, clients)
 
   if (request.method === "GET" && requestUrl.pathname === "/api/annotations") {
     await refreshIntegratedSession(session)
-    const map = getSessionAnnotations(session.sessionId)
+    const map = getDiagramAnnotations(session)
     const statusFilter = requestUrl.searchParams.get("status")
     const list = [...map.values()]
       .map((task) => ({ task, state: annotationEffectiveState(session, task) }))
@@ -5381,7 +5508,6 @@ state.eventClients.set(session.sessionId, clients)
       .map((entry) => annotationPayload(session, entry.task, entry.state))
     integratedJsonResponse(response, 200, {
       ok: true,
-      sessionId: session.sessionId,
       file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
       count: list.length,
       annotations: list,
@@ -5428,7 +5554,6 @@ state.eventClients.set(session.sessionId, clients)
     const id = `ant_${randomBytes(6).toString("base64url")}`
     const task: AnnotationTask = {
       id,
-      sessionId: session.sessionId,
       file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
       pageId,
       pageName,
@@ -5436,15 +5561,16 @@ state.eventClients.set(session.sessionId, clients)
       region,
       instruction,
       scope,
-      authorization: null,
       status: "open",
       baseRevision: session.revision,
+      baseFileHash: session.fileHash,
+      baseCellHashes: annotationBaseCellHashes(pages, pageId, cells.map((cell) => cell.id)),
       result: null,
       createdAt: now,
       updatedAt: now,
       resolvedAt: null,
     }
-    const map = getSessionAnnotations(session.sessionId)
+    const map = getDiagramAnnotations(session)
     map.set(task.id, task)
     await persistStoredAnnotations(session)
     broadcastAnnotation(session, task, "created")
@@ -5457,7 +5583,7 @@ state.eventClients.set(session.sessionId, clients)
 
   if (annotationId && request.method === "GET") {
     await refreshIntegratedSession(session)
-    const map = getSessionAnnotations(session.sessionId)
+    const map = getDiagramAnnotations(session)
     const task = map.get(annotationId)
     if (!task) {
       integratedJsonResponse(response, 404, { ok: false, error: "annotation not found" })
@@ -5471,7 +5597,7 @@ state.eventClients.set(session.sessionId, clients)
   }
 
   if (annotationId && (request.method === "PATCH" || request.method === "PUT")) {
-    const map = getSessionAnnotations(session.sessionId)
+    const map = getDiagramAnnotations(session)
     const task = map.get(annotationId)
     if (!task) {
       integratedJsonResponse(response, 404, { ok: false, error: "annotation not found" })
@@ -5498,7 +5624,7 @@ state.eventClients.set(session.sessionId, clients)
         updatedAt: new Date().toISOString(),
       }
       task.resolvedAt = task.result.updatedAt
-      if (session.activeAnnotationId === task.id) session.activeAnnotationId = null
+      clearAnnotationSessionState(session, task.id)
     } else if (requestedStatus === "open" || requestedStatus === "stale") {
       task.status = requestedStatus
       if (requestedStatus === "open") {
@@ -5597,10 +5723,12 @@ async function bindIntegratedSession(
       }],
       backupFile: null,
       activeAnnotationId: null,
+      annotationAuthorizations: new Map(),
       historyWarning: null,
     }
-state.sessions.set(context.sessionID, session)
+  state.sessions.set(context.sessionID, session)
   session.activeAnnotationId ??= null
+  session.annotationAuthorizations ??= new Map()
   await loadStoredAnnotations(session)
   await bindHistoryCheckpoint(session)
   const bridge = await ensureIntegratedBridgeStarted()
@@ -5664,10 +5792,10 @@ const DRAWIO_RUNTIME_GUIDANCE = `## Draw.io 文件写入与交付
 
 ## 注释任务（框选评审）
 
-用户在内置浏览器中框选图元并提交注释后，每条注释是一条独立任务，记录选中图元的稳定 ID、页面、区域范围、修改说明、允许范围和提交时的 revision。
+用户在内置浏览器中框选图元并提交注释后，每条注释是一条按图表文件持久化的独立任务，不绑定创建它的对话 session；任务记录稳定 ID、页面、区域范围、修改说明、允许范围和提交时的图表基线。
 注释的 status 只有 open/resolved；freshness=stale 表示图元已变化但任务仍未完成。执行 stale 注释前必须先询问用户；fresh 注释可直接进入计划和审批流程。
-处理注释时必须先读取最新状态并 dry-run，向用户说明计划、完整稳定 ID 清单和范围，再调用 drawio_authorize_annotation_change。该工具必须由 OpenCode 以 ask 权限弹窗在写入前批准；批准后才可把一次性 token 传给正式 drawio_patch/drawio_update_state。调用 drawio_patch 时传 annotation_id，由运行时强制使用注释绑定的 pageId。禁止先改后问。
-不得修改授权范围外内容。确需越界时，在 authorization 的 escalation_reason 中先说明不可避免的原因并申请更宽范围；未获批准不得写入。drawio_polish 会重排整页，存在活动注释时禁止正式运行。
+处理注释时必须先读取最新状态并 dry-run，向用户说明计划、完整稳定 ID 清单和范围，再调用 drawio_authorize_annotation_change。该工具必须由 OpenCode 以 ask 权限弹窗在写入前批准；批准后才可把当前 session 的一次性 token 传给正式 drawio_patch/drawio_update_state。非全图范围由运行时强制使用注释绑定的 pageId；diagram_wide 覆盖当前图表全部页面并使用 pageId:cellId。禁止先改后问。
+不得修改授权范围外内容。确需越界时，在 authorization 的 escalation_reason 中先说明不可避免的原因并申请更宽范围；未获批准不得写入。drawio_polish 会重排整页，存在活动注释时只有取得 diagram_wide 审批后才能正式运行。
 用户本轮另有明确任务时先完成该任务，然后在同一轮重新探测注释；最终回复前仍存在 requiresConfirmation=false 的 open 注释时必须继续处理，不能只提示用户稍后继续。
 注释任务的检查与处理流程由 drawio-session-editing 技能负责编排，详见该 SKILL.md。`
 
@@ -5988,7 +6116,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           if (!activeSession) {
             throw new Error("annotation_id requires an active Draw.io session for this file")
           }
-          const annotation = getSessionAnnotations(activeSession.sessionId).get(args.annotation_id)
+          const annotation = getDiagramAnnotations(activeSession).get(args.annotation_id)
           if (!annotation) throw new Error(`annotation not found: ${args.annotation_id}`)
           if (annotation.status === "resolved") {
             throw new Error(`annotation is already resolved: ${args.annotation_id}`)
@@ -5996,12 +6124,19 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           if (!annotation.pageId.trim()) {
             throw new Error(`annotation has no stable page id: ${args.annotation_id}`)
           }
-          if (args.page && args.page !== annotation.pageId && args.page !== annotation.pageName) {
+          if (
+            annotation.scope !== "diagram_wide"
+            && args.page
+            && args.page !== annotation.pageId
+            && args.page !== annotation.pageName
+          ) {
             throw new Error(
               `annotation ${args.annotation_id} is bound to page ${annotation.pageId}; received page ${args.page}`,
             )
           }
-          pageSelector = annotation.pageId
+          pageSelector = annotation.scope === "diagram_wide" && args.page
+            ? args.page
+            : annotation.pageId
         }
         if (activeSession && !args.dry_run && args.base_revision === undefined) {
           throw new Error(
@@ -6018,7 +6153,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         const page = selectEditablePage(editable, pageSelector)
         const changedIds = applyPatchOperations(page, args.operations as PatchOperation[])
         if (annotationGuard) {
-          validateAnnotationPatchScope(annotationGuard, args.operations as PatchOperation[], changedIds)
+          validateAnnotationPatchScope(annotationGuard, page.id, args.operations as PatchOperation[], changedIds)
         }
         const afterXml = serializeEditableDrawio(editable)
         const afterPages = parseDrawio(afterXml)
@@ -6107,6 +6242,14 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           .min(0)
           .optional()
           .describe("Exact revision returned by drawio_get_state; mandatory when writing an active session"),
+        annotation_id: tool.schema
+          .string()
+          .optional()
+          .describe("Active annotation id; whole-page polish requires diagram_wide approval"),
+        approval_token: tool.schema
+          .string()
+          .optional()
+          .describe("One-time diagram_wide token returned by drawio_authorize_annotation_change"),
       },
       async execute(args, context) {
         const target = resolveWorkspacePath(context, args.file)
@@ -6118,10 +6261,13 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
             + "call drawio_get_state immediately before writing",
           )
         }
-        if (activeSession && !args.dry_run && activeAnnotationTask(activeSession)) {
+        const annotationGuard = activeSession && !args.dry_run
+          ? requireAnnotationAuthorization(activeSession, args.annotation_id, args.approval_token)
+          : null
+        if (annotationGuard && annotationGuard.authorization.scope !== "diagram_wide") {
           throw new Error(
-            "drawio_polish may relayout the whole page and is blocked while an annotation is active; "
-            + "use scoped drawio_patch after explicit annotation approval",
+            "drawio_polish may relayout the whole page and requires diagram_wide annotation approval; "
+            + "use scoped drawio_patch or request wider approval",
           )
         }
         const beforeXml = activeSession?.xml || await readDiagramFile(target)
@@ -6130,6 +6276,9 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         const editable = parseEditableDrawio(beforeXml)
         const page = selectEditablePage(editable, args.page)
         const changedIds = autoLayoutPage(page, args.direction)
+        if (annotationGuard) {
+          validateAnnotationPatchScope(annotationGuard, page.id, [], changedIds)
+        }
         const afterXml = serializeEditableDrawio(editable)
         const afterPages = parseDrawio(afterXml)
         const afterQuality = qualityReport(afterPages, args.threshold)
@@ -6171,6 +6320,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           if (commit.invalid) {
             throw new Error(`polished diagram failed validation: ${JSON.stringify(commit.report.errors)}`)
           }
+          if (annotationGuard) await consumeAnnotationAuthorization(activeSession, annotationGuard)
           writeResult = { backup: activeSession.backupFile }
         } else {
           writeResult = await atomicWrite(target, afterXml, true)
@@ -6413,7 +6563,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         const session = integratedSessionFor(context, target)
         if (!session) throw new Error("No active Draw.io session for this file. Call drawio_open first.")
         await refreshIntegratedSession(session)
-        const map = getSessionAnnotations(session.sessionId)
+        const map = getDiagramAnnotations(session)
         const list = [...map.values()]
           .map((task) => ({ task, state: annotationEffectiveState(session, task) }))
           .filter((entry) => annotationMatchesStatus(entry.state, args.status))
@@ -6433,13 +6583,14 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       description:
         "Read one annotation task in full and make it the active guarded task, including selected stable cell ids, region, user-selected scope, instruction, base revision, staleness and latest per-cell snapshots.",
       args: {
+        file: tool.schema.string().optional().describe("Workspace-relative diagram file; defaults to the active file"),
         id: tool.schema.string().describe("Annotation id returned by drawio_list_annotations"),
       },
       async execute(args, context) {
-        const session = getIntegratedBridgeState().sessions.get(context.sessionID)
+        const session = annotationSessionFor(context, args.file)
         if (!session) throw new Error("No active Draw.io session. Call drawio_open first.")
         await refreshIntegratedSession(session)
-        const map = getSessionAnnotations(session.sessionId)
+        const map = getDiagramAnnotations(session)
         const task = map.get(args.id)
         if (!task) throw new Error(`annotation not found: ${args.id}`)
         session.activeAnnotationId = task.id
@@ -6484,6 +6635,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       description:
         "Request the user's pre-change approval for one annotation plan. OpenCode must show its permission popup before this tool runs. If approved, returns a one-time token bound to the current revision, declared stable IDs and requested scope. Never call after modifying the diagram.",
       args: {
+        file: tool.schema.string().optional().describe("Workspace-relative diagram file; defaults to the active file"),
         id: tool.schema.string().describe("Annotation id returned by drawio_get_annotation"),
         plan: tool.schema
           .string()
@@ -6492,9 +6644,9 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         proposed_changed_ids: tool.schema
           .array(tool.schema.string())
           .min(1)
-          .describe("Complete stable-ID allowlist disclosed to the user before the write"),
+          .describe("Complete stable-ID allowlist disclosed before writing; diagram_wide uses pageId:cellId"),
         requested_scope: tool.schema
-          .enum(["selection_only", "selection_and_edges", "surrounding_layout"])
+          .enum(["selection_only", "selection_and_edges", "surrounding_layout", "diagram_wide"])
           .describe("Scope needed by this plan; normally equal to or narrower than the user's annotation scope"),
         escalation_reason: tool.schema
           .string()
@@ -6502,10 +6654,10 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           .describe("Required when requesting a scope wider than the user originally selected"),
       },
       async execute(args, context) {
-        const session = getIntegratedBridgeState().sessions.get(context.sessionID)
+        const session = annotationSessionFor(context, args.file)
         if (!session) throw new Error("No active Draw.io session. Call drawio_open first.")
         await refreshIntegratedSession(session)
-        const task = getSessionAnnotations(session.sessionId).get(args.id)
+        const task = getDiagramAnnotations(session).get(args.id)
         if (!task) throw new Error(`annotation not found: ${args.id}`)
         if (task.status === "resolved") throw new Error(`annotation is already resolved: ${args.id}`)
         const requestedScope = annotationScope(args.requested_scope)
@@ -6521,8 +6673,10 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           throw new Error("proposed_changed_ids must contain at least one stable id")
         }
         const scope = annotationScopeContext(session, task, requestedScope)
+        const diagramFile = path.relative(session.workspace, session.file).split(path.sep).join("/")
         const approvalPattern = [
           "annotation",
+          integratedHash(integratedDiagramKey(session.file)).slice(0, 12),
           task.id,
           `revision-${session.revision}`,
           requestedScope,
@@ -6534,6 +6688,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           always: [approvalPattern],
           metadata: {
             annotationId: task.id,
+            file: diagramFile,
             plan: args.plan.trim(),
             proposedChangedIds,
             requestedScope,
@@ -6545,8 +6700,10 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           },
         })
         const now = new Date().toISOString()
-        task.authorization = {
+        const authorization: AnnotationAuthorization = {
           token: randomBytes(24).toString("base64url"),
+          sessionId: session.sessionId,
+          diagramKey: integratedDiagramKey(session.file),
           scope: requestedScope,
           plan: args.plan.trim(),
           proposedChangedIds,
@@ -6555,6 +6712,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           approvedAt: now,
           consumedAt: null,
         }
+        session.annotationAuthorizations.set(task.id, authorization)
         task.updatedAt = now
         session.activeAnnotationId = task.id
         await persistStoredAnnotations(session)
@@ -6562,15 +6720,17 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         return JSON.stringify({
           ok: true,
           annotationId: task.id,
-          approvalToken: task.authorization.token,
-          baseRevision: task.authorization.baseRevision,
+          approvalToken: authorization.token,
+          baseRevision: authorization.baseRevision,
           requestedScope,
           requestedScopeLabel: annotationScopeLabel(requestedScope),
           originalScope: task.scope,
           originalScopeLabel: annotationScopeLabel(task.scope),
           escalationReason,
           proposedChangedIds,
-          allowedExistingIds: [...scope.allowedIds],
+          allowedExistingIds: requestedScope === "diagram_wide"
+            ? [...scope.allowedQualifiedIds]
+            : [...scope.allowedIds],
           guidance:
             "Approval is valid for one formal write at this exact revision. Pass annotation_id and approval_token to drawio_patch or drawio_update_state. Any undeclared or out-of-scope stable ID is rejected.",
         }, null, 2)
@@ -6581,6 +6741,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       description:
         "Mark an annotation task as resolved after the requested change has been written (or after deciding no change is needed). This updates status and stores a summary; it does not modify the diagram itself.",
       args: {
+        file: tool.schema.string().optional().describe("Workspace-relative diagram file; defaults to the active file"),
         id: tool.schema.string().describe("Annotation id to resolve"),
         summary: tool.schema
           .string()
@@ -6591,10 +6752,10 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           .describe("Stable cell ids that were added, removed or modified for this annotation"),
       },
       async execute(args, context) {
-        const session = getIntegratedBridgeState().sessions.get(context.sessionID)
+        const session = annotationSessionFor(context, args.file)
         if (!session) throw new Error("No active Draw.io session. Call drawio_open first.")
         await refreshIntegratedSession(session)
-        const map = getSessionAnnotations(session.sessionId)
+        const map = getDiagramAnnotations(session)
         const task = map.get(args.id)
         if (!task) throw new Error(`annotation not found: ${args.id}`)
         const now = new Date().toISOString()
@@ -6608,7 +6769,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         task.resolvedAt = now
         task.updatedAt = now
         map.set(task.id, task)
-        if (session.activeAnnotationId === task.id) session.activeAnnotationId = null
+        clearAnnotationSessionState(session, task.id)
         await persistStoredAnnotations(session)
         broadcastAnnotation(session, task, "updated")
         return JSON.stringify({

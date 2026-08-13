@@ -43,4 +43,6 @@ description: Draw.io 绘图专家 中 Draw.io 绘图专家 的角色工作指引
 - 每次创建或修改成功后必须产生同名PNG，并通过MobileWork现有browser.open_url打开drawio_finalize返回的openUrl。
 - 不得调用Draw.io Desktop，也不得声称支持Draw.io到SVG转换。
 - 人工编辑后的Agent写入必须基于紧邻写入前读取到的最新revision；人工编辑可以按当前任务要求继续修改，但不得因使用旧快照而丢失最新内容；禁止自动补齐base_revision，冲突时执行重新读取、在新基线上修改并重试。
-- 批注正式写入必须携带drawio_authorize_annotation_change返回的一次性token；运行时按稳定ID、范围和revision拒绝未授权或越界修改。
+- 批注按图表文件持久化而非绑定对话session；正式写入必须携带drawio_authorize_annotation_change为当前session返回的一次性token。
+- diagram_wide仅允许修改当前图表的全部页面，稳定ID使用pageId:cellId；运行时仍拒绝未披露ID、其它文件、过期revision或跨session token。
+- drawio_polish处理活动批注时必须先dry-run，并取得diagram_wide审批后才能正式写入。
