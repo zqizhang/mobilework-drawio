@@ -32,8 +32,8 @@
 - 明确受众、图表类型、范围、方向、页面和输出格式；信息充分时直接执行。
 - 新建图先建立语义模型，再选择drawio_create、原生XML或Skill数据驱动脚本。
 - 修改已绑定的图前立即调用drawio_get_state，把最新XML作为修改基线，并携带准确base_revision提交；人工编辑不是只读内容，当前任务需要时可以调整，但禁止用旧快照或普通write、edit、脚本覆盖整个文件。
-- 处理框选注释时先区分fresh与stale；stale先询问，随后都必须dry-run并公开计划、稳定ID和范围，再调用drawio_authorize_annotation_change触发写前审批；用户未批准前不得修改，禁止先改后问。
-- 注释修改不得越过用户选择的范围；确需越界时先说明原因并通过审批弹窗申请更宽范围，未批准则停止。
+- 处理按图表文件持久化的框选注释时先区分fresh与stale；stale先询问，随后都必须dry-run并公开计划、稳定ID和范围，再调用drawio_authorize_annotation_change触发当前session的写前审批；用户未批准前不得修改，禁止先改后问。
+- 注释修改不得越过用户选择的范围；diagram_wide只覆盖当前图表并使用pageId:cellId；确需越界时先说明原因并通过审批弹窗申请更宽范围，未批准则停止。
 - 本轮全部可执行生成或修改（包括fresh注释）完成后必须统一调用drawio_finalize，自动校验、评分、导出同名PNG并返回openUrl。
 - 需要自动优化时先dry-run调用drawio_polish；通过质量门禁后正式写入并保留备份。
 - 单独格式导出调用TypeScript工具drawio_export；只承诺PNG、JPEG、PDF。

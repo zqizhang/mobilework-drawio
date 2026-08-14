@@ -374,8 +374,8 @@ try {
   }
 
   // =====================================================================
-  // annotation sidecar write failure during restore: still a proper response,
-  // never a plain 500, and the in-memory authorization is still invalidated
+  // Annotation approvals are session-local and never persisted. Restore must
+  // invalidate them in memory without touching the annotation sidecar.
   // =====================================================================
   {
     const session = await makeSession(plugin, "fix-ann-sidecar", "ann.drawio", BASE_XML)
@@ -407,11 +407,11 @@ try {
     globalThis.__drawioHistoryFaults = { annotationsFile: true }
     const restored = await restoreVersion(session.open, initial.id, history.currentRevision)
     delete globalThis.__drawioHistoryFaults
-    assert.equal(restored.status, 200, "annotation sidecar failure must not collapse into a plain 500")
+    assert.equal(restored.status, 200, "session-local approval invalidation must not touch the sidecar")
     assert.equal(restored.body.ok, true)
-    assert.equal(restored.body.partial, undefined, "restore itself succeeded; only the sidecar persistence failed")
+    assert.equal(restored.body.partial, undefined)
     assert.equal(restored.body.revision, history.currentRevision + 1)
-    assert.match(restored.body.annotationInvalidationWarning || "", /annotation invalidation could not be persisted/)
+    assert.equal(restored.body.annotationInvalidationWarning, null)
 
     const detail = JSON.parse(await plugin.tool.drawio_get_annotation.execute({
       id: annotationId,
