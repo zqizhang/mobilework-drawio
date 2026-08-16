@@ -175,7 +175,7 @@ drawio_export(
 - 每次迭代覆盖同一预览PNG（`overwrite=true`）
 - 每轮修改后重新`drawio_validate`→`drawio_export`预览
 - 循环直到用户说通过/完成/LGTM
-- **安全阀：** 最多5轮；每轮任务结束仍必须调用`drawio_finalize`并用MobileWork现有`browser.open_url`打开，让用户在内置浏览器中微调。之后必须按revision重新读取与合并。
+- **安全阀：** 最多5轮；每轮任务结束仍必须调用`drawio_finalize`。仅当返回`shouldOpenBrowser=true`时用MobileWork现有`browser.open_url`打开；已有编辑器连接时保持原页面，让用户继续微调。之后必须按revision重新读取与合并。
 
 ### 步骤6 —— 自动收尾、PNG导出和内置浏览器
 
@@ -185,7 +185,7 @@ drawio_export(
 drawio_finalize(file="<工作区相对路径>/<名称>.drawio")
 ```
 
-该工具会读取最新revision、校验、评分、覆盖更新同名PNG并返回`openUrl`。随后必须立即调用MobileWork现有`browser.open_url`打开该地址；完成浏览器调用前不得结束任务。浏览器已经打开时，后续revision通过实时同步刷新当前画布。
+该工具会读取最新revision、校验、评分、覆盖更新同名PNG并返回`openUrl`与`shouldOpenBrowser`。仅当`shouldOpenBrowser=true`时调用MobileWork现有`browser.open_url`；若`editorConnected=true`，不得重新打开或刷新现有编辑器。Agent更新只提示新revision并保留用户当前画布，用户保存时再进行三方合并或冲突处理。
 
 用户另外指定JPEG、PDF、输出目录或高分辨率PNG时，再补充调用`drawio_export`：
 
@@ -220,7 +220,7 @@ drawio_export(
 
 - 如用户未指定格式，`drawio_finalize`默认导出同名PNG。
 - 报告`.drawio`源文件和导出图像的文件路径。
-- 无论是否需要进一步微调，都要使用MobileWork已有的`browser.open_url`打开`drawio_finalize`返回的地址。
+- 仅当`drawio_finalize`返回`shouldOpenBrowser=true`时使用MobileWork已有的`browser.open_url`打开地址；已有编辑器连接时禁止重复打开。
 
 ## TypeScript运行时工具参考
 
@@ -334,8 +334,8 @@ PNG导出统一调用专家提供的`drawio_export`或`drawio_finalize`工具，
 
 ### 内置浏览器编辑
 
-生成或修改完成时调用`drawio_finalize(file="<工作区相对路径>")`，再使用MobileWork已有的
-`browser.open_url`打开返回的`openUrl`。仅打开现有文件且不需要导出时可调用`drawio_open`。
+生成或修改完成时调用`drawio_finalize(file="<工作区相对路径>")`；仅在返回`shouldOpenBrowser=true`时使用MobileWork已有的
+`browser.open_url`打开返回的`openUrl`。已有编辑器连接时保持现有页面。仅打开现有文件且不需要导出时可调用`drawio_open`。
 浏览器保存会增加revision；Agent写入前必须立即调用`drawio_get_state`，只在最新XML上修改，
 并携带该次读取返回的准确`base_revision`。不允许由工具自动补齐revision。
 

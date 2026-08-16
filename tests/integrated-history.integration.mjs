@@ -380,7 +380,7 @@ try {
   const bridge = globalThis.__drawioIntegratedBridge
   if (bridge?.server) {
     for (const clients of bridge.eventClients.values()) {
-      for (const response of clients) response.end()
+      for (const client of clients) client.response.end()
     }
     await new Promise((resolve) => bridge.server.close(resolve))
   }

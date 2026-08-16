@@ -10,7 +10,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 ## 标准流程
 
 1. 创建或修改完成后调用`drawio_finalize`，自动校验并导出同名PNG；仅打开已有文件时调用`drawio_open`。
-2. 将返回的`openUrl`立即交给MobileWork现有的`browser.open_url`打开，不新增界面按钮；完成浏览器调用前不得结束任务。
+2. 检查返回的`shouldOpenBrowser`：仅为`true`时将`openUrl`交给MobileWork现有的`browser.open_url`打开；若`editorConnected=true`，必须保持现有编辑器，不得重新打开或刷新，以免覆盖用户尚未保存的编辑。
 3. 如果任务依赖项目内容，先读取相关工作区文件再设计或修改图表。
 4. 每次修改前立即调用`drawio_get_state`，取得最新XML和revision。
 5. 以最新XML中的图元、标签、几何和样式为起点，根据当前任务判断哪些内容需要保留、调整、删除或重构。
@@ -31,10 +31,12 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 ## 工具契约
 
 - `drawio_open(file=...)`：绑定当前会话和工作区文件，返回内置浏览器可打开的URL。
-- `drawio_finalize(file=...)`：读取最新revision、校验、评分、导出同名PNG并返回必须交给`browser.open_url`的URL。
+- `drawio_finalize(file=...)`：读取最新revision、校验、评分、导出同名PNG，并通过`shouldOpenBrowser`说明是否需要打开新编辑器；已有编辑器连接时禁止重复打开。
 - `drawio_get_state(since_revision=...)`：返回最新XML、revision及可选的稳定ID变化。
 - `drawio_update_state(base_revision=..., xml=...)`：以乐观并发方式提交完整XML。
 - 这些工具根据运行时上下文识别session，不需要用户手动传入session ID。
+- 浏览器保存发生409时，运行时会以稳定页面/图元ID进行保守三方合并；不重叠修改自动合并并落盘，但不强制刷新仍可能处于输入状态的画布；重叠修改则保留本地画布、逐字段展示差异，并让用户选择保留用户版或AI版的冲突字段。
+- 自动合并只用于浏览器保存；Agent工具遇到`revision_conflict`时仍必须重新读取、重新执行增量修改并提交，不得把旧XML换用新revision重发。
 - 如果会话工具不可用，应明确说明无法提供冲突安全的浏览器编辑，不得假装当前画布已同步。
 
 ## 注释任务（框选评审）

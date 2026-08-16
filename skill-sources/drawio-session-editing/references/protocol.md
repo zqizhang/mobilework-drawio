@@ -41,6 +41,21 @@ A successful update increments the revision. A stale `baseRevision` returns
 HTTP `409` with `error: revision_conflict` and the current document. Treat this
 as a required read-merge-retry operation, not as a transient network retry.
 
+For browser-originated updates (`source: editor`), the bridge first attempts a
+conservative three-way merge using the base revision, local XML and current
+server XML. Stable cell fields changed on only one side are merged automatically and
+the successful response includes `autoMerge.status: merged`. Overlapping cell
+changes, page/container changes, an unavailable base revision or an invalid
+merged graph still return `409`; `merge.conflicts` identifies overlapping
+`pageId:cellId` keys when available. The editor keeps its local canvas and asks
+the user to choose the conflicting fields from their version or the Agent version.
+Both resolution candidates already contain every non-conflicting change from
+both sides, so choosing one side never replaces the whole document with stale XML.
+Agent-originated updates never auto-retry or auto-merge a stale full XML.
+An editor receiving an Agent/external revision event keeps its current canvas
+instead of force-loading the remote XML, so an in-progress manual edit cannot
+be silently discarded before Draw.io emits its next autosave.
+
 ## Events and editor
 
 - `GET /api/events?sessionId=...` is a server-sent event stream.

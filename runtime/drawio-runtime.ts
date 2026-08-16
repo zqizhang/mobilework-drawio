@@ -715,6 +715,357 @@ function diffParsedPages(beforePages: ParsedPage[], afterPages: ParsedPage[]) {
   }
 }
 
+type DrawioThreeWayMergeResult =
+  | {
+    status: "merged"
+    xml: string
+    localChangedKeys: string[]
+    remoteChangedKeys: string[]
+  }
+  | {
+    status: "conflict"
+    conflicts: string[]
+    details: DrawioMergeConflictDetail[]
+    userResolutionXml: string
+    agentResolutionXml: string
+    localChangedKeys: string[]
+    remoteChangedKeys: string[]
+  }
+  | { status: "unavailable"; reason: string }
+
+type DrawioMergeCellSnapshot = {
+  exists: boolean
+  kind: "node" | "edge" | "cell"
+  label: string
+  style: string
+  parent: string | null
+  source: string | null
+  target: string | null
+  geometry: { x: string | null; y: string | null; width: string | null; height: string | null } | null
+}
+
+type DrawioMergeConflictDetail = {
+  key: string
+  pageId: string
+  pageName: string
+  cellId: string
+  changedFields: string[]
+  fields: Array<{
+    path: string
+    user: { exists: boolean; value: unknown }
+    agent: { exists: boolean; value: unknown }
+  }>
+  base: DrawioMergeCellSnapshot
+  user: DrawioMergeCellSnapshot
+  agent: DrawioMergeCellSnapshot
+}
+
+function canonicalMergeValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalMergeValue)
+  if (!value || typeof value !== "object") return value
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, canonicalMergeValue(entry)]),
+  )
+}
+
+function mergeValueKey(value: unknown): string {
+  return value === undefined
+    ? "<missing>"
+    : JSON.stringify(canonicalMergeValue(value))
+}
+
+type StructuredMergeConflict = {
+  path: string
+  user: { exists: boolean; value: unknown }
+  agent: { exists: boolean; value: unknown }
+}
+
+function mergeStructuredValue(
+  base: unknown,
+  user: unknown,
+  agent: unknown,
+  pathParts: string[] = [],
+): { userValue: unknown; agentValue: unknown; conflicts: StructuredMergeConflict[] } {
+  const baseKey = mergeValueKey(base)
+  const userKey = mergeValueKey(user)
+  const agentKey = mergeValueKey(agent)
+  if (userKey === agentKey) return { userValue: user, agentValue: user, conflicts: [] }
+  if (userKey === baseKey) return { userValue: agent, agentValue: agent, conflicts: [] }
+  if (agentKey === baseKey) return { userValue: user, agentValue: user, conflicts: [] }
+
+  if (integratedRecord(base) && integratedRecord(user) && integratedRecord(agent)) {
+    const userResult: Record<string, unknown> = {}
+    const agentResult: Record<string, unknown> = {}
+    const conflicts: StructuredMergeConflict[] = []
+    const keys = new Set([...Object.keys(base), ...Object.keys(user), ...Object.keys(agent)])
+    for (const key of keys) {
+      const merged = mergeStructuredValue(base[key], user[key], agent[key], [...pathParts, key])
+      if (merged.userValue !== undefined) userResult[key] = merged.userValue
+      if (merged.agentValue !== undefined) agentResult[key] = merged.agentValue
+      conflicts.push(...merged.conflicts)
+    }
+    return { userValue: userResult, agentValue: agentResult, conflicts }
+  }
+
+  return {
+    userValue: user,
+    agentValue: agent,
+    conflicts: [{
+      path: pathParts.join(".") || "existence",
+      user: { exists: user !== undefined, value: user },
+      agent: { exists: agent !== undefined, value: agent },
+    }],
+  }
+}
+
+function mergeCellMap(page: EditablePage): Map<string, Record<string, unknown>> {
+  const result = new Map<string, Record<string, unknown>>()
+  for (const cell of editableCells(page)) {
+    const id = attribute(cell["@_id"])
+    if (!id) throw new Error(`page ${page.name} contains a cell without a stable id`)
+    if (result.has(id)) throw new Error(`page ${page.name} contains duplicate cell id ${id}`)
+    result.set(id, cell)
+  }
+  return result
+}
+
+function mergeCellSnapshot(cell: Record<string, unknown> | undefined): DrawioMergeCellSnapshot {
+  if (!cell) {
+    return {
+      exists: false,
+      kind: "cell",
+      label: "",
+      style: "",
+      parent: null,
+      source: null,
+      target: null,
+      geometry: null,
+    }
+  }
+  const geometry = integratedRecord(cell.mxGeometry) ? cell.mxGeometry : null
+  return {
+    exists: true,
+    kind: attribute(cell["@_vertex"]) === "1"
+      ? "node"
+      : attribute(cell["@_edge"]) === "1" ? "edge" : "cell",
+    label: attribute(cell["@_value"]),
+    style: attribute(cell["@_style"]),
+    parent: attribute(cell["@_parent"]) || null,
+    source: attribute(cell["@_source"]) || null,
+    target: attribute(cell["@_target"]) || null,
+    geometry: geometry ? {
+      x: attribute(geometry["@_x"]) || null,
+      y: attribute(geometry["@_y"]) || null,
+      width: attribute(geometry["@_width"]) || null,
+      height: attribute(geometry["@_height"]) || null,
+    } : null,
+  }
+}
+
+function mergePageEnvelope(page: EditablePage): string {
+  const diagram = page.diagram
+    ? Object.fromEntries(
+      Object.entries(page.diagram).filter(([key]) => key !== "mxGraphModel" && key !== "#text"),
+    )
+    : null
+  const model = Object.fromEntries(
+    Object.entries(page.model).filter(([key]) => !["root", "@_dx", "@_dy"].includes(key)),
+  )
+  const root = page.model.root && typeof page.model.root === "object"
+    ? Object.fromEntries(
+      Object.entries(page.model.root as Record<string, unknown>).filter(([key]) => key !== "mxCell"),
+    )
+    : null
+  return JSON.stringify(canonicalMergeValue({ diagram, model, root }))
+}
+
+function applyMergedCell(
+  targetPages: Map<string, EditablePage>,
+  preferredPages: Map<string, EditablePage>,
+  pageId: string,
+  cellId: string,
+  mergedCell: Record<string, unknown> | undefined,
+): void {
+  const targetCells = editableCells(targetPages.get(pageId)!)
+  const index = targetCells.findIndex((cell) => attribute(cell["@_id"]) === cellId)
+  if (mergedCell === undefined) {
+    if (index >= 0) targetCells.splice(index, 1)
+    return
+  }
+  if (index >= 0) {
+    targetCells[index] = structuredClone(mergedCell)
+    return
+  }
+  const preferredOrder = editableCells(preferredPages.get(pageId)!)
+    .map((cell) => attribute(cell["@_id"]))
+  const preferredIndex = preferredOrder.indexOf(cellId)
+  const previousId = [...preferredOrder.slice(0, preferredIndex)].reverse()
+    .find((id) => targetCells.some((cell) => attribute(cell["@_id"]) === id))
+  const nextId = preferredOrder.slice(preferredIndex + 1)
+    .find((id) => targetCells.some((cell) => attribute(cell["@_id"]) === id))
+  if (previousId) {
+    const previousIndex = targetCells.findIndex((cell) => attribute(cell["@_id"]) === previousId)
+    targetCells.splice(previousIndex + 1, 0, structuredClone(mergedCell))
+  } else if (nextId) {
+    const nextIndex = targetCells.findIndex((cell) => attribute(cell["@_id"]) === nextId)
+    targetCells.splice(nextIndex, 0, structuredClone(mergedCell))
+  } else {
+    targetCells.push(structuredClone(mergedCell))
+  }
+}
+
+function tryMergeDrawioXml(
+  baseXml: string,
+  localXml: string,
+  remoteXml: string,
+): DrawioThreeWayMergeResult {
+  try {
+    const base = parseEditableDrawio(baseXml)
+    const local = parseEditableDrawio(localXml)
+    const remote = parseEditableDrawio(remoteXml)
+    if (base.directModel !== local.directModel || base.directModel !== remote.directModel) {
+      return { status: "unavailable", reason: "document container structure changed" }
+    }
+
+    const basePages = new Map(base.pages.map((page) => [page.id, page]))
+    const localPages = new Map(local.pages.map((page) => [page.id, page]))
+    const remotePages = new Map(remote.pages.map((page) => [page.id, page]))
+    const pageIds = [...basePages.keys()].sort()
+    if (
+      JSON.stringify([...localPages.keys()].sort()) !== JSON.stringify(pageIds)
+      || JSON.stringify([...remotePages.keys()].sort()) !== JSON.stringify(pageIds)
+    ) {
+      return { status: "unavailable", reason: "page additions or removals require user confirmation" }
+    }
+    const basePageOrder = base.pages.map((page) => page.id)
+    const localPageOrder = local.pages.map((page) => page.id)
+    const remotePageOrder = remote.pages.map((page) => page.id)
+    if (
+      JSON.stringify(localPageOrder) !== JSON.stringify(basePageOrder)
+      && JSON.stringify(localPageOrder) !== JSON.stringify(remotePageOrder)
+    ) {
+      return { status: "unavailable", reason: "local page order changed" }
+    }
+
+    const localChangedKeys: string[] = []
+    const remoteChangedKeys: string[] = []
+    const conflicts: string[] = []
+    const conflictDetails: DrawioMergeConflictDetail[] = []
+    const cellChoices: Array<{
+      key: string
+      pageId: string
+      cellId: string
+      userCell: Record<string, unknown> | undefined
+      agentCell: Record<string, unknown> | undefined
+    }> = []
+
+    for (const pageId of pageIds) {
+      const basePage = basePages.get(pageId)!
+      const localPage = localPages.get(pageId)!
+      const remotePage = remotePages.get(pageId)!
+      const baseEnvelope = mergePageEnvelope(basePage)
+      const localEnvelope = mergePageEnvelope(localPage)
+      const remoteEnvelope = mergePageEnvelope(remotePage)
+      if (localEnvelope !== baseEnvelope && localEnvelope !== remoteEnvelope) {
+        return { status: "unavailable", reason: `local page metadata changed for ${pageId}` }
+      }
+      const baseCells = mergeCellMap(basePage)
+      const localCells = mergeCellMap(localPage)
+      const remoteCells = mergeCellMap(remotePage)
+      const commonIds = new Set(
+        [...baseCells.keys()].filter((id) => localCells.has(id) && remoteCells.has(id)),
+      )
+      const baseOrder = [...baseCells.keys()].filter((id) => commonIds.has(id))
+      const localOrder = [...localCells.keys()].filter((id) => commonIds.has(id))
+      const remoteOrder = [...remoteCells.keys()].filter((id) => commonIds.has(id))
+      if (
+        JSON.stringify(localOrder) !== JSON.stringify(baseOrder)
+        && JSON.stringify(localOrder) !== JSON.stringify(remoteOrder)
+      ) {
+        return { status: "unavailable", reason: `local cell order changed for page ${pageId}` }
+      }
+      const cellIds = new Set([...baseCells.keys(), ...localCells.keys(), ...remoteCells.keys()])
+      for (const cellId of cellIds) {
+        const key = `${pageId}:${cellId}`
+        const baseValue = mergeValueKey(baseCells.get(cellId))
+        const localValue = mergeValueKey(localCells.get(cellId))
+        const remoteValue = mergeValueKey(remoteCells.get(cellId))
+        const localChanged = localValue !== baseValue
+        const remoteChanged = remoteValue !== baseValue
+        if (localChanged) localChangedKeys.push(key)
+        if (remoteChanged) remoteChangedKeys.push(key)
+        const merged = mergeStructuredValue(
+          baseCells.get(cellId),
+          localCells.get(cellId),
+          remoteCells.get(cellId),
+        )
+        cellChoices.push({
+          key,
+          pageId,
+          cellId,
+          userCell: merged.userValue as Record<string, unknown> | undefined,
+          agentCell: merged.agentValue as Record<string, unknown> | undefined,
+        })
+        if (merged.conflicts.length > 0) {
+          conflicts.push(key)
+          const baseSnapshot = mergeCellSnapshot(baseCells.get(cellId))
+          const userSnapshot = mergeCellSnapshot(localCells.get(cellId))
+          const agentSnapshot = mergeCellSnapshot(remoteCells.get(cellId))
+          conflictDetails.push({
+            key,
+            pageId,
+            pageName: basePage.name,
+            cellId,
+            changedFields: merged.conflicts.map((entry) => entry.path),
+            fields: merged.conflicts,
+            base: baseSnapshot,
+            user: userSnapshot,
+            agent: agentSnapshot,
+          })
+        }
+      }
+    }
+
+    const userDocument = structuredClone(remote)
+    const agentDocument = structuredClone(remote)
+    const userPages = new Map(userDocument.pages.map((page) => [page.id, page]))
+    const agentPages = new Map(agentDocument.pages.map((page) => [page.id, page]))
+    for (const choice of cellChoices) {
+      applyMergedCell(userPages, localPages, choice.pageId, choice.cellId, choice.userCell)
+      applyMergedCell(agentPages, localPages, choice.pageId, choice.cellId, choice.agentCell)
+    }
+    const userXml = serializeEditableDrawio(userDocument)
+    const agentXml = serializeEditableDrawio(agentDocument)
+    const userReport = validationReport(parseDrawio(userXml))
+    const agentReport = validationReport(parseDrawio(agentXml))
+    if (!userReport.valid || !agentReport.valid) {
+      return {
+        status: "unavailable",
+        reason: `merged diagram is invalid: ${[
+          ...userReport.errors,
+          ...agentReport.errors,
+        ].join("; ")}`,
+      }
+    }
+    if (conflicts.length > 0) {
+      return {
+        status: "conflict",
+        conflicts,
+        details: conflictDetails,
+        userResolutionXml: userXml,
+        agentResolutionXml: agentXml,
+        localChangedKeys,
+        remoteChangedKeys,
+      }
+    }
+    return { status: "merged", xml: userXml, localChangedKeys, remoteChangedKeys }
+  } catch (error) {
+    return { status: "unavailable", reason: `automatic merge failed: ${(error as Error).message}` }
+  }
+}
+
 function validateSemanticGraph(nodes: DiagramNode[], edges: DiagramEdge[]): void {
   if (nodes.length === 0) throw new Error("nodes must contain at least one node")
 
@@ -2304,6 +2655,7 @@ type IntegratedSessionHistory = {
 
 type IntegratedSession = {
   sessionId: string
+  bindingId: string
   workspace: string
   file: string
   editorUrl?: string
@@ -2353,6 +2705,8 @@ type HistoryPendingEditor = {
 
 type IntegratedToken = {
   sessionId: string
+  diagramKey: string
+  bindingId: string
   expiresAt: number
 }
 
@@ -2426,7 +2780,10 @@ type IntegratedBridgeState = {
   port: number
   sessions: Map<string, IntegratedSession>
   tokens: Map<string, IntegratedToken>
-  eventClients: Map<string, Set<import("node:http").ServerResponse>>
+  eventClients: Map<string, Set<{
+    response: import("node:http").ServerResponse
+    diagramKey: string
+  }>>
   writeQueues: Map<string, Promise<unknown>>
   annotationWriteQueues: Map<string, Promise<unknown>>
   annotationsByDiagram: Map<string, Map<string, AnnotationTask>>
@@ -2588,23 +2945,69 @@ async function integratedCommit(
   baseRevision: number,
   source: "editor" | "agent",
   clientId: string | null = null,
+  options: { autoMerge?: boolean } = {},
 ) {
   const state = getIntegratedBridgeState()
   const queueKey = path.resolve(session.file).toLowerCase()
   const previous = state.writeQueues.get(queueKey) || Promise.resolve()
   const operation = previous.catch(() => undefined).then(async () => {
+    let candidateXml = xml
+    let autoMerge: null | {
+      status: "merged"
+      fromRevision: number
+      ontoRevision: number
+      localChangedKeys: string[]
+      remoteChangedKeys: string[]
+    } = null
     // LP semantics: refresh and compare inside the serialized critical section.
     // No writer can pass the same revision check concurrently.
     await refreshIntegratedSession(session)
     if (baseRevision !== session.revision) {
-      return {
-        conflict: true as const,
-        current: session,
-        manualChanges: integratedManualChanges(session, baseRevision),
+      const manualChanges = integratedManualChanges(session, baseRevision)
+      if (options.autoMerge) {
+        const base = session.history.find((entry) => entry.revision === baseRevision)
+        const merge = base
+          ? tryMergeDrawioXml(base.xml, xml, session.xml)
+          : { status: "unavailable" as const, reason: "base revision is no longer in memory" }
+        if (merge.status === "merged") {
+          candidateXml = merge.xml
+          autoMerge = {
+            status: "merged",
+            fromRevision: baseRevision,
+            ontoRevision: session.revision,
+            localChangedKeys: merge.localChangedKeys,
+            remoteChangedKeys: merge.remoteChangedKeys,
+          }
+          if (
+            merge.localChangedKeys.length === 0
+            || integratedHash(candidateXml) === session.fileHash
+          ) {
+            return {
+              conflict: false as const,
+              document: session,
+              validation: validationReport(parseDrawio(session.xml)),
+              autoMerge,
+            }
+          }
+        } else {
+          return {
+            conflict: true as const,
+            current: session,
+            manualChanges,
+            merge,
+          }
+        }
+      } else {
+        return {
+          conflict: true as const,
+          current: session,
+          manualChanges,
+          merge: null,
+        }
       }
     }
 
-    const pages = parseDrawio(xml)
+    const pages = parseDrawio(candidateXml)
     const report = validationReport(pages)
     if (!report.valid) {
       return { invalid: true as const, report }
@@ -2612,15 +3015,15 @@ async function integratedCommit(
 
     integratedHistoryPush(session)
     if (!session.backupFile) {
-      const write = await atomicWrite(session.file, xml, true)
+      const write = await atomicWrite(session.file, candidateXml, true)
       session.backupFile = write.backup
     } else {
-      await replaceDiagramWithoutBackup(session.file, xml)
+      await replaceDiagramWithoutBackup(session.file, candidateXml)
     }
 
     session.revision += 1
-    session.xml = xml
-    session.fileHash = integratedHash(xml)
+    session.xml = candidateXml
+    session.fileHash = integratedHash(candidateXml)
     session.updatedBy = source
     session.updatedAt = new Date().toISOString()
     broadcastIntegratedRevision(session, clientId)
@@ -2628,7 +3031,7 @@ async function integratedCommit(
       // A history-record failure must never roll back or fail the actual save.
       // Only the pre-restore checkpoint in the restore transaction is mandatory.
       try {
-        await createHistorySnapshot(session, { source: "agent", xml, sessionRevision: session.revision })
+        await createHistorySnapshot(session, { source: "agent", xml: candidateXml, sessionRevision: session.revision })
       } catch (error) {
         console.warn(`history snapshot record failed for ${session.file}: ${(error as Error).message}`)
       }
@@ -2639,6 +3042,7 @@ async function integratedCommit(
       conflict: false as const,
       document: session,
       validation: report,
+      autoMerge,
     }
   })
   state.writeQueues.set(queueKey, operation)
@@ -2661,6 +3065,8 @@ function integratedTokenSession(request: IncomingMessage): {
   }
   const session = getIntegratedBridgeState().sessions.get(tokenState.sessionId)
   if (!session) return null
+  if (integratedDiagramKey(session.file) !== tokenState.diagramKey) return null
+  if (session.bindingId !== tokenState.bindingId) return null
   tokenState.expiresAt = Date.now() + BRIDGE_TOKEN_TTL_MS
   return { sessionKey, session }
 }
@@ -2705,9 +3111,16 @@ function broadcastIntegratedRevision(session: IntegratedSession, clientId: strin
     updatedAt: session.updatedAt,
     clientId,
   })}\\n\\n`
-  for (const response of getIntegratedBridgeState().eventClients.get(session.sessionId) || []) {
-    response.write(payload)
+  const diagramKey = integratedDiagramKey(session.file)
+  for (const client of getIntegratedBridgeState().eventClients.get(session.sessionId) || []) {
+    if (client.diagramKey === diagramKey) client.response.write(payload)
   }
+}
+
+function integratedEditorConnected(sessionId: string, file: string): boolean {
+  const diagramKey = integratedDiagramKey(file)
+  return [...(getIntegratedBridgeState().eventClients.get(sessionId) || [])]
+    .some((client) => client.diagramKey === diagramKey)
 }
 
 // ---------------------------------------------------------------------------
@@ -2876,8 +3289,9 @@ function broadcastHistory(
   payload: Record<string, unknown>,
 ): void {
   const data = `event: history\\ndata: ${JSON.stringify({ kind, ...payload })}\\n\\n`
-  for (const response of getIntegratedBridgeState().eventClients.get(session.sessionId) || []) {
-    response.write(data)
+  const diagramKey = integratedDiagramKey(session.file)
+  for (const client of getIntegratedBridgeState().eventClients.get(session.sessionId) || []) {
+    if (client.diagramKey === diagramKey) client.response.write(data)
   }
 }
 
@@ -4020,8 +4434,9 @@ function broadcastAnnotation(session: IntegratedSession, task: AnnotationTask, k
       kind,
       annotation: annotationPayload(candidate, task),
     })}\\n\\n`
-    for (const response of state.eventClients.get(candidate.sessionId) || []) {
-      response.write(payload)
+    const candidateDiagramKey = integratedDiagramKey(candidate.file)
+    for (const client of state.eventClients.get(candidate.sessionId) || []) {
+      if (client.diagramKey === candidateDiagramKey) client.response.write(payload)
     }
   }
 }
@@ -4044,9 +4459,13 @@ function buildIntegratedEditorPage(options: {
   const apiUrl = new URL("/api/diagram", options.bridgeUrl)
   apiUrl.searchParams.set("sessionId", options.session.sessionId)
   apiUrl.searchParams.set("token", options.token)
-const eventsUrl = new URL("/api/events", options.bridgeUrl)
+  const eventsUrl = new URL("/api/events", options.bridgeUrl)
   eventsUrl.searchParams.set("sessionId", options.session.sessionId)
   eventsUrl.searchParams.set("token", options.token)
+  eventsUrl.searchParams.set(
+    "file",
+    path.relative(options.session.workspace, options.session.file).split(path.sep).join("/"),
+  )
   const annotationsUrl = new URL("/api/annotations", options.bridgeUrl)
   annotationsUrl.searchParams.set("sessionId", options.session.sessionId)
   annotationsUrl.searchParams.set("token", options.token)
@@ -4094,6 +4513,42 @@ return `<!doctype html>
     #conflict-banner.visible { display: flex; }
     #conflict-banner button { border: 1px solid #d97706; border-radius: 6px; background: #fff;
       color: #92400e; padding: 4px 10px; cursor: pointer; }
+    #conflict-modal { position: fixed; z-index: 12; inset: 0; display: none; align-items: center;
+      justify-content: center; padding: 24px; background: rgba(15, 23, 42, .58); backdrop-filter: blur(2px); }
+    #conflict-modal.open { display: flex; }
+    #conflict-modal .dialog { width: min(760px, 96vw); max-height: min(720px, 90vh); display: flex;
+      flex-direction: column; overflow: hidden; border: 1px solid #e2e8f0; border-radius: 18px;
+      background: #fff; color: #0f172a; box-shadow: 0 24px 70px rgba(15,23,42,.32); }
+    #conflict-modal header { display: flex; gap: 12px; padding: 20px 22px 16px; border-bottom: 1px solid #e2e8f0; }
+    #conflict-modal .conflict-icon { width: 38px; height: 38px; flex: 0 0 38px; display: grid;
+      place-items: center; border-radius: 11px; background: #fff7ed; color: #c2410c; font-size: 21px; }
+    #conflict-modal h2 { margin: 0 0 5px; font-size: 18px; }
+    #conflict-modal .subtitle { margin: 0; color: #64748b; line-height: 1.55; }
+    #conflict-details { overflow-y: auto; padding: 16px 22px; }
+    .conflict-card { margin-bottom: 12px; overflow: hidden; border: 1px solid #e2e8f0; border-radius: 12px; }
+    .conflict-card:last-child { margin-bottom: 0; }
+    .conflict-card-title { display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+      background: #f8fafc; border-bottom: 1px solid #e2e8f0; }
+    .conflict-card-title strong { font-size: 13px; }
+    .conflict-card-title code { color: #64748b; font-size: 11px; }
+    .conflict-columns { display: grid; grid-template-columns: 1fr 1fr; }
+    .conflict-version { min-width: 0; padding: 12px; }
+    .conflict-version + .conflict-version { border-left: 1px solid #e2e8f0; }
+    .conflict-version.user { background: #eff6ff; }
+    .conflict-version.agent { background: #fff7ed; }
+    .conflict-version .version-title { margin-bottom: 8px; font-size: 12px; font-weight: 700; }
+    .conflict-version.user .version-title { color: #1d4ed8; }
+    .conflict-version.agent .version-title { color: #c2410c; }
+    .conflict-field { display: grid; grid-template-columns: 58px minmax(0, 1fr); gap: 7px;
+      margin-top: 6px; line-height: 1.45; }
+    .conflict-field .field-name { color: #64748b; }
+    .conflict-field .field-value { overflow-wrap: anywhere; white-space: pre-wrap; }
+    #conflict-modal footer { display: flex; align-items: center; justify-content: flex-end; gap: 10px;
+      padding: 14px 22px; border-top: 1px solid #e2e8f0; background: #f8fafc; }
+    #conflict-modal footer .danger-note { margin-right: auto; color: #64748b; font-size: 12px; }
+    #conflict-modal footer button { padding: 8px 14px; border: 1px solid #cbd5e1; border-radius: 8px;
+      background: #fff; color: #334155; cursor: pointer; font-weight: 600; }
+    #conflict-modal footer .primary { border-color: #2563eb; background: #2563eb; color: #fff; }
     #history-modal { position: fixed; z-index: 7; inset: 0; display: none; align-items: center;
       justify-content: center; background: rgba(15, 23, 42, .5); }
     #history-modal.open { display: flex; }
@@ -4255,6 +4710,16 @@ return `<!doctype html>
       .h-list-skeleton .ln { background: #334155; }
       #conflict-banner { background: #451a03; border-color: #b45309; color: #fde68a; }
       #conflict-banner button { background: #451a03; color: #fde68a; border-color: #d97706; }
+      #conflict-modal .dialog { background: #111827; color: #f8fafc; border-color: #334155; }
+      #conflict-modal header, #conflict-modal footer, .conflict-card,
+      .conflict-card-title, .conflict-version + .conflict-version { border-color: #334155; }
+      #conflict-modal .subtitle, #conflict-modal footer .danger-note,
+      .conflict-field .field-name, .conflict-card-title code { color: #94a3b8; }
+      #conflict-modal footer, .conflict-card-title { background: #1e293b; }
+      .conflict-version.user { background: #172554; }
+      .conflict-version.agent { background: #431407; }
+      #conflict-modal footer button { background: #1e293b; color: #e2e8f0; border-color: #475569; }
+      #conflict-modal footer .primary { background: #2563eb; border-color: #2563eb; color: #fff; }
     }
   </style>
 </head>
@@ -4264,7 +4729,25 @@ return `<!doctype html>
   <div id="conflict-banner" role="alert">
     <span id="conflict-message">图表刚发生变化，当前画布暂未保存，请确认最新版本。</span>
     <button type="button" id="conflict-retry" style="display:none">重试加载</button>
+    <button type="button" id="conflict-overwrite" style="display:none">保留我的版本并覆盖</button>
     <button type="button" id="conflict-reload">重新加载最新版本</button>
+  </div>
+  <div id="conflict-modal" role="dialog" aria-modal="true" aria-labelledby="conflict-title">
+    <div class="dialog">
+      <header>
+        <div class="conflict-icon" aria-hidden="true">!</div>
+        <div>
+          <h2 id="conflict-title">发现版本冲突</h2>
+          <p class="subtitle" id="conflict-subtitle">AI 和你修改了同一处内容。画布仍保留你的版本，请选择如何处理。</p>
+        </div>
+      </header>
+      <div id="conflict-details"></div>
+      <footer>
+        <span class="danger-note">覆盖操作会丢弃 AI 在冲突位置的修改。</span>
+        <button type="button" id="conflict-modal-reload">使用 AI 版本</button>
+        <button type="button" class="primary" id="conflict-modal-overwrite">保留我的版本并覆盖</button>
+      </footer>
+    </div>
   </div>
   <div id="fab-group">
     <button id="history-btn" type="button" title="查看历史版本">
@@ -4357,6 +4840,8 @@ return `<!doctype html>
       const status = document.getElementById("status");
       const clientId = crypto.randomUUID();
       let current = null;
+      let canvasRevision = 0;
+      let lastEditorXml = null;
       let saveChain = Promise.resolve();
       let externalTimer = null;
       let pendingSelection = null;
@@ -4368,6 +4853,7 @@ return `<!doctype html>
       let restoreTargetXml = null;
       let preRestoreXml = null;
       let pendingRestore = null; // { xml } kept so a load timeout can retry the same target
+      let pendingConflict = null; // { xml, latest, merge } kept until the user chooses
       let restoreLoadTimer = null;
 
       const historyBtn = document.getElementById("history-btn");
@@ -4380,6 +4866,8 @@ return `<!doctype html>
       const annInstruction = document.getElementById("ann-instruction");
       const annSubmit = document.getElementById("ann-submit");
       const conflictBanner = document.getElementById("conflict-banner");
+      const conflictModal = document.getElementById("conflict-modal");
+      const conflictDetails = document.getElementById("conflict-details");
       const histModal = document.getElementById("history-modal");
       const histList = document.getElementById("hist-list");
       const histPreview = document.getElementById("hist-preview");
@@ -4424,6 +4912,9 @@ return `<!doctype html>
           const error = new Error(result.error || "图表刚发生变化，请检查最新版本后重新确认");
           error.status = 409;
           error.current = result.current;
+          error.merge = result.merge;
+          error.localXml = xml;
+          error.baseRevision = baseRevision;
           throw error;
         }
         if (!response.ok) throw new Error(result.error || "保存图表失败");
@@ -4433,29 +4924,238 @@ return `<!doctype html>
       function queueSave(xml) {
         saveChain = saveChain.then(async () => {
           if (editorMode === "restoring" || editorMode === "loading-restored-xml") return;
+          if (editorMode === "conflict") {
+            if (pendingConflict && typeof xml === "string") pendingConflict.xml = xml;
+            return;
+          }
           if (typeof xml !== "string" || xml === current?.xml) return;
-          current = await writeState(xml, current?.revision ?? 0);
-          showStatus("已保存 revision " + current.revision, 1000);
+          const submittedXml = xml;
+          const submittedRevision = canvasRevision;
+          const result = await writeState(submittedXml, submittedRevision);
+          const editorAdvanced = lastEditorXml !== submittedXml;
+          current = result;
+          if (result.autoMerge?.status === "merged") {
+            showConflictBanner(
+              "已自动合并不重叠修改并保存 revision " + result.revision
+                + "。为保护可能仍在输入的内容，当前画布没有自动刷新；可在编辑完成后加载合并版本。",
+              false,
+              false,
+            );
+            showStatus("已自动合并；为保护正在输入的内容，画布未刷新", 5000);
+          } else {
+            if (!editorAdvanced) canvasRevision = result.revision;
+            showStatus("已保存 revision " + result.revision, 1000);
+            conflictBanner.classList.remove("visible");
+          }
         }).catch(error => {
           if (error && error.status === 409) {
-            enterConflict(error.current);
+            enterConflict(error.current, error.localXml, error.merge, undefined, false, error.baseRevision);
           } else {
             showStatus(error.message || "保存失败", 5000);
           }
         });
       }
 
-      function showConflictBanner(message, showRetry) {
+      function showConflictBanner(message, showRetry, showOverwrite) {
         document.getElementById("conflict-message").textContent = message;
         document.getElementById("conflict-retry").style.display = showRetry ? "" : "none";
+        document.getElementById("conflict-overwrite").style.display = showOverwrite ? "" : "none";
         conflictBanner.classList.add("visible");
       }
 
-      function enterConflict(latest, message, showRetry) {
+      function conflictFieldLabel(field) {
+        const leaf = String(field).split(".").at(-1);
+        return ({
+          existence: "状态",
+          "@_value": "文字",
+          "@_style": "样式",
+          "@_parent": "父级",
+          "@_source": "连线起点",
+          "@_target": "连线终点",
+          "@_x": "横坐标",
+          "@_y": "纵坐标",
+          "@_width": "宽度",
+          "@_height": "高度",
+          mxPoint: "折点",
+        })[leaf] || field;
+      }
+
+      function conflictFieldValue(entry) {
+        if (!entry?.exists) return "已删除 / 不存在";
+        if (entry.value === "") return "（空）";
+        if (entry.value === null) return "null";
+        if (typeof entry.value === "object") return JSON.stringify(entry.value, null, 2);
+        return String(entry.value);
+      }
+
+      function appendConflictVersion(container, title, className, fields, side) {
+        const version = document.createElement("section");
+        version.className = "conflict-version " + className;
+        const heading = document.createElement("div");
+        heading.className = "version-title";
+        heading.textContent = title;
+        version.appendChild(heading);
+        for (const field of fields) {
+          const row = document.createElement("div");
+          row.className = "conflict-field";
+          const name = document.createElement("span");
+          name.className = "field-name";
+          name.textContent = conflictFieldLabel(field.path);
+          const value = document.createElement("span");
+          value.className = "field-value";
+          value.textContent = conflictFieldValue(field[side]);
+          row.append(name, value);
+          version.appendChild(row);
+        }
+        container.appendChild(version);
+      }
+
+      function showConflictModal(merge) {
+        conflictDetails.replaceChildren();
+        const details = merge?.status === "conflict" && Array.isArray(merge.details)
+          ? merge.details
+          : [];
+        document.getElementById("conflict-title").textContent = details.length
+          ? "发现 " + details.length + " 处版本冲突"
+          : "无法自动合并这次修改";
+        document.getElementById("conflict-subtitle").textContent = details.length
+          ? "AI 和你修改了同一图元。下方只展示发生冲突的字段，当前画布仍保留你的版本。"
+          : "当前修改涉及页面结构或缺少合并基线，系统没有覆盖任何一方。";
+        if (!details.length) {
+          const empty = document.createElement("div");
+          empty.className = "conflict-card";
+          const title = document.createElement("div");
+          title.className = "conflict-card-title";
+          title.textContent = merge?.reason || "请在保留当前画布和加载 AI 最新版本之间选择。";
+          empty.appendChild(title);
+          conflictDetails.appendChild(empty);
+        }
+        for (const detail of details) {
+          const card = document.createElement("article");
+          card.className = "conflict-card";
+          const title = document.createElement("div");
+          title.className = "conflict-card-title";
+          const strong = document.createElement("strong");
+          strong.textContent = (detail.pageName || detail.pageId) + " · "
+            + (detail.user?.label || detail.agent?.label || "未命名图元");
+          const code = document.createElement("code");
+          code.textContent = detail.key;
+          title.append(strong, code);
+          const columns = document.createElement("div");
+          columns.className = "conflict-columns";
+          const fields = detail.fields?.length ? detail.fields : [{
+            path: "existence",
+            user: { exists: detail.user?.exists, value: detail.user },
+            agent: { exists: detail.agent?.exists, value: detail.agent },
+          }];
+          appendConflictVersion(columns, "我的未保存版本", "user", fields, "user");
+          appendConflictVersion(columns, "AI 已保存版本", "agent", fields, "agent");
+          card.append(title, columns);
+          conflictDetails.appendChild(card);
+        }
+        conflictBanner.classList.remove("visible");
+        conflictModal.classList.add("open");
+      }
+
+      function enterConflict(latest, localXml, merge, message, showRetry, baseRevision) {
         editorMode = "conflict";
-        showConflictBanner(message || "图表刚发生变化，当前画布暂未保存，请确认最新版本。", !!showRetry);
+        pendingConflict = localXml && latest ? {
+          xml: localXml,
+          originalXml: localXml,
+          baseRevision: Number.isInteger(baseRevision) ? baseRevision : canvasRevision,
+          latest,
+          merge,
+        } : null;
+        if (pendingConflict) {
+          showConflictModal(merge);
+          void refreshAnnotations();
+          showStatus("保存冲突：画布仍保留你的未保存版本", 6000);
+          return;
+        }
+        const overlap = merge?.status === "conflict" && merge.conflicts?.length
+          ? "重叠图元：" + merge.conflicts.join("、") + "。"
+          : "";
+        showConflictBanner(
+          message || ("检测到重叠修改，未覆盖服务端版本。" + overlap + "请选择保留哪一版。"),
+          !!showRetry,
+          !!pendingConflict,
+        );
         void refreshAnnotations();
         if (latest) showStatus("保存冲突：图表刚发生变化，已保留你的本地画布（revision " + (current?.revision ?? 0) + "，最新 revision " + latest.revision + "）", 6000);
+      }
+
+      function setConflictResolutionBusy(busy) {
+        document.getElementById("conflict-modal-reload").disabled = busy;
+        document.getElementById("conflict-modal-overwrite").disabled = busy;
+      }
+
+      async function resolveConflict(choice) {
+        setConflictResolutionBusy(true);
+        try {
+          await saveChain;
+          const pending = pendingConflict;
+          if (!pending) return;
+          if (pending.xml !== pending.originalXml) {
+            try {
+              const refreshed = await writeState(pending.xml, pending.baseRevision);
+              current = refreshed;
+              canvasRevision = refreshed.revision;
+              lastEditorXml = refreshed.xml;
+              pendingConflict = null;
+              editorMode = "editing";
+              conflictModal.classList.remove("open");
+              sendEditor({ action: "load", xml: refreshed.xml, autosave: 1, diffSync: true, title: CONFIG.file });
+              showStatus("已合并保存冲突期间的最新编辑 · revision " + refreshed.revision, 3000);
+              return;
+            } catch (error) {
+              if (error && error.status === 409) {
+                enterConflict(
+                  error.current,
+                  error.localXml,
+                  error.merge,
+                  undefined,
+                  false,
+                  error.baseRevision,
+                );
+                return;
+              }
+              throw error;
+            }
+          }
+          const candidate = choice === "user"
+            ? pending.merge?.userResolutionXml || pending.xml
+            : pending.merge?.agentResolutionXml || pending.latest.xml;
+          const result = await writeState(candidate, pending.latest.revision);
+          current = result;
+          canvasRevision = result.revision;
+          lastEditorXml = result.xml;
+          pendingConflict = null;
+          editorMode = "editing";
+          conflictBanner.classList.remove("visible");
+          conflictModal.classList.remove("open");
+          sendEditor({ action: "load", xml: result.xml, autosave: 1, diffSync: true, title: CONFIG.file });
+          showStatus(
+            (choice === "user" ? "已保留你的冲突修改" : "已保留 AI 的冲突修改")
+              + "，双方非冲突修改均已合并 · revision " + result.revision,
+            4000,
+          );
+          void refreshAnnotations();
+        } catch (error) {
+          if (error && error.status === 409) {
+            enterConflict(
+              error.current,
+              error.localXml,
+              error.merge,
+              undefined,
+              false,
+              error.baseRevision,
+            );
+          } else {
+            showStatus(error.message || "保存图表失败", 5000);
+          }
+        } finally {
+          setConflictResolutionBusy(false);
+        }
       }
 
       async function reloadLatest() {
@@ -4463,12 +5163,16 @@ return `<!doctype html>
         try {
           const latest = await readLatest();
           current = latest;
+          canvasRevision = latest.revision;
+          lastEditorXml = latest.xml;
           editorMode = "editing";
           clearTimeout(restoreLoadTimer);
           restoreTargetXml = null;
           preRestoreXml = null;
           pendingRestore = null;
+          pendingConflict = null;
           conflictBanner.classList.remove("visible");
+          conflictModal.classList.remove("open");
           sendEditor({ action: "load", xml: latest.xml, autosave: 1, diffSync: true, title: CONFIG.file });
           showStatus("已加载最新版本 revision " + latest.revision, 2000);
           void refreshAnnotations();
@@ -4494,17 +5198,18 @@ return `<!doctype html>
 
       async function applyExternalRevision(revision) {
         await saveChain;
-        // The user's queued save may have returned 409 and flipped us into
-        // "conflict" while we waited. Loading the external revision then would
-        // overwrite their still-pending local canvas, so bail out here.
+        // Keep the user's canvas on its current base when Agent/external writes
+        // arrive. A forced reload here can erase an in-progress label edit
+        // before Draw.io emits its autosave. The next user save will perform the
+        // conservative three-way merge or enter the explicit conflict flow.
         if (editorMode !== "editing") return;
         if (revision <= (current?.revision ?? 0)) return;
-        const latest = await readLatest();
-        if (editorMode !== "editing") return;
-        if (latest.revision <= (current?.revision ?? 0)) return;
-        current = latest;
-        sendEditor({ action: "load", xml: latest.xml, autosave: 1, diffSync: true, title: CONFIG.file });
-        showStatus("Agent 更新已加载 · revision " + latest.revision);
+        showConflictBanner(
+          "Agent 已保存新版本 revision " + revision + "。当前画布未被强制刷新；继续编辑并保存时会自动合并，重叠修改会提示冲突。",
+          false,
+          false,
+        );
+        showStatus("检测到 Agent 更新 · 当前画布保持不变", 5000);
         void refreshAnnotations();
       }
 
@@ -5076,6 +5781,9 @@ return `<!doctype html>
         }).catch(() => showStatus("读取历史失败", 4000));
       });
       document.getElementById("conflict-reload").addEventListener("click", () => void reloadLatest());
+      document.getElementById("conflict-overwrite").addEventListener("click", () => void resolveConflict("user"));
+      document.getElementById("conflict-modal-reload").addEventListener("click", () => void resolveConflict("agent"));
+      document.getElementById("conflict-modal-overwrite").addEventListener("click", () => void resolveConflict("user"));
       document.getElementById("conflict-retry").addEventListener("click", retryRestoreLoad);
       histModal.addEventListener("click", (event) => {
         if (event.target === histModal) closeHistory();
@@ -5121,17 +5829,21 @@ return `<!doctype html>
         } else if (message.event === "init") {
           try {
             current = await readLatest();
+            canvasRevision = current.revision;
+            lastEditorXml = current.xml;
             sendEditor({ action: "load", xml: current.xml, autosave: 1, diffSync: true, title: CONFIG.file });
             void refreshAnnotations();
           } catch (error) { showStatus(error.message || "读取失败", 5000); }
         } else if (message.event === "export" && message.format === "json" && awaitingSelection) {
           applySelectionExport(message.data);
         } else if (message.event === "load" && typeof message.xml === "string") {
+          lastEditorXml = message.xml;
           // Draw.io acknowledges action:"load" with event:"load". Only the
           // exact restore target may release the save guard; a delayed initial
           // load acknowledgement must not confirm a different document.
           confirmRestoreTargetLoaded(message.xml);
         } else if ((message.event === "autosave" || message.event === "save") && typeof message.xml === "string") {
+          lastEditorXml = message.xml;
           const action = decideHistoryAutosave(editorMode, message.xml, restoreTargetXml);
           if (action === "drop") return;
           if (action === "confirm") {
@@ -5244,6 +5956,7 @@ async function handleIntegratedBridgeRequest(
       baseRevision as number,
       integratedSource(body.source),
       typeof body.clientId === "string" ? body.clientId : null,
+      { autoMerge: body.source === "editor" },
     )
     if (result.conflict) {
       integratedJsonResponse(response, 409, {
@@ -5251,6 +5964,7 @@ async function handleIntegratedBridgeRequest(
         error: "revision_conflict",
         current: integratedDocumentPayload(result.current),
         manualChanges: result.manualChanges,
+        merge: result.merge,
       })
       return
     }
@@ -5266,6 +5980,7 @@ async function handleIntegratedBridgeRequest(
       ok: true,
       ...integratedDocumentPayload(result.document),
       validation: result.validation,
+      autoMerge: result.autoMerge,
     })
     return
   }
@@ -5277,11 +5992,16 @@ async function handleIntegratedBridgeRequest(
       "Content-Type": "text/event-stream; charset=utf-8",
     })
     response.write(": connected\\n\\n")
+    const requestedFile = requestUrl.searchParams.get("file")
+    const connectedFile = requestedFile
+      ? resolveWorkspacePath({ directory: session.workspace }, requestedFile)
+      : session.file
+    const client = { response, diagramKey: integratedDiagramKey(connectedFile) }
     const clients = state.eventClients.get(session.sessionId) || new Set()
-    clients.add(response)
-state.eventClients.set(session.sessionId, clients)
+    clients.add(client)
+    state.eventClients.set(session.sessionId, clients)
     request.on("close", () => {
-      clients.delete(response)
+      clients.delete(client)
       if (clients.size === 0) state.eventClients.delete(session.sessionId)
     })
     return
@@ -5708,6 +6428,7 @@ async function bindIntegratedSession(
     ? await refreshIntegratedSession(existing)
     : {
       sessionId: context.sessionID,
+      bindingId: randomBytes(16).toString("base64url"),
       workspace,
       file: target,
       revision: 0,
@@ -5727,6 +6448,7 @@ async function bindIntegratedSession(
       historyWarning: null,
     }
   state.sessions.set(context.sessionID, session)
+  session.bindingId ??= randomBytes(16).toString("base64url")
   session.activeAnnotationId ??= null
   session.annotationAuthorizations ??= new Map()
   await loadStoredAnnotations(session)
@@ -5735,6 +6457,8 @@ async function bindIntegratedSession(
   const token = randomBytes(24).toString("base64url")
   state.tokens.set(token, {
     sessionId: context.sessionID,
+    diagramKey: integratedDiagramKey(session.file),
+    bindingId: session.bindingId,
     expiresAt: Date.now() + BRIDGE_TOKEN_TTL_MS,
   })
   return { session, token, bridge }
@@ -5788,7 +6512,7 @@ const DRAWIO_RUNTIME_GUIDANCE = `## Draw.io 文件写入与交付
 每次修改前必须立即调用 drawio_get_state，并把返回的最新 XML 作为修改基线。人工编辑不是只读内容，可以按当前任务要求继续调整。
 提交时必须携带该次读取返回的准确 base_revision；revision_conflict 后重新读取，在新 XML 上重新执行所需变更并重试，禁止重发旧 XML。
 禁止用普通 write、edit 或脚本直接覆盖已绑定的 .drawio 文件，因为这会绕过 revision 检查并可能用旧快照丢失最新内容。
-本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG，并将 openUrl 交给 MobileWork 现有 browser.open_url 打开。完成浏览器调用前不要结束任务。
+本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。只有返回 shouldOpenBrowser=true 时才将 openUrl 交给 MobileWork 现有 browser.open_url 打开；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
 
 ## 注释任务（框选评审）
 
@@ -6458,6 +7182,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         const openUrl = new URL("/editor", bridgeUrl)
         openUrl.searchParams.set("sessionId", context.sessionID)
         openUrl.searchParams.set("token", bound.token)
+        const editorConnected = integratedEditorConnected(bound.session.sessionId, source)
         return JSON.stringify({
           ok: true,
           file: workspaceRelative(context, source).split(path.sep).join("/"),
@@ -6465,7 +7190,11 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           revision: bound.session.revision,
           openUrl: openUrl.toString(),
           editorUrl: editorUrl.toString(),
-          browserAction: "Open the returned openUrl with OpenWork's existing browser.open_url action.",
+          editorConnected,
+          shouldOpenBrowser: !editorConnected,
+          browserAction: editorConnected
+            ? "Keep the connected editor open. Do not call browser.open_url because reopening it can discard an in-progress manual edit."
+            : "Open the returned openUrl with OpenWork's existing browser.open_url action.",
           saveMode: "workspace-file",
           tokenExpiresAt: new Date(Date.now() + BRIDGE_TOKEN_TTL_MS).toISOString(),
         }, null, 2)
@@ -6474,7 +7203,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
 
     drawio_finalize: tool({
       description:
-        "Finish a Draw.io task: refresh the latest revision, validate and score it, export an up-to-date PNG, bind the browser session, and return the URL that must be opened with browser.open_url.",
+        "Finish a Draw.io task: refresh the latest revision, validate and score it, export an up-to-date PNG, bind the browser session, and report whether a new editor must be opened.",
       args: {
         file: tool.schema.string().describe("Workspace-relative .drawio or .xml file"),
         output_path: tool.schema
@@ -6527,6 +7256,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         const openUrl = new URL("/editor", bridgeUrl)
         openUrl.searchParams.set("sessionId", context.sessionID)
         openUrl.searchParams.set("token", bound.token)
+        const editorConnected = integratedEditorConnected(bound.session.sessionId, source)
         return JSON.stringify({
           ok: true,
           file: workspaceRelative(context, source).split(path.sep).join("/"),
@@ -6541,7 +7271,11 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           },
           openUrl: openUrl.toString(),
           editorUrl: editorUrl.toString(),
-          browserAction: "Immediately call MobileWork's existing browser.open_url with openUrl before ending the task.",
+          editorConnected,
+          shouldOpenBrowser: !editorConnected,
+          browserAction: editorConnected
+            ? "Keep the connected editor open. Do not call browser.open_url because reopening it can discard an in-progress manual edit."
+            : "Immediately call MobileWork's existing browser.open_url with openUrl before ending the task.",
           saveMode: "workspace-file",
           tokenExpiresAt: new Date(Date.now() + BRIDGE_TOKEN_TTL_MS).toISOString(),
         }, null, 2)

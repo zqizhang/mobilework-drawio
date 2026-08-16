@@ -112,6 +112,7 @@ try {
   assert.match(systemOutput.system.join("\n"), /最新 XML 作为修改基线/)
   assert.match(systemOutput.system.join("\n"), /freshness=stale/)
   assert.match(systemOutput.system.join("\n"), /requiresConfirmation=false/)
+  assert.match(systemOutput.system.join("\n"), /shouldOpenBrowser=true/)
   assert.match(systemOutput.system.join("\n"), /不能只提示用户稍后继续/)
   assert.match(systemOutput.system.join("\n"), /禁止先改后问/)
   const createResult = JSON.parse(await plugin.tool.drawio_create.execute({
@@ -211,6 +212,15 @@ try {
     /return writeState\(xml, result\.current\.revision\)/,
     "browser must not blind-retry an old XML with a new revision on 409",
   )
+  assert.match(editorPage, /id="conflict-overwrite"/)
+  assert.match(editorPage, /id="conflict-modal"/)
+  assert.match(editorPage, /id="conflict-details"/)
+  assert.match(editorPage, /\.conflict-version\.user/)
+  assert.match(editorPage, /\.conflict-version\.agent/)
+  assert.match(editorPage, /保留我的版本并覆盖/)
+  assert.match(editorPage, /已自动合并不重叠修改并保存/)
+  assert.match(editorPage, /当前画布未被强制刷新/)
+  assert.doesNotMatch(editorPage, /Agent 更新已加载/)
 
   const apiUrl = new URL(openResult.openUrl)
   apiUrl.pathname = "/api/diagram"
@@ -271,6 +281,120 @@ try {
   assert.match(agentUpdatedState.xml, /Agent [AB]/)
   assert.doesNotMatch(agentUpdatedState.xml, /MobileWork Manual/)
 
+  const mergeLocalXml = agentUpdatedState.xml.replace(/Agent [AB]/, "Local Merge")
+  const mergeRemoteXml = agentUpdatedState.xml.replace("Neighbor", "Remote Neighbor")
+  const mergeRemoteSave = await fetch(apiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      xml: mergeRemoteXml,
+      baseRevision: agentUpdatedState.revision,
+      source: "editor",
+      clientId: "remote-browser",
+    }),
+  })
+  assert.equal(mergeRemoteSave.status, 200)
+  const mergeRemoteResult = await mergeRemoteSave.json()
+  const automaticMergeSave = await fetch(apiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      xml: mergeLocalXml,
+      baseRevision: agentUpdatedState.revision,
+      source: "editor",
+      clientId: "local-browser",
+    }),
+  })
+  assert.equal(automaticMergeSave.status, 200)
+  const automaticMerge = await automaticMergeSave.json()
+  assert.equal(automaticMerge.autoMerge.status, "merged")
+  assert.equal(automaticMerge.revision, mergeRemoteResult.revision + 1)
+  assert.equal(automaticMerge.autoMerge.localChangedKeys.includes("p1:node"), true)
+  assert.equal(automaticMerge.autoMerge.remoteChangedKeys.includes("p1:neighbor"), true)
+  assert.match(automaticMerge.xml, /Local Merge/)
+  assert.match(automaticMerge.xml, /Remote Neighbor/)
+
+  const fieldRemoteXml = automaticMerge.xml.replace('x="20" y="20"', 'x="35" y="20"')
+  const fieldLocalXml = automaticMerge.xml.replace("Local Merge", "Field Local")
+  const fieldRemoteSave = await fetch(apiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      xml: fieldRemoteXml,
+      baseRevision: automaticMerge.revision,
+      source: "editor",
+      clientId: "remote-browser",
+    }),
+  })
+  assert.equal(fieldRemoteSave.status, 200)
+  const fieldRemoteResult = await fieldRemoteSave.json()
+  const fieldMergeSave = await fetch(apiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      xml: fieldLocalXml,
+      baseRevision: automaticMerge.revision,
+      source: "editor",
+      clientId: "local-browser",
+    }),
+  })
+  assert.equal(fieldMergeSave.status, 200)
+  const fieldMerge = await fieldMergeSave.json()
+  assert.equal(fieldMerge.autoMerge.status, "merged")
+  assert.equal(fieldMerge.revision, fieldRemoteResult.revision + 1)
+  assert.match(fieldMerge.xml, /Field Local/)
+  assert.match(fieldMerge.xml, /x="35" y="20"/)
+
+  const overlapRemoteXml = fieldMerge.xml
+    .replace("Field Local", "Remote Overlap")
+    .replace("Remote Neighbor", "AI NonConflict")
+  const overlapLocalXml = fieldMerge.xml
+    .replace("Field Local", "Local Overlap")
+    .replace('value="Remote"', 'value="User NonConflict"')
+  const overlapRemoteSave = await fetch(apiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      xml: overlapRemoteXml,
+      baseRevision: fieldMerge.revision,
+      source: "editor",
+      clientId: "remote-browser",
+    }),
+  })
+  assert.equal(overlapRemoteSave.status, 200)
+  const overlapSave = await fetch(apiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      xml: overlapLocalXml,
+      baseRevision: fieldMerge.revision,
+      source: "editor",
+      clientId: "local-browser",
+    }),
+  })
+  assert.equal(overlapSave.status, 409)
+  const overlapConflict = await overlapSave.json()
+  assert.equal(overlapConflict.merge.status, "conflict")
+  assert.equal(overlapConflict.merge.conflicts.includes("p1:node"), true)
+  assert.equal(overlapConflict.merge.details[0].key, "p1:node")
+  assert.equal(overlapConflict.merge.details[0].user.label, "Local Overlap")
+  assert.equal(overlapConflict.merge.details[0].agent.label, "Remote Overlap")
+  assert.equal(overlapConflict.merge.details[0].changedFields.includes("@_value"), true)
+  assert.equal(overlapConflict.merge.details[0].fields[0].path, "@_value")
+  assert.match(overlapConflict.merge.userResolutionXml, /Local Overlap/)
+  assert.match(overlapConflict.merge.userResolutionXml, /AI NonConflict/)
+  assert.match(overlapConflict.merge.userResolutionXml, /User NonConflict/)
+  assert.match(overlapConflict.merge.agentResolutionXml, /Remote Overlap/)
+  assert.match(overlapConflict.merge.agentResolutionXml, /AI NonConflict/)
+  assert.match(overlapConflict.merge.agentResolutionXml, /User NonConflict/)
+  assert.match(overlapConflict.current.xml, /Remote Overlap/)
+  assert.doesNotMatch(overlapConflict.current.xml, /Local Overlap/)
+
+  const eventsUrl = new URL(openResult.openUrl)
+  eventsUrl.pathname = "/api/events"
+  const eventsResponse = await fetch(eventsUrl)
+  assert.equal(eventsResponse.status, 200)
+
   const finalize = JSON.parse(await plugin.tool.drawio_finalize.execute({
     file: "architecture.drawio",
     threshold: 0,
@@ -281,6 +405,10 @@ try {
   assert.equal(finalize.png.output_path, "architecture.png")
   assert.equal((await fs.readFile(path.join(workspace, "architecture.png"))).subarray(0, 8).equals(PNG.subarray(0, 8)), true)
   assert.match(finalize.openUrl, /\/editor\?/)
+  assert.equal(finalize.editorConnected, true)
+  assert.equal(finalize.shouldOpenBrowser, false)
+  assert.match(finalize.browserAction, /Do not call browser\.open_url/)
+  await eventsResponse.body.cancel()
 
   const health = JSON.parse(await plugin.tool.drawio_health_check.execute({ deep: true }, context))
   assert.equal(health.success, true)
@@ -304,7 +432,7 @@ try {
       cells: [{ id: "node", kind: "node", label: "Agent" }],
     }),
   }).then((response) => response.json())
-  assert.equal(submitted.ok, true)
+  assert.equal(submitted.ok, true, JSON.stringify(submitted))
   assert.equal(submitted.annotation.status, "open")
   assert.equal(submitted.annotation.freshness, "fresh")
   assert.equal(submitted.annotation.requiresConfirmation, false)
@@ -725,6 +853,61 @@ try {
   assert.equal(annotationFinalize.png.output_path, "architecture.png")
   assert.match(annotationFinalize.openUrl, /\/editor\?/)
 
+  await fs.writeFile(path.join(workspace, "other.drawio"), XML, "utf8")
+  const originalEventsUrl = new URL(annotationFinalize.openUrl)
+  originalEventsUrl.pathname = "/api/events"
+  const originalEventsResponse = await fetch(originalEventsUrl)
+  assert.equal(originalEventsResponse.status, 200)
+  const otherOpen = JSON.parse(await plugin.tool.drawio_open.execute({
+    file: "other.drawio",
+  }, context))
+  assert.equal(otherOpen.editorConnected, false)
+  assert.equal(otherOpen.shouldOpenBrowser, true)
+
+  // An editor URL is permanently bound to its diagram. After the same
+  // OpenCode session switches files, the old page must not read or write the
+  // newly active file through its stale token.
+  const staleApiUrl = new URL(annotationFinalize.openUrl)
+  staleApiUrl.pathname = "/api/diagram"
+  const staleRead = await fetch(staleApiUrl)
+  assert.equal(staleRead.status, 401)
+  const staleWrite = await fetch(staleApiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      xml: XML.replace("MobileWork", "Must Not Write"),
+      baseRevision: 0,
+      source: "editor",
+    }),
+  })
+  assert.equal(staleWrite.status, 401)
+  const otherApiUrl = new URL(otherOpen.openUrl)
+  otherApiUrl.pathname = "/api/diagram"
+  const otherState = await fetch(otherApiUrl).then((response) => response.json())
+  assert.match(otherState.xml, /MobileWork/)
+  assert.doesNotMatch(otherState.xml, /Must Not Write/)
+
+  const reopenedOriginal = JSON.parse(await plugin.tool.drawio_open.execute({
+    file: "architecture.drawio",
+  }, context))
+  const resurrectedRead = await fetch(staleApiUrl)
+  assert.equal(resurrectedRead.status, 401)
+  const resurrectedWrite = await fetch(staleApiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      xml: XML.replace("MobileWork", "Resurrected Token Write"),
+      baseRevision: 0,
+      source: "editor",
+    }),
+  })
+  assert.equal(resurrectedWrite.status, 401)
+  const reopenedApiUrl = new URL(reopenedOriginal.openUrl)
+  reopenedApiUrl.pathname = "/api/diagram"
+  const reopenedRead = await fetch(reopenedApiUrl)
+  assert.equal(reopenedRead.status, 200)
+  await originalEventsResponse.body.cancel()
+
   console.log(JSON.stringify({
     ok: true,
     openUrl: true,
@@ -732,6 +915,14 @@ try {
     manualChanges: true,
     manualChangesRemainEditable: true,
     serializedRevisionWrites: true,
+    automaticNonOverlappingMerge: true,
+    sameCellNonOverlappingFieldMerge: true,
+    mixedConflictPreservesNonConflictingChanges: true,
+    overlappingConflictRequiresChoice: true,
+    connectedEditorIsFileScoped: true,
+    staleEditorTokenRejected: true,
+    staleEditorTokenCannotResurrect: true,
+    autoMergeDoesNotForceReload: true,
     nestedContainerQuality: true,
     genuineIntersectionDetection: true,
     edgeLabelCollisionDetection: true,
@@ -757,7 +948,7 @@ try {
   const bridge = globalThis.__drawioIntegratedBridge
   if (bridge?.server) {
     for (const clients of bridge.eventClients.values()) {
-      for (const response of clients) response.end()
+      for (const client of clients) client.response.end()
     }
     await new Promise((resolve) => bridge.server.close(resolve))
   }
