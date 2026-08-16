@@ -2302,8 +2302,21 @@ type IntegratedSessionHistory = {
   updatedAt: string
 }
 
+type IntegratedDocument = {
+  workspace: string
+  file: string
+  revision: number
+  xml: string
+  fileHash: string
+  updatedBy: "editor" | "agent" | "external" | "initial" | "restore"
+  updatedAt: string
+  history: IntegratedSessionHistory[]
+  backupFile: string | null
+}
+
 type IntegratedSession = {
   sessionId: string
+  document: IntegratedDocument
   workspace: string
   file: string
   editorUrl?: string
@@ -2425,6 +2438,7 @@ type IntegratedBridgeState = {
   host: string
   port: number
   sessions: Map<string, IntegratedSession>
+  documents: Map<string, IntegratedDocument>
   tokens: Map<string, IntegratedToken>
   eventClients: Map<string, Set<import("node:http").ServerResponse>>
   writeQueues: Map<string, Promise<unknown>>
@@ -2449,6 +2463,7 @@ function getIntegratedBridgeState(): IntegratedBridgeState {
       host: "127.0.0.1",
       port: 0,
       sessions: new Map(),
+      documents: new Map(),
       tokens: new Map(),
       eventClients: new Map(),
       writeQueues: new Map(),
@@ -2461,6 +2476,7 @@ function getIntegratedBridgeState(): IntegratedBridgeState {
       previewWaiters: [],
     }
   }
+  integratedBridgeGlobal.__drawioIntegratedBridge.documents ||= new Map()
   integratedBridgeGlobal.__drawioIntegratedBridge.writeQueues ||= new Map()
   integratedBridgeGlobal.__drawioIntegratedBridge.annotationWriteQueues ||= new Map()
   integratedBridgeGlobal.__drawioIntegratedBridge.annotationsByDiagram ||= new Map()
@@ -2469,7 +2485,59 @@ function getIntegratedBridgeState(): IntegratedBridgeState {
   integratedBridgeGlobal.__drawioIntegratedBridge.previewInFlight ||= new Map()
   integratedBridgeGlobal.__drawioIntegratedBridge.previewActive ||= 0
   integratedBridgeGlobal.__drawioIntegratedBridge.previewWaiters ||= []
-  return integratedBridgeGlobal.__drawioIntegratedBridge
+  const state = integratedBridgeGlobal.__drawioIntegratedBridge
+  for (const [sessionId, existing] of state.sessions) {
+    const currentDocument = (existing as IntegratedSession & { document?: IntegratedDocument }).document
+    if (currentDocument) {
+      state.documents.set(integratedDiagramKey(currentDocument.file), currentDocument)
+      continue
+    }
+    const key = integratedDiagramKey(existing.file)
+    const document = state.documents.get(key) || {
+      workspace: existing.workspace,
+      file: existing.file,
+      revision: existing.revision,
+      xml: existing.xml,
+      fileHash: existing.fileHash,
+      updatedBy: existing.updatedBy,
+      updatedAt: existing.updatedAt,
+      history: existing.history,
+      backupFile: existing.backupFile,
+    }
+    state.documents.set(key, document)
+    state.sessions.set(sessionId, createIntegratedSessionBinding(sessionId, document, existing))
+  }
+  return state
+}
+
+function createIntegratedSessionBinding(
+  sessionId: string,
+  document: IntegratedDocument,
+  previous?: Partial<IntegratedSession>,
+): IntegratedSession {
+  return {
+    sessionId,
+    document,
+    get workspace() { return document.workspace },
+    get file() { return document.file },
+    editorUrl: previous?.editorUrl,
+    get revision() { return document.revision },
+    set revision(value) { document.revision = value },
+    get xml() { return document.xml },
+    set xml(value) { document.xml = value },
+    get fileHash() { return document.fileHash },
+    set fileHash(value) { document.fileHash = value },
+    get updatedBy() { return document.updatedBy },
+    set updatedBy(value) { document.updatedBy = value },
+    get updatedAt() { return document.updatedAt },
+    set updatedAt(value) { document.updatedAt = value },
+    get history() { return document.history },
+    get backupFile() { return document.backupFile },
+    set backupFile(value) { document.backupFile = value },
+    activeAnnotationId: previous?.activeAnnotationId || null,
+    annotationAuthorizations: previous?.annotationAuthorizations || new Map(),
+    historyWarning: previous?.historyWarning || null,
+  }
 }
 
 function integratedHash(value: string): string {
@@ -5704,28 +5772,35 @@ async function bindIntegratedSession(
 
   const state = getIntegratedBridgeState()
   const existing = state.sessions.get(context.sessionID)
-  const session = existing && path.resolve(existing.file) === path.resolve(target)
-    ? await refreshIntegratedSession(existing)
-    : {
-      sessionId: context.sessionID,
-      workspace,
-      file: target,
-      revision: 0,
-      xml: initialXml,
-      fileHash: integratedHash(initialXml),
-      updatedBy: "initial" as const,
-      updatedAt: new Date().toISOString(),
-      history: [{
+  const key = integratedDiagramKey(target)
+  let session: IntegratedSession
+  if (existing && integratedDiagramKey(existing.file) === key) {
+    session = await refreshIntegratedSession(existing)
+  } else {
+    let document = state.documents.get(key)
+    if (!document) {
+      const now = new Date().toISOString()
+      document = {
+        workspace,
+        file: target,
         revision: 0,
         xml: initialXml,
+        fileHash: integratedHash(initialXml),
         updatedBy: "initial" as const,
-        updatedAt: new Date().toISOString(),
-      }],
-      backupFile: null,
-      activeAnnotationId: null,
-      annotationAuthorizations: new Map(),
-      historyWarning: null,
+        updatedAt: now,
+        history: [{
+          revision: 0,
+          xml: initialXml,
+          updatedBy: "initial" as const,
+          updatedAt: now,
+        }],
+        backupFile: null,
+      }
+      state.documents.set(key, document)
     }
+    session = createIntegratedSessionBinding(context.sessionID, document)
+    await refreshIntegratedSession(session)
+  }
   state.sessions.set(context.sessionID, session)
   session.activeAnnotationId ??= null
   session.annotationAuthorizations ??= new Map()

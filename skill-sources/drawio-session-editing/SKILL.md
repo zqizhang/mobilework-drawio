@@ -35,6 +35,8 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 - `drawio_get_state(since_revision=...)`：返回最新XML、revision及可选的稳定ID变化。
 - `drawio_update_state(base_revision=..., xml=...)`：以乐观并发方式提交完整XML。
 - 这些工具根据运行时上下文识别session，不需要用户手动传入session ID。
+- 同一工作区文件允许被多个session同时打开；各session保持独立凭据与审批状态，同时共享文件级最新XML、revision和版本历史。
+- 任一session保存后，其他已绑定session可读取同一最新版本；旧revision提交继续返回`revision_conflict`。
 - 如果会话工具不可用，应明确说明无法提供冲突安全的浏览器编辑，不得假装当前画布已同步。
 
 ## 注释任务（框选评审）

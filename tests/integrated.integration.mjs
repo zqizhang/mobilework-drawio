@@ -96,6 +96,13 @@ const context = {
   metadata() {},
   async ask(input) { approvalRequests.push(input) },
 }
+const secondApprovalRequests = []
+const secondContext = {
+  ...context,
+  sessionID: "integrated-session-2",
+  messageID: "integrated-message-2",
+  async ask(input) { secondApprovalRequests.push(input) },
+}
 
 try {
   const plugin = await DrawioExpertPlugin({ directory: workspace })
@@ -217,6 +224,18 @@ try {
   const initial = await fetch(apiUrl).then((response) => response.json())
   assert.equal(initial.revision, 0)
 
+  const sharedOpen = JSON.parse(await plugin.tool.drawio_open.execute({
+    file: "architecture.drawio",
+  }, secondContext))
+  assert.equal(sharedOpen.ok, true)
+  assert.notEqual(sharedOpen.openUrl, openResult.openUrl)
+  const sharedApiUrl = new URL(sharedOpen.openUrl)
+  sharedApiUrl.pathname = "/api/diagram"
+  const sharedInitial = await fetch(sharedApiUrl).then((response) => response.json())
+  assert.equal(sharedInitial.sessionId, secondContext.sessionID)
+  assert.equal(sharedInitial.revision, initial.revision)
+  assert.equal(sharedInitial.xml, initial.xml)
+
   await assert.rejects(
     plugin.tool.drawio_patch.execute({
       file: "architecture.drawio",
@@ -242,6 +261,17 @@ try {
   assert.equal(manualSave.status, 200)
   assert.equal((await manualSave.json()).revision, 1)
 
+  const sharedLatest = await fetch(sharedApiUrl).then((response) => response.json())
+  assert.equal(sharedLatest.revision, 1)
+  assert.match(sharedLatest.xml, /MobileWork Manual/)
+  const sharedStaleSave = await fetch(sharedApiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ xml: XML, baseRevision: 0, source: "editor", clientId: "browser-2" }),
+  })
+  assert.equal(sharedStaleSave.status, 409)
+  assert.equal((await sharedStaleSave.json()).current.revision, 1)
+
   const state = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
   assert.equal(state.revision, 1)
   assert.match(state.xml, /MobileWork Manual/)
@@ -262,7 +292,7 @@ try {
     plugin.tool.drawio_update_state.execute({
       base_revision: 1,
       xml: manualXml.replace("MobileWork Manual", "Agent B"),
-    }, context).then(JSON.parse),
+    }, secondContext).then(JSON.parse),
   ])
   assert.equal(concurrent.filter((result) => result.ok).length, 1)
   assert.equal(concurrent.filter((result) => result.error === "revision_conflict").length, 1)
@@ -489,13 +519,6 @@ try {
     "utf8",
   )
   globalThis.__drawioIntegratedBridge.annotationsByDiagram.clear()
-  const secondApprovalRequests = []
-  const secondContext = {
-    ...context,
-    sessionID: "integrated-session-2",
-    messageID: "integrated-message-2",
-    async ask(input) { secondApprovalRequests.push(input) },
-  }
   const secondOpen = JSON.parse(await plugin.tool.drawio_open.execute({
     file: "architecture.drawio",
   }, secondContext))
@@ -732,6 +755,8 @@ try {
     manualChanges: true,
     manualChangesRemainEditable: true,
     serializedRevisionWrites: true,
+    multiSessionSharedDocument: true,
+    multiSessionConflictProtection: true,
     nestedContainerQuality: true,
     genuineIntersectionDetection: true,
     edgeLabelCollisionDetection: true,

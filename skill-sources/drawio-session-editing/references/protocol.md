@@ -23,6 +23,9 @@ GET /api/diagram?sessionId=ses_123
 ```
 
 A newly bound file starts at revision `0` with that file's current XML.
+If another session binds the same absolute workspace file, it joins the same
+file-level document state. Session tokens and annotation approvals remain
+independent while XML, revision and history are shared by the file.
 
 ## Update
 
