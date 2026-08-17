@@ -25,7 +25,7 @@
 
 | 能力 | 生成位置 / 配置字段 | 状态 |
 |---|---|---|
-| 自定义命令 | `.opencode/commands/` | 6 个 |
+| 自定义命令 | `.opencode/commands/` | 7 个 |
 | 自定义工具 | `.opencode/tools/` | 0 个 |
 | 插件 | `.opencode/plugins/` / `opencode.json.plugin` | 本地 1 个，npm 0 个 |
 | References | `references/` / `opencode.json.references` | 1 个别名 |

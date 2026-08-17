@@ -75,7 +75,7 @@
 
 | 能力 | 生成位置 / 配置字段 | 状态 |
 |---|---|---|
-| 自定义命令 | `.opencode/commands/` | 6 个 |
+| 自定义命令 | `.opencode/commands/` | 7 个 |
 | 自定义工具 | `.opencode/tools/` | 0 个 |
 | 插件 | `.opencode/plugins/` / `opencode.json.plugin` | 本地 1 个，npm 0 个 |
 | References | `references/` / `opencode.json.references` | 1 个别名 |
@@ -87,6 +87,7 @@
 
 ### 自定义命令
 - `/drawio-create`：根据需求创建、校验并预览Draw.io文件。
+- `/drawio-pages`：列出、新增、重命名、删除或移动Draw.io文件页面。
 - `/drawio-inspect`：读取并解释现有Draw.io文件。
 - `/drawio-patch`：以稳定ID安全增量修改Draw.io文件。
 - `/drawio-polish`：执行自动布局、路由调整和质量门禁。

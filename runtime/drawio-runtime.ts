@@ -22,6 +22,14 @@ type DiagramEdge = {
   label?: string
 }
 
+type DiagramPageInput = {
+  id?: string
+  title: string
+  nodes: DiagramNode[]
+  edges?: DiagramEdge[]
+  direction?: Direction
+}
+
 type ParsedCell = {
   id: string
   parent?: string
@@ -1241,14 +1249,92 @@ function buildDrawioDocument(
   direction: Direction,
   compressed: boolean,
 ): string {
-  const graphModel = buildGraphModel(nodes, edges, direction)
-  const pageId = `page-${slug(title)}`
-  const diagramContent = compressed ? encodeDiagramPayload(graphModel) : graphModel
+  return buildDrawioPagesDocument([
+    { title, nodes, edges, direction },
+  ], compressed, direction)
+}
+
+function uniquePageId(title: string, requestedId: string | undefined, used: Set<string>): string {
+  const requested = requestedId?.trim()
+  if (requested) {
+    if (!SAFE_ID.test(requested)) throw new Error(`invalid page id: ${requested}`)
+    if (used.has(requested)) throw new Error(`duplicate page id: ${requested}`)
+    used.add(requested)
+    return requested
+  }
+  const base = `page-${slug(title)}`
+  let candidate = base
+  let suffix = 2
+  while (used.has(candidate)) {
+    candidate = `${base}-${suffix}`
+    suffix += 1
+  }
+  used.add(candidate)
+  return candidate
+}
+
+function buildDrawioPagesDocument(
+  pages: DiagramPageInput[],
+  compressed: boolean,
+  defaultDirection: Direction,
+): string {
+  if (pages.length === 0) throw new Error("drawio document requires at least one page")
+  const usedPageIds = new Set<string>()
   const now = new Date().toISOString()
+  const diagrams = pages.map((page) => {
+    if (!page.title?.trim()) throw new Error("each page requires a non-empty title")
+    validateSemanticGraph(page.nodes, page.edges || [])
+    const graphModel = buildGraphModel(page.nodes, page.edges || [], page.direction || defaultDirection)
+    const pageId = uniquePageId(page.title, page.id, usedPageIds)
+    const diagramContent = compressed ? encodeDiagramPayload(graphModel) : graphModel
+    return `  <diagram id="${xmlEscape(pageId)}" name="${xmlEscape(page.title)}">${diagramContent}</diagram>`
+  })
   return `<mxfile host="OpenWork" modified="${now}" agent="drawio-expert" version="26.0.0">
-  <diagram id="${xmlEscape(pageId)}" name="${xmlEscape(title)}">${diagramContent}</diagram>
+${diagrams.join("\n")}
 </mxfile>
 `
+}
+
+function ensureEditableMxfile(editable: EditableDocument): Record<string, unknown>[] {
+  if (editable.directModel) {
+    const firstPage = editable.pages[0]
+    const firstDiagram: Record<string, unknown> = {
+      "@_id": firstPage.id,
+      "@_name": firstPage.name,
+      mxGraphModel: firstPage.model,
+    }
+    editable.document = {
+      mxfile: {
+        "@_host": "OpenWork",
+        "@_modified": new Date().toISOString(),
+        "@_agent": "drawio-expert",
+        "@_version": "26.0.0",
+        diagram: [firstDiagram],
+      },
+    }
+    editable.directModel = false
+    firstPage.diagram = firstDiagram
+    firstPage.compressed = false
+  }
+
+  const mxfile = editable.document.mxfile as Record<string, unknown> | undefined
+  if (!mxfile) throw new Error("root element must be mxfile")
+  const diagrams = asArray(
+    mxfile.diagram as Record<string, unknown> | Record<string, unknown>[] | undefined,
+  )
+  mxfile.diagram = diagrams
+  return diagrams
+}
+
+function pageSummary(pages: ParsedPage[]) {
+  return pages.map((page, index) => ({
+    index,
+    id: page.id,
+    name: page.name,
+    compressed: page.compressed,
+    nodes: page.cells.filter((cell) => cell.vertex).length,
+    edges: page.cells.filter((cell) => cell.edge).length,
+  }))
 }
 
 function validationReport(pages: ParsedPage[]) {
@@ -6480,6 +6566,17 @@ const edgeSchema = tool.schema.object({
   label: tool.schema.string().optional().describe("Visible edge label"),
 })
 
+const pageSchema = tool.schema.object({
+  id: tool.schema.string().optional().describe("Stable unique page id"),
+  title: tool.schema.string().describe("Diagram page title"),
+  nodes: tool.schema.array(nodeSchema).describe("Diagram nodes on this page"),
+  edges: tool.schema.array(edgeSchema).default([]).describe("Diagram edges on this page"),
+  direction: tool.schema
+    .enum(["left-to-right", "top-to-bottom"])
+    .optional()
+    .describe("Layered layout direction for this page"),
+})
+
 const patchOperationSchema = tool.schema.object({
   type: tool.schema.enum([
     "add-node",
@@ -6698,27 +6795,41 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
 
     drawio_create: tool({
       description:
-        "Create a validated Draw.io file from a semantic graph. Use this instead of writing mxGraphModel XML directly.",
+        "Create a validated Draw.io file from one or more semantic graph pages. Use this instead of writing mxGraphModel XML directly.",
       args: {
         file: tool.schema.string().describe("Workspace-relative .drawio or .xml output path"),
-        title: tool.schema.string().describe("Diagram page title"),
-        nodes: tool.schema.array(nodeSchema).describe("Diagram nodes"),
+        title: tool.schema.string().optional().describe("Single-page diagram title; ignored when pages is provided"),
+        nodes: tool.schema.array(nodeSchema).default([]).describe("Single-page diagram nodes"),
         edges: tool.schema.array(edgeSchema).default([]).describe("Diagram edges"),
+        pages: tool.schema
+          .array(pageSchema)
+          .optional()
+          .describe("Optional multi-page document definition; each entry becomes one Draw.io page"),
         direction: tool.schema
           .enum(["left-to-right", "top-to-bottom"])
           .default("left-to-right")
-          .describe("Layered layout direction"),
+          .describe("Default layered layout direction"),
         compressed: tool.schema
           .boolean()
           .default(false)
-          .describe("Write standard compressed Draw.io page payload"),
+          .describe("Write standard compressed Draw.io page payloads"),
         overwrite: tool.schema
           .boolean()
           .default(false)
           .describe("Allow replacement; the previous file is preserved as a timestamped backup"),
       },
       async execute(args, context) {
-        validateSemanticGraph(args.nodes, args.edges)
+        const pageInputs = args.pages?.length
+          ? args.pages as DiagramPageInput[]
+          : [{
+            title: args.title,
+            nodes: args.nodes,
+            edges: args.edges,
+            direction: args.direction,
+          }] as DiagramPageInput[]
+        if (!pageInputs[0]?.title?.trim()) {
+          throw new Error("title is required when pages is not provided")
+        }
         const target = resolveWorkspacePath(context, args.file)
         if (integratedSessionFor(context, target)) {
           throw new Error(
@@ -6726,13 +6837,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
             + "call drawio_get_state and submit an incremental revision-aware update",
           )
         }
-        const xml = buildDrawioDocument(
-          args.title,
-          args.nodes,
-          args.edges,
-          args.direction,
-          args.compressed,
-        )
+        const xml = buildDrawioPagesDocument(pageInputs, args.compressed, args.direction)
         const pages = parseDrawio(xml)
         const report = validationReport(pages)
         if (!report.valid) {
@@ -6745,6 +6850,194 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
             ? workspaceRelative(context, writeResult.backup)
             : null,
           compressed: args.compressed,
+          page_count: pages.length,
+          pages: pageSummary(pages),
+          ...report,
+        }, null, 2)
+      },
+    }),
+
+    drawio_pages: tool({
+      description:
+        "List and manage pages in an existing Draw.io file: add, rename, remove, or move pages with validation and revision safety.",
+      args: {
+        file: tool.schema.string().describe("Workspace-relative .drawio or .xml file"),
+        action: tool.schema.enum(["list", "add", "rename", "remove", "move"]),
+        page: tool.schema.string().optional().describe("Page id or name for rename, remove, or move"),
+        page_id: tool.schema.string().optional().describe("Stable id for a newly added page"),
+        title: tool.schema.string().optional().describe("Page title for add or rename"),
+        nodes: tool.schema.array(nodeSchema).default([]).describe("Nodes for a newly added page"),
+        edges: tool.schema.array(edgeSchema).default([]).describe("Edges for a newly added page"),
+        direction: tool.schema
+          .enum(["left-to-right", "top-to-bottom"])
+          .default("left-to-right")
+          .describe("Layout direction for a newly added page"),
+        compressed: tool.schema
+          .boolean()
+          .default(false)
+          .describe("Store a newly added page as compressed Draw.io payload"),
+        index: tool.schema
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Zero-based destination index for add or move"),
+        dry_run: tool.schema
+          .boolean()
+          .default(false)
+          .describe("Return the diff and validation result without writing"),
+        base_revision: tool.schema
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Exact revision returned by drawio_get_state; mandatory when writing an active session"),
+      },
+      async execute(args, context) {
+        const target = resolveWorkspacePath(context, args.file)
+        const session = integratedSessionFor(context, target)
+        const activeSession = session ? await refreshIntegratedSession(session) : null
+        if (activeSession && args.action !== "list" && !args.dry_run && args.base_revision === undefined) {
+          throw new Error(
+            "base_revision is required for an active Draw.io session; "
+            + "call drawio_get_state immediately before writing",
+          )
+        }
+
+        const beforeXml = activeSession?.xml || await readDiagramFile(target)
+        const beforePages = parseDrawio(beforeXml)
+        if (args.action === "list") {
+          return JSON.stringify({
+            file: workspaceRelative(context, target),
+            page_count: beforePages.length,
+            pages: pageSummary(beforePages),
+            ...validationReport(beforePages),
+          }, null, 2)
+        }
+
+        const editable = parseEditableDrawio(beforeXml)
+        const diagrams = ensureEditableMxfile(editable)
+        const changedPages: string[] = []
+
+        if (args.action === "add") {
+          if (!args.title?.trim()) throw new Error("add requires title")
+          validateSemanticGraph(args.nodes, args.edges)
+          const existingIds = new Set(editable.pages.map((page) => page.id))
+          const pageId = uniquePageId(args.title, args.page_id, existingIds)
+          if (editable.pages.some((page) => page.name === args.title)) {
+            throw new Error(`page name already exists: ${args.title}`)
+          }
+          const diagram: Record<string, unknown> = {
+            "@_id": pageId,
+            "@_name": args.title,
+          }
+          const modelDocument = parser.parse(
+            buildGraphModel(args.nodes, args.edges, args.direction),
+          ) as Record<string, unknown>
+          if (!modelDocument.mxGraphModel || typeof modelDocument.mxGraphModel !== "object") {
+            throw new Error("failed to create page mxGraphModel")
+          }
+          const page: EditablePage = {
+            id: pageId,
+            name: args.title,
+            compressed: args.compressed,
+            diagram,
+            model: modelDocument.mxGraphModel as Record<string, unknown>,
+          }
+          const insertAt = Math.min(args.index ?? editable.pages.length, editable.pages.length)
+          editable.pages.splice(insertAt, 0, page)
+          diagrams.splice(insertAt, 0, diagram)
+          changedPages.push(pageId)
+        } else {
+          if (!args.page?.trim()) throw new Error(`${args.action} requires page`)
+          const page = selectEditablePage(editable, args.page)
+          const pageIndex = editable.pages.indexOf(page)
+          if (args.action === "rename") {
+            if (!args.title?.trim()) throw new Error("rename requires title")
+            if (editable.pages.some((candidate) => candidate !== page && candidate.name === args.title)) {
+              throw new Error(`page name already exists: ${args.title}`)
+            }
+            page.name = args.title
+            page.diagram!["@_name"] = args.title
+            changedPages.push(page.id)
+          } else if (args.action === "remove") {
+            if (editable.pages.length === 1) throw new Error("cannot remove the only page")
+            editable.pages.splice(pageIndex, 1)
+            diagrams.splice(pageIndex, 1)
+            changedPages.push(page.id)
+          } else if (args.action === "move") {
+            if (args.index === undefined) throw new Error("move requires index")
+            const destination = Math.min(args.index, editable.pages.length - 1)
+            const [removedPage] = editable.pages.splice(pageIndex, 1)
+            const [removedDiagram] = diagrams.splice(pageIndex, 1)
+            editable.pages.splice(destination, 0, removedPage)
+            diagrams.splice(destination, 0, removedDiagram)
+            changedPages.push(page.id)
+          }
+        }
+
+        const afterXml = serializeEditableDrawio(editable)
+        const afterPages = parseDrawio(afterXml)
+        const report = validationReport(afterPages)
+        if (!report.valid) {
+          throw new Error(`page operation failed validation: ${JSON.stringify(report.errors)}`)
+        }
+        const diff = diffParsedPages(beforePages, afterPages)
+
+        if (args.dry_run) {
+          return JSON.stringify({
+            file: workspaceRelative(context, target),
+            action: args.action,
+            dryRun: true,
+            changedPages,
+            page_count: afterPages.length,
+            pages: pageSummary(afterPages),
+            diff,
+            ...report,
+          }, null, 2)
+        }
+
+        if (activeSession) {
+          const commit = await integratedCommit(activeSession, afterXml, args.base_revision!, "agent")
+          if (commit.conflict) {
+            return JSON.stringify({
+              file: workspaceRelative(context, target),
+              action: args.action,
+              dryRun: false,
+              ...commit,
+            }, null, 2)
+          }
+          if (commit.invalid) {
+            throw new Error(`page operation failed validation: ${JSON.stringify(commit.report.errors)}`)
+          }
+          return JSON.stringify({
+            file: workspaceRelative(context, target),
+            action: args.action,
+            dryRun: false,
+            backup: activeSession.backupFile
+              ? workspaceRelative(context, activeSession.backupFile)
+              : null,
+            revision: activeSession.revision,
+            changedPages,
+            page_count: afterPages.length,
+            pages: pageSummary(afterPages),
+            diff,
+            ...report,
+          }, null, 2)
+        }
+
+        const writeResult = await atomicWrite(target, afterXml, true)
+        return JSON.stringify({
+          file: workspaceRelative(context, target),
+          action: args.action,
+          dryRun: false,
+          backup: writeResult.backup
+            ? workspaceRelative(context, writeResult.backup)
+            : null,
+          changedPages,
+          page_count: afterPages.length,
+          pages: pageSummary(afterPages),
+          diff,
           ...report,
         }, null, 2)
       },
