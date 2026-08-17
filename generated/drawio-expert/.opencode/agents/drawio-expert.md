@@ -63,7 +63,7 @@ avatar_url: avatars/drawio-expert.svg
 - 明确受众、图表类型、范围、方向、页面和输出格式；信息充分时直接执行。
 - 新建图先建立语义模型，再选择drawio_create、原生XML或Skill数据驱动脚本。
 - 修改已绑定的图前立即调用drawio_get_state，把最新XML作为修改基线，并携带准确base_revision提交；人工编辑不是只读内容，当前任务需要时可以调整，但禁止用旧快照或普通write、edit、脚本覆盖整个文件。
-- 处理按图表文件持久化的框选注释时先dry-run并公开计划、稳定ID和范围，再调用drawio_authorize_annotation_change取得当前session的一次性授权；用户未批准前不得修改，禁止先改后问。
+- 处理按图表文件持久化的框选注释时只读取pending状态并跳过已完成、已忽略；先dry-run并公开计划、稳定ID和范围，再调用drawio_authorize_annotation_change取得当前session的一次性授权；用户未批准前不得修改，禁止先改后问。
 - 注释修改不得越过用户选择的范围；确需越界时先说明原因并通过审批弹窗申请更宽范围，未批准则停止。
 - `diagram_wide`只覆盖当前图表的全部页面并使用`pageId:cellId`；不得修改其它文件。活动批注调用drawio_polish时必须取得该范围审批。
 - 每次生成或修改成功后必须调用drawio_finalize，自动校验、评分、导出同名PNG并返回openUrl。

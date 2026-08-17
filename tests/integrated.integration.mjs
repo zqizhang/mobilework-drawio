@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs"
 import { createServer } from "node:http"
 import os from "node:os"
 import path from "node:path"
+import { Script } from "node:vm"
 
 import { DrawioExpertPlugin } from "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js"
 
@@ -275,6 +276,16 @@ try {
 
   const annotationsUrl = new URL(finalize.openUrl)
   annotationsUrl.pathname = "/api/annotations"
+  const editorHtml = await fetch(finalize.openUrl).then((response) => response.text())
+  assert.match(editorHtml, /value="pending">待处理/)
+  assert.match(editorHtml, /value="ignored">已忽略/)
+  assert.match(editorHtml, /data-status="ignored">忽略/)
+  assert.match(editorHtml, /const statusUrl = new URL\(CONFIG\.annotationsUrl\)/)
+  assert.match(editorHtml, /statusUrl\.pathname = statusUrl\.pathname\.endsWith/)
+  assert.doesNotMatch(editorHtml, /fetch\(CONFIG\.annotationsUrl \+ "\/"/)
+  const editorScripts = [...editorHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+  assert.ok(editorScripts.length > 0)
+  for (const [, script] of editorScripts) new Script(script)
   const liveInspect = JSON.parse(await plugin.tool.drawio_inspect.execute({
     file: "architecture.drawio",
   }, context))
@@ -398,7 +409,7 @@ try {
   const storedAnnotations = await fs.readFile(path.join(workspace, "architecture.annotations.json"), "utf8")
   assert.match(storedAnnotations, /architecture\/|architecture\.drawio|"file":\s*"architecture.drawio"/)
   assert.match(storedAnnotations, /已将节点改名为 Draw\.io/)
-  assert.match(storedAnnotations, /"schemaVersion":\s*2/)
+  assert.match(storedAnnotations, /"schemaVersion":\s*3/)
   assert.doesNotMatch(storedAnnotations, /"sessionId"/)
   assert.doesNotMatch(storedAnnotations, /approvalToken|"authorization"|base64url/)
 
@@ -407,6 +418,85 @@ try {
     status: "open",
   }, context))
   assert.equal(openAfterResolve.count, 0)
+
+  const ignoredAnn = await fetch(annotationsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "这条批注将被手动忽略",
+      scope: "selection_only",
+      pageId,
+      pageName,
+      cells: [{ id: "node", kind: "node", label: "Draw.io" }],
+    }),
+  }).then((response) => response.json())
+  await plugin.tool.drawio_get_annotation.execute({ id: ignoredAnn.annotation.id }, context)
+  const ignoredBase = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
+  const ignoredAuthorization = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
+    id: ignoredAnn.annotation.id,
+    plan: "准备修改后由用户决定忽略",
+    proposed_changed_ids: ["node"],
+    requested_scope: "selection_only",
+  }, context))
+  const ignoredResult = await fetch(new URL(
+    `/api/annotations/${encodeURIComponent(ignoredAnn.annotation.id)}${annotationsUrl.search}`,
+    annotationsUrl,
+  ), {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ status: "ignored", reason: "当前不需要处理" }),
+  }).then((response) => response.json())
+  assert.equal(ignoredResult.annotation.status, "ignored")
+  assert.equal(ignoredResult.annotation.ignoredReason, "当前不需要处理")
+  assert.ok(ignoredResult.annotation.ignoredAt)
+  await assert.rejects(
+    plugin.tool.drawio_authorize_annotation_change.execute({
+      id: ignoredAnn.annotation.id,
+      plan: "忽略后不应再授权",
+      proposed_changed_ids: ["node"],
+      requested_scope: "selection_only",
+    }, context),
+    /must be reopened before authorization/,
+  )
+  await assert.rejects(
+    plugin.tool.drawio_patch.execute({
+      file: "architecture.drawio",
+      operations: [{ type: "update-node", id: "node", label: "Should Not Apply" }],
+      dry_run: false,
+      base_revision: ignoredBase.revision,
+      annotation_id: ignoredAnn.annotation.id,
+      approval_token: ignoredAuthorization.approvalToken,
+    }, context),
+    /no longer active|reopen the annotation/,
+  )
+  const ignoredListUrl = new URL(annotationsUrl)
+  ignoredListUrl.searchParams.set("status", "ignored")
+  const ignoredList = await fetch(ignoredListUrl).then((response) => response.json())
+  assert.equal(ignoredList.count, 1)
+  assert.equal(ignoredList.annotations[0].id, ignoredAnn.annotation.id)
+  assert.equal(ignoredList.counts.ignored, 1)
+  const reopenedResult = await fetch(new URL(
+    `/api/annotations/${encodeURIComponent(ignoredAnn.annotation.id)}${annotationsUrl.search}`,
+    annotationsUrl,
+  ), {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ status: "open" }),
+  }).then((response) => response.json())
+  assert.equal(reopenedResult.annotation.status, "open")
+  assert.equal(reopenedResult.annotation.ignoredAt, null)
+  await fetch(new URL(
+    `/api/annotations/${encodeURIComponent(ignoredAnn.annotation.id)}${annotationsUrl.search}`,
+    annotationsUrl,
+  ), {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ status: "ignored", reason: "保持忽略" }),
+  })
+
+  const invalidStatusUrl = new URL(annotationsUrl)
+  invalidStatusUrl.searchParams.set("status", "unknown")
+  assert.equal((await fetch(invalidStatusUrl)).status, 400)
 
   const globalAnn = await fetch(annotationsUrl, {
     method: "POST",
@@ -424,14 +514,15 @@ try {
 
   // Simulate a fresh conversation/process cache: annotations must reload from
   // the diagram sidecar even though its legacy creator session differs.
-  const v2BeforeMigration = JSON.parse(await fs.readFile(
+  const v3BeforeMigration = JSON.parse(await fs.readFile(
     path.join(workspace, "architecture.annotations.json"),
     "utf8",
   ))
   await fs.writeFile(
     path.join(workspace, "architecture.annotations.json"),
-    JSON.stringify(v2BeforeMigration.annotations.map((task) => ({
+    JSON.stringify(v3BeforeMigration.annotations.map((task) => ({
       ...task,
+      status: task.id === globalAnn.annotation.id ? "stale" : task.status,
       sessionId: "legacy-foreign-session",
     })), null, 2),
     "utf8",
@@ -506,7 +597,7 @@ try {
     changed_ids: ["p2:remote"],
   }, secondContext)
   const migratedStore = await fs.readFile(path.join(workspace, "architecture.annotations.json"), "utf8")
-  assert.match(migratedStore, /"schemaVersion":\s*2/)
+  assert.match(migratedStore, /"schemaVersion":\s*3/)
   assert.doesNotMatch(migratedStore, /legacy-foreign-session|"sessionId"/)
 
   const polishAnn = await fetch(annotationsUrl, {
@@ -581,7 +672,24 @@ try {
     id: staleAnn.annotation.id,
   }, context))
   assert.equal(staleDetail.annotation.stale, true)
+  assert.equal(staleDetail.annotation.status, "stale")
   assert.match(staleDetail.annotation.staleReason, /changed/)
+
+  const staleListUrl = new URL(annotationsUrl)
+  staleListUrl.searchParams.set("status", "stale")
+  const staleList = await fetch(staleListUrl).then((response) => response.json())
+  assert.ok(staleList.annotations.some((task) => task.id === staleAnn.annotation.id))
+  const pendingList = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
+    file: "architecture.drawio",
+    status: "pending",
+  }, context))
+  assert.ok(pendingList.annotations.some((task) => task.id === staleAnn.annotation.id))
+  assert.ok(pendingList.counts.stale >= 1)
+  const ignoredAgentList = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
+    file: "architecture.drawio",
+    status: "ignored",
+  }, context))
+  assert.ok(ignoredAgentList.annotations.some((task) => task.id === ignoredAnn.annotation.id))
 
   console.log(JSON.stringify({
     ok: true,
@@ -606,6 +714,10 @@ try {
     annotationSessionBoundApproval: true,
     annotationDiagramWidePolish: true,
     annotationPreWriteApproval: true,
+    annotationStatusFiltering: true,
+    annotationIgnoreAndReopen: true,
+    annotationBrowserStatusUrl: true,
+    annotationTerminalAuthorizationRevocation: true,
   }, null, 2))
 } finally {
   const bridge = globalThis.__drawioIntegratedBridge

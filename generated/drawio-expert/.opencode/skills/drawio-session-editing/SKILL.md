@@ -41,7 +41,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 
 用户在内置浏览器中框选一个或多个图元并填写修改说明后，还必须选择允许修改范围。每条注释记录选中图元的稳定 ID、页面、区域范围、修改说明、范围策略和提交时的图表基线。注释按图表文件持久化到 `<basename>.annotations.json`，不绑定对话session；重启或换新对话后打开同一图表仍可恢复。
 
-范围策略只有三种：
+范围策略只有四种：
 
 | 策略 | 允许修改 | 明确禁止 |
 |---|---|---|
@@ -56,7 +56,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 
 只要当前会话已通过 `drawio_open`/`drawio_finalize` 绑定了 `.drawio` 文件，**每一轮对话开始都必须先并发地完成两项探测**，再决定本轮动作：
 
-1. 调 `drawio_list_annotations(file, status="open")` 查待处理注释；
+1. 调 `drawio_list_annotations(file, status="pending")` 查待处理注释（未完成和已过时）；
 2. 调 `drawio_get_state` 拿最新 `revision` 和 `updatedBy`——`updatedBy` 取值 `editor`/`external` 表示用户在内置浏览器里手动动过画布，取 `agent`/`initial` 表示上次是 agent 改的或刚打开。
 
 两者都是用户意图，必须合起来看，不能只看注释。探测后按下表决定本轮动作：
@@ -73,10 +73,10 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 
 ### 工具
 
-- `drawio_list_annotations(file, status="open")`：列出待处理注释。每轮第一句对话必调一次。`status` 可用 `"open"`、`"resolved"`、`"stale"`、`"all"`。
+- `drawio_list_annotations(file, status="pending")`：列出待处理注释。每轮第一句对话必调一次。`pending` 聚合未完成和已过时；精确筛选可用 `"open"`、`"stale"`、`"resolved"`、`"ignored"`，也可用 `"all"`。
 - `drawio_get_annotation(id)`：取注释详情并把它设为当前活动注释，含选中id、region、范围、过时标记和最新图元快照。
 - `drawio_authorize_annotation_change(id, plan, proposed_changed_ids, requested_scope, escalation_reason?)`：必须在正式写入前调用；该工具权限固定为`ask`，OpenCode先弹窗，用户批准后才返回绑定当前revision和计划ID的一次性token。请求比用户原选项更宽的范围时，`escalation_reason`必填。
-- `drawio_resolve_annotation(id, summary, changed_ids?)`：标记已解决并记录 summary；只改任务状态，不改图。
+- `drawio_resolve_annotation(id, summary, changed_ids?)`：标记已完成并记录 summary；只改任务状态，不改图。
 
 ### 处理一条注释的标准闭环
 
@@ -103,6 +103,6 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 
 一次只处理一条以避免 revision 冲突；处理完一条后回到第 1 步处理下一条。`stale` 注释表示提交后图元被改动——有时是 agent 上一次处理触发的，有时是用户手调的；不要盲 patch，先 `drawio_get_state` 看最新状态，必要时用 `since_revision` 取手动编辑 diff 弄清"谁改的、怎么改的"，再在新基线上重新核对这条注释到底要怎么落地。
 
-用户也可以在浏览器注释面板手动标记已解决；agent 看到 `resolved` 的注释跳过即可，无需再次处理。
+注释的持久化流程状态是 `open`、`resolved` 或 `ignored`；`stale` 是运行时根据当前图表和提交基线动态计算的有效状态，不写死到持久化状态中。用户可以在浏览器注释面板手动标记已完成、忽略或重新打开。agent 必须跳过 `resolved` 和 `ignored`，也不得为这两种终态申请写入授权；只有用户重新打开后才可继续处理。忽略或完成时，已有活动注释和未使用的一次性授权立即失效。
 
 诊断Bridge或实现宿主适配时读取[references/protocol.md](references/protocol.md)。需要理解基础XML模式时读取[references/xml-patterns.md](references/xml-patterns.md)；复杂绘图知识以`drawio-skill`为准。
