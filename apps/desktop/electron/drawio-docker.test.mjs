@@ -17,7 +17,7 @@ test("managed Docker reports when explicit installation is required", async () =
       calls.push([command, ...args]);
       throw new Error("missing");
     },
-    fetcher: async () => ({ ok: false }),
+    fetcher: async () => new Response(null, { status: 503 }),
   });
   const state = await manager.ensure({ install: false });
   assert.equal(state.status, "docker_required");
@@ -40,7 +40,7 @@ test("managed Docker starts an existing stopped Draw.io container", async () => 
       }
       throw new Error(`Unexpected command: ${args.join(" ")}`);
     },
-    fetcher: async () => ({ ok: editorReady }),
+    fetcher: async () => new Response(null, { status: editorReady ? 200 : 503 }),
     pollDelay: async () => {},
   });
   assert.equal((await manager.ensure()).status, "ready");
@@ -71,7 +71,7 @@ test("explicit Windows setup invokes winget before creating the container", asyn
       }
       throw new Error(`Unexpected command: ${args.join(" ")}`);
     },
-    fetcher: async () => ({ ok: editorReady }),
+    fetcher: async () => new Response(null, { status: editorReady ? 200 : 503 }),
     pollDelay: async () => {},
   });
   assert.equal((await manager.ensure({ install: true })).status, "ready");
