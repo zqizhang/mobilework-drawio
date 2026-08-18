@@ -15,7 +15,7 @@
 - 根据自然语言创建架构图、流程图、ER 图、UML、BPMN、SysML、网络拓扑和基础设施图。
 - 读取、检查、比较和增量修改压缩或非压缩的 `.drawio` 文件。
 - 使用稳定 ID 修改节点和连线，避免无关内容被整图重建。
-- 通过自托管的 `jgraph/drawio` + `jgraph/export-server` 导出 PNG、JPEG 和 PDF。
+- 通过自托管的 `jgraph/drawio` + `jgraph/export-server` 导出 PNG、JPEG、PDF 和可编辑 PNG；通过内置浏览器编辑器导出 SVG、可编辑 SVG 和 HTML。
 - 创建或修改结束后自动导出同名 PNG，并在 MobileWork / OpenWork 内置浏览器中打开。
 - 用户在浏览器保存后，将最新 XML 和 revision 作为 Agent 下一次修改的基线。
 - 用户可对选区提交按图表文件持久化的注释，并选择“只修改选区”“允许调整关联连线”“允许调整周边布局”或“允许修改整个图表”；全图范围会额外确认，Agent正式写入前仍必须通过OpenCode审批弹窗取得当前session的一次性授权。
@@ -208,7 +208,7 @@ Copy-Item `
 | `/drawio-inspect` | 读取并解释现有图表 |
 | `/drawio-patch` | 通过稳定 ID 增量修改图表 |
 | `/drawio-polish` | 自动布局、路由调整和质量门禁 |
-| `/drawio-export` | 通过 Docker 导出 PNG、JPEG 或 PDF |
+| `/drawio-export` | 导出 PNG、JPEG、PDF、可编辑PNG（Docker）；SVG、可编辑SVG、HTML（内置浏览器编辑器） |
 | `/drawio-open` | 在 MobileWork / OpenWork 内置浏览器中打开并协同编辑 |
 
 ## 会话与并发安全
@@ -283,7 +283,7 @@ mobilework-drawio/
 
 ## 能力边界
 
-- 默认导出格式为 PNG、JPEG 和 PDF，不提供 Draw.io 到 SVG 的转换。
+- 导出格式：PNG、JPEG、PDF、可编辑PNG（`xmlpng`，Docker Export Server 通道）；SVG、可编辑SVG（`xmlsvg`）、HTML（`html2`，内置浏览器编辑器页面渲染，页面未打开时工具返回 `editor_required` 与 `openUrl`，经 `browser.open_url` 打开后重试即可）。
 - 不调用 Draw.io Desktop，也不依赖 `rlespinasse/drawio-export`；推荐运行时依赖官方 Compose 中的 `jgraph/drawio` 与 `jgraph/export-server`。
 - Skills 中的数据提取、Graphviz 自动布局等高级脚本是可选能力；只有使用这些脚本时才需要 Python 或相应第三方工具。
 - Bridge 仅监听本机回环地址，文件工具只允许访问当前工作区内的相对路径。

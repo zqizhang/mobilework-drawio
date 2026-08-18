@@ -226,25 +226,27 @@ drawio_export(
 
 ### drawio_export
 
-统一导出工具，通过`format`参数选择PNG、JPEG或PDF。
+统一导出工具。`png`、`jpeg`、`pdf`、`xmlpng`（可编辑PNG，嵌入源XML）走 Docker Export Server；`svg`、`xmlsvg`（可编辑SVG）、`html2`（HTML）由内置浏览器中的 Draw.io 编辑器页面渲染，需该页面处于打开状态。
 
 **参数：**
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `input_path` | string | 是 | 本地.drawio文件路径 |
-| `format` | string | 是 | 输出格式：`png`、`jpeg`、`pdf` |
-| `output_path` | string | 否 | 输出路径；未提供时在输入文件旁自动生成 |
-| `page_id` | string | 否 | 指定导出的页面ID |
-| `all_pages` | bool | 否 | 导出所有页面（默认false） |
+| `format` | string | 是 | 输出格式：`png`、`jpeg`、`pdf`、`xmlpng`、`svg`、`xmlsvg`、`html2` |
+| `output_path` | string | 否 | 输出路径；未提供时在输入文件旁自动生成（xmlpng默认`.editable.png`，xmlsvg默认`.editable.svg`） |
+| `page_id` | string | 否 | 指定导出的页面ID（仅Docker通道格式支持） |
+| `all_pages` | bool | 否 | 导出所有页面（默认false，仅Docker通道格式支持） |
 | `scale` | float | 否 | 缩放比例（默认1） |
 | `border` | int | 否 | 边框宽度像素（默认0） |
 | `background` | string | 否 | 背景色，默认白色`#ffffff`；需要其他背景时可显式覆盖 |
-| `embed_xml` | bool | 否 | 嵌入源XML（仅部分格式支持，默认false） |
+| `embed_xml` | bool | 否 | 嵌入源XML（仅部分格式支持，默认false；xmlpng始终嵌入） |
 | `overwrite` | bool | 否 | 允许覆盖已有文件（默认false） |
 
 **预览建议：** `format="png"`，输出到`preview/`或临时目录，`overwrite=true`。
 **最终文件建议：** `overwrite=false`（默认），未经用户允许不得覆盖已有文件。
+
+**SVG/HTML导出流程（编辑器通道）：** 若编辑器页面未打开，工具返回`status="editor_required"`及`openUrl`，此时先用MobileWork内置浏览器`browser.open_url`打开`openUrl`，等待编辑器加载完成后再以相同参数重试`drawio_export`即可完成导出。`page_id`/`all_pages`对编辑器通道格式暂不支持（导出编辑器当前打开的页面）。
 
 ### drawio_validate
 
@@ -329,8 +331,8 @@ PNG导出统一调用专家提供的`drawio_export`或`drawio_finalize`工具，
 
 ### 格式不支持
 
-- `drawio_export`只支持`png`、`jpeg`、`pdf`。
-- 如需SVG，参考“当前运行时能力边界”。
+- `drawio_export`支持`png`、`jpeg`、`pdf`、`xmlpng`（Docker通道）和`svg`、`xmlsvg`、`html2`（编辑器通道，需内置浏览器编辑器页面打开）。
+- 其他格式（如vsdx、gif）上游服务不支持。
 
 ### 内置浏览器编辑
 
@@ -347,6 +349,10 @@ PNG导出统一调用专家提供的`drawio_export`或`drawio_finalize`工具，
 - ✅ PNG导出（`drawio_export`，format="png"）
 - ✅ JPEG导出（`drawio_export`，format="jpeg"）
 - ✅ PDF导出（`drawio_export`，format="pdf"）
+- ✅ 可编辑PNG导出（`drawio_export`，format="xmlpng"，Docker通道嵌入源XML）
+- ✅ SVG导出（`drawio_export`，format="svg"，编辑器通道）
+- ✅ 可编辑SVG导出（`drawio_export`，format="xmlsvg"，编辑器通道）
+- ✅ HTML导出（`drawio_export`，format="html2"，编辑器通道）
 - ✅ 服务健康检查（`drawio_health_check`）
 - ✅ deep模式实际导出验证
 
@@ -354,18 +360,16 @@ PNG导出统一调用专家提供的`drawio_export`或`drawio_finalize`工具，
 
 以下功能**尚未通过当前运行时验证**，不得宣称已迁移：
 
-- ❌ **SVG导出** —— 当前运行时不支持SVG格式。
-- ❌ **可编辑SVG**（嵌入XML的SVG） —— 依赖SVG导出。
 - ❌ **嵌入XML的可编辑PDF** —— 当前Docker后端的PDF导出可能不嵌入源XML。
 - ❌ **Mermaid→原生.drawio自动转换** —— 当前专家不提供该转换；改用原生XML、`drawio_create`或Graphviz自动布局。
 - ❌ **Draw.io ELK布局命令** —— 当前专家不提供；大型图使用`autolayout.py`的Graphviz布局。
-- ❌ **`-e`（嵌入XML）** —— 当前运行时通过`embed_xml`参数透传，但实际效果取决于后端。
+- ❌ **编辑器通道的页面选择** —— svg/xmlsvg/html2导出编辑器当前打开的页面，暂不支持`page_id`/`all_pages`。
 
 **处理原则：**
-1. 用户请求这些功能时，明确说明当前Docker后端暂不支持。
+1. 用户请求这些功能时，明确说明当前运行时暂不支持。
 2. **不得自动回退到宿主机Draw.io Desktop CLI。**
 3. 至少保留可编辑的`.drawio`源文件；任务完成时用`drawio_finalize`导出PNG并在MobileWork内置浏览器中打开。
-4. 不得调用宿主机Draw.io Desktop，也不得把不支持的SVG转换描述为已支持。
+4. 不得调用宿主机Draw.io Desktop。
 
 ### 辅助脚本导出边界
 
