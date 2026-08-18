@@ -1,5 +1,5 @@
 import { promises as fs } from "node:fs"
-import { createHash, randomBytes } from "node:crypto"
+import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { createServer, type IncomingMessage, type Server } from "node:http"
 import { createConnection } from "node:net"
 import path from "node:path"
@@ -115,6 +115,10 @@ const DEFAULT_MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 const DEFAULT_EXPORT_URL = "http://127.0.0.1:18765/ImageExport4/export"
 const DEFAULT_EXPORT_BACKGROUND = "#ffffff"
 const BRIDGE_TOKEN_TTL_MS = 12 * 60 * 60 * 1000
+// How long an editor-channel export waits for the built-in browser editor
+// page to (re)connect before answering with an editor_required response that
+// asks the agent to open the page via MobileWork's built-in browser.
+const EDITOR_EXPORT_CONNECT_GRACE_MS = 3000
 const SESSION_HISTORY_LIMIT = 20
 // User-visible persistent history settings. The in-memory `session.history`
 // window above is a short-lived per-revision conflict window; this store is a
@@ -2074,7 +2078,11 @@ async function atomicWrite(target: string, content: string, overwrite: boolean) 
   return { backup }
 }
 
-type ExportFormat = "png" | "jpeg" | "pdf"
+type ExportFormat = "png" | "jpeg" | "pdf" | "svg" | "xmlsvg" | "xmlpng" | "html2"
+
+// Formats rendered by the Draw.io editor iframe in the built-in browser (embed
+// protocol export action) instead of the Docker ImageExport4 server.
+const EDITOR_EXPORT_FORMATS = new Set<ExportFormat>(["svg", "xmlsvg", "html2"])
 
 type ExportOptions = {
   pageId?: string
@@ -2170,7 +2178,17 @@ function exportSettings() {
 }
 
 function outputExtension(format: ExportFormat): string {
-  return format === "jpeg" ? ".jpeg" : `.${format}`
+  if (format === "jpeg") return ".jpeg"
+  if (format === "xmlpng") return ".editable.png"
+  if (format === "xmlsvg") return ".editable.svg"
+  if (format === "html2") return ".html"
+  return `.${format}`
+}
+
+function allowedOutputExtensions(format: ExportFormat): string[] {
+  if (format === "xmlpng") return [".editable.png", ".png"]
+  if (format === "xmlsvg") return [".editable.svg", ".svg"]
+  return [outputExtension(format)]
 }
 
 function resolveExportOutput(
@@ -2182,7 +2200,7 @@ function resolveExportOutput(
   const workspace = resolveWorkspaceRoot(context)
   const requested = output?.trim()
     || workspaceRelative(context, input).replace(/\.(?:drawio|xml)$/i, outputExtension(format))
-  const target = resolveWorkspaceFile(context, requested, [outputExtension(format)])
+  const target = resolveWorkspaceFile(context, requested, allowedOutputExtensions(format))
   const relative = path.relative(workspace, target)
   if (!relative || path.isAbsolute(relative)) {
     throw new Error("output file must resolve inside the current workspace")
@@ -2196,16 +2214,53 @@ function validateExportBytes(content: Buffer, format: ExportFormat, contentType:
     png: ["image/png", "application/octet-stream"],
     jpeg: ["image/jpeg", "application/octet-stream"],
     pdf: ["application/pdf", "application/octet-stream"],
+    xmlpng: ["image/png", "image/jpg", "application/octet-stream"],
+    svg: ["image/svg+xml", "text/plain", "application/octet-stream"],
+    xmlsvg: ["image/svg+xml", "text/plain", "application/octet-stream"],
+    html2: ["text/html", "text/plain", "application/octet-stream"],
   }
   if (!expectedContentTypes[format].some((expected) => contentType.includes(expected))) {
     throw new Error(`export server returned unexpected Content-Type: ${contentType || "(missing)"}`)
   }
-  const valid = format === "png"
+  const valid = format === "png" || format === "xmlpng"
     ? content.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
     : format === "jpeg"
       ? content.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))
-      : content.subarray(0, 5).toString("ascii") === "%PDF-"
+      : format === "pdf"
+        ? content.subarray(0, 5).toString("ascii") === "%PDF-"
+        : true
   if (!valid) throw new Error(`export server response is not a valid ${format.toUpperCase()} file`)
+}
+
+function decodeDataUri(value: string): Buffer {
+  if (typeof value !== "string") throw new Error("editor export data must be a data URI string")
+  const match = value.match(/^data:([^;,]+)?((?:;[^,]*)*),(.*)$/s)
+  if (!match) throw new Error("editor returned an invalid data URI")
+  return match[2].split(";").includes("base64")
+    ? Buffer.from(match[3], "base64")
+    : Buffer.from(decodeURIComponent(match[3]), "utf8")
+}
+
+function validateEditorExportContent(content: Buffer, format: ExportFormat) {
+  if (content.length === 0) throw new Error("editor export returned empty content")
+  if (format !== "svg" && format !== "xmlsvg" && format !== "html2") {
+    throw new Error(`${format} is not an editor-channel export format`)
+  }
+  const head = content.subarray(0, 4096).toString("utf8")
+  if (format === "svg" || format === "xmlsvg") {
+    if (!head.includes("<svg")) throw new Error(`editor export is not valid ${format.toUpperCase()} content`)
+  } else {
+    const lowered = head.toLowerCase()
+    if (!lowered.includes("<html") && !lowered.includes("<!doctype")) {
+      throw new Error("editor export is not valid HTML content")
+    }
+  }
+}
+
+function editorExportContentType(format: ExportFormat): string {
+  if (format === "svg" || format === "xmlsvg") return "image/svg+xml"
+  if (format === "html2") return "text/html"
+  return "application/octet-stream"
 }
 
 async function requestDrawioExport(
@@ -2215,7 +2270,9 @@ async function requestDrawioExport(
 ): Promise<{ content: Buffer; contentType: string; exportUrl: string }> {
   const settings = exportSettings()
   const prepared = prepareDrawioExport(xml, options.pageId)
-  const form = new URLSearchParams({ format, xml: prepared.xml })
+  // The Docker ImageExport4 server has no "xmlpng" format; an editable PNG is
+  // a regular PNG export with the source XML embedded (embedXml=1).
+  const form = new URLSearchParams({ format: format === "xmlpng" ? "png" : format, xml: prepared.xml })
   if (prepared.pageId && !options.allPages) form.set("pageId", prepared.pageId)
   if (options.allPages) form.set("allPages", "1")
   if (options.scale !== undefined && options.scale !== 1) form.set("scale", String(options.scale))
@@ -2314,6 +2371,97 @@ async function exportDiagramToFile(options: {
     contentType: result.contentType,
     exportUrl: result.exportUrl,
   }
+}
+
+type EditorExportOutcome =
+  | {
+    status: "exported"
+    outputTarget: string
+    bytes: number
+    contentType: string
+  }
+  | {
+    status: "editor_required"
+    openUrl: string
+    tokenExpiresAt: string
+  }
+
+async function waitForEditorConnection(
+  sessionId: string,
+  file: string,
+  graceMs: number,
+): Promise<boolean> {
+  const start = Date.now()
+  while (Date.now() - start < graceMs) {
+    if (integratedEditorConnected(sessionId, file)) return true
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+  return integratedEditorConnected(sessionId, file)
+}
+
+// Exports svg/xmlsvg/html2 through the Draw.io editor iframe connected over
+// SSE. The iframe renders these formats client-side, so the built-in browser
+// editor page must be open; when it is not, the caller receives editor_required
+// with an openUrl to hand to MobileWork's built-in browser before retrying.
+async function exportDiagramViaEditor(options: {
+  context: { sessionID: string; directory: string; worktree?: string }
+  inputTarget: string
+  format: ExportFormat
+  outputPath?: string
+  overwrite: boolean
+}): Promise<EditorExportOutcome> {
+  if (!EDITOR_EXPORT_FORMATS.has(options.format)) {
+    throw new Error(`${options.format} is not an editor-channel export format`)
+  }
+  const bound = await bindIntegratedSession(options.context, options.inputTarget)
+  const outputTarget = resolveExportOutput(
+    options.context,
+    options.inputTarget,
+    options.outputPath,
+    options.format,
+  )
+  const connected = await waitForEditorConnection(
+    bound.session.sessionId,
+    options.inputTarget,
+    EDITOR_EXPORT_CONNECT_GRACE_MS,
+  )
+  if (!connected) {
+    const openUrl = new URL("/editor", `http://${bound.bridge.host}:${bound.bridge.port}`)
+    openUrl.searchParams.set("sessionId", bound.session.sessionId)
+    openUrl.searchParams.set("token", bound.token)
+    return {
+      status: "editor_required",
+      openUrl: openUrl.toString(),
+      tokenExpiresAt: new Date(Date.now() + BRIDGE_TOKEN_TTL_MS).toISOString(),
+    }
+  }
+
+  const state = getIntegratedBridgeState()
+  const requestId = `export_${randomUUID()}`
+  const timeoutMs = exportSettings().timeoutMs
+  return await new Promise<EditorExportOutcome>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      state.pendingEditorExports.delete(requestId)
+      reject(new Error(
+        `editor export timed out after ${Math.round(timeoutMs / 1000)}s; make sure the built-in browser editor page is open and responsive, then retry`,
+      ))
+    }, timeoutMs)
+    state.pendingEditorExports.set(requestId, {
+      requestId,
+      sessionId: bound.session.sessionId,
+      diagramKey: integratedDiagramKey(bound.session.file),
+      format: options.format,
+      outputTarget,
+      overwrite: options.overwrite,
+      resolve: (result) => resolve({ status: "exported", ...result }),
+      reject,
+      timer,
+    })
+    broadcastEditorCommand(
+      bound.session,
+      { action: "export", requestId, format: options.format },
+    )
+  })
 }
 
 async function checkExportConnectivity(): Promise<{ reachable: boolean; error?: string }> {
@@ -2855,6 +3003,18 @@ type AnnotationEffectiveState = {
   staleReason?: string
 }
 
+type PendingEditorExport = {
+  requestId: string
+  sessionId: string
+  diagramKey: string
+  format: ExportFormat
+  outputTarget: string
+  overwrite: boolean
+  resolve: (result: { outputTarget: string; bytes: number; contentType: string }) => void
+  reject: (error: Error) => void
+  timer: ReturnType<typeof setTimeout>
+}
+
 type IntegratedBridgeState = {
   server: Server | null
   startPromise: Promise<{ host: string; port: number }> | null
@@ -2866,6 +3026,7 @@ type IntegratedBridgeState = {
     response: import("node:http").ServerResponse
     diagramKey: string
   }>>
+  pendingEditorExports: Map<string, PendingEditorExport>
   writeQueues: Map<string, Promise<unknown>>
   annotationWriteQueues: Map<string, Promise<unknown>>
   annotationsByDiagram: Map<string, Map<string, AnnotationTask>>
@@ -2890,6 +3051,7 @@ function getIntegratedBridgeState(): IntegratedBridgeState {
       sessions: new Map(),
       tokens: new Map(),
       eventClients: new Map(),
+      pendingEditorExports: new Map(),
       writeQueues: new Map(),
       annotationWriteQueues: new Map(),
       annotationsByDiagram: new Map(),
@@ -2901,6 +3063,7 @@ function getIntegratedBridgeState(): IntegratedBridgeState {
     }
   }
   integratedBridgeGlobal.__drawioIntegratedBridge.writeQueues ||= new Map()
+  integratedBridgeGlobal.__drawioIntegratedBridge.pendingEditorExports ||= new Map()
   integratedBridgeGlobal.__drawioIntegratedBridge.annotationWriteQueues ||= new Map()
   integratedBridgeGlobal.__drawioIntegratedBridge.annotationsByDiagram ||= new Map()
   integratedBridgeGlobal.__drawioIntegratedBridge.historyWriteQueues ||= new Map()
@@ -3203,6 +3366,17 @@ function integratedEditorConnected(sessionId: string, file: string): boolean {
   const diagramKey = integratedDiagramKey(file)
   return [...(getIntegratedBridgeState().eventClients.get(sessionId) || [])]
     .some((client) => client.diagramKey === diagramKey)
+}
+
+// Sends an editor-command SSE frame to exactly one connected editor page for
+// the given diagram. With multiple tabs open on the same file, only the first
+// connected page performs the command, avoiding duplicate exports.
+function broadcastEditorCommand(session: IntegratedSession, payload: Record<string, unknown>) {
+  const frame = `event: editor-command\ndata: ${JSON.stringify(payload)}\n\n`
+  const diagramKey = integratedDiagramKey(session.file)
+  const client = [...(getIntegratedBridgeState().eventClients.get(session.sessionId) || [])]
+    .find((candidate) => candidate.diagramKey === diagramKey)
+  client?.response.write(frame)
 }
 
 // ---------------------------------------------------------------------------
@@ -4596,6 +4770,9 @@ function buildIntegratedEditorPage(options: {
   const historyUrl = new URL("/api/history", options.bridgeUrl)
   historyUrl.searchParams.set("sessionId", options.session.sessionId)
   historyUrl.searchParams.set("token", options.token)
+  const editorExportUrl = new URL("/api/editor-export", options.bridgeUrl)
+  editorExportUrl.searchParams.set("sessionId", options.session.sessionId)
+  editorExportUrl.searchParams.set("token", options.token)
   const config = safeScriptJson({
     file: path.relative(options.session.workspace, options.session.file).split(path.sep).join("/"),
     drawioUrl: options.editorUrl.toString(),
@@ -4604,6 +4781,7 @@ function buildIntegratedEditorPage(options: {
     eventsUrl: eventsUrl.toString(),
     annotationsUrl: annotationsUrl.toString(),
     historyUrl: historyUrl.toString(),
+    editorExportUrl: editorExportUrl.toString(),
   })
 
 return `<!doctype html>
@@ -4991,6 +5169,8 @@ return `<!doctype html>
       let lastEditorXml = null;
       let saveChain = Promise.resolve();
       let externalTimer = null;
+      let editorReady = false;
+      let pendingExport = null; // { format, requestId } file export requested via SSE editor-command
       let pendingSelection = null;
       let awaitingSelection = false;
       let editorMode = "editing"; // editing | restoring | loading-restored-xml | conflict
@@ -5038,6 +5218,64 @@ return `<!doctype html>
 
       function sendEditor(payload) {
         editor.contentWindow?.postMessage(JSON.stringify(payload), CONFIG.drawioOrigin);
+      }
+
+      function dispatchExport() {
+        if (!editorReady || !pendingExport) return;
+        const active = pendingExport;
+        sendEditor({
+          action: "export",
+          format: active.format,
+          currentPage: true,
+          allPages: false,
+          message: { requestId: active.requestId },
+        });
+      }
+
+      async function reportEditorExportError(requestId, message) {
+        try {
+          await fetch(CONFIG.editorExportUrl, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ requestId, error: String(message || "export failed") }),
+          });
+        } catch { /* 上报失败时仅保留页面提示 */ }
+      }
+
+      async function saveExport(message) {
+        const active = pendingExport;
+        pendingExport = null;
+        try {
+          if (typeof message.data !== "string" || !message.data) {
+            throw new Error("Draw.io 未返回导出数据");
+          }
+          const response = await fetch(CONFIG.editorExportUrl, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              requestId: active.requestId,
+              format: active.format,
+              data: message.data,
+            }),
+          });
+          const result = await response.json().catch(() => ({}));
+          if (!response.ok || !result.ok) throw new Error(result.error || "导出结果保存失败");
+          showStatus("已导出 " + result.outputPath + "（" + result.bytes + " 字节）", 6000);
+        } catch (error) {
+          showStatus(error.message || "导出失败", 6000);
+          void reportEditorExportError(active.requestId, error.message);
+        }
+      }
+
+      function requestEditorExport(command) {
+        if (pendingExport) {
+          showStatus("已有一次导出正在进行，请稍候", 3000);
+          void reportEditorExportError(command.requestId, "another export is already running on this page");
+          return;
+        }
+        pendingExport = { format: command.format, requestId: command.requestId };
+        showStatus((editorReady ? "正在导出 " : "等待编辑器就绪后导出 ") + command.format + "…", 10000);
+        dispatchExport();
       }
 
       async function readLatest() {
@@ -6000,14 +6238,18 @@ return `<!doctype html>
           sendEditor({ action: "configure", config: { autosaveDelay: 250, preserveViewState: true } });
         } else if (message.event === "init") {
           try {
+            editorReady = true;
             current = await readLatest();
             canvasRevision = current.revision;
             lastEditorXml = current.xml;
             sendEditor({ action: "load", xml: current.xml, autosave: 1, diffSync: true, title: CONFIG.file });
             void refreshAnnotations();
+            if (pendingExport) setTimeout(dispatchExport, 250);
           } catch (error) { showStatus(error.message || "读取失败", 5000); }
         } else if (message.event === "export" && message.format === "json" && awaitingSelection) {
           applySelectionExport(message.data);
+        } else if (message.event === "export" && message.format !== "json" && pendingExport) {
+          void saveExport(message);
         } else if (message.event === "load" && typeof message.xml === "string") {
           lastEditorXml = message.xml;
           // Draw.io acknowledges action:"load" with event:"load". Only the
@@ -6058,6 +6300,12 @@ return `<!doctype html>
         }
       });
       events.onerror = () => showStatus("正在重连图表同步服务…", 5000);
+      events.addEventListener("editor-command", event => {
+        const command = JSON.parse(event.data);
+        if (command.action === "export" && command.requestId && command.format) {
+          requestEditorExport(command);
+        }
+      });
     })();
   </script>
 </body>
@@ -6574,6 +6822,75 @@ async function handleIntegratedBridgeRequest(
     return
   }
 
+  if (request.method === "POST" && requestUrl.pathname === "/api/editor-export") {
+    let body: Record<string, unknown>
+    try {
+      body = await integratedRequestJson(request)
+    } catch (error) {
+      integratedJsonResponse(response, 400, { ok: false, error: (error as Error).message })
+      return
+    }
+    const requestId = typeof body.requestId === "string" ? body.requestId : ""
+    const pending = requestId ? state.pendingEditorExports.get(requestId) : undefined
+    if (
+      !pending
+      || pending.sessionId !== session.sessionId
+      || pending.diagramKey !== integratedDiagramKey(session.file)
+    ) {
+      integratedJsonResponse(response, 404, { ok: false, error: "unknown editor export request" })
+      return
+    }
+    const fail = (message: string) => {
+      clearTimeout(pending.timer)
+      state.pendingEditorExports.delete(requestId)
+      pending.reject(new Error(message))
+    }
+    if (typeof body.error === "string" && body.error) {
+      fail(`editor export failed: ${body.error}`)
+      integratedJsonResponse(response, 200, { ok: false, error: body.error })
+      return
+    }
+    if (typeof body.data !== "string" || !body.data) {
+      fail("editor export returned no data")
+      integratedJsonResponse(response, 400, { ok: false, error: "editor export data must be a non-empty data URI" })
+      return
+    }
+    let content: Buffer
+    try {
+      content = decodeDataUri(body.data)
+    } catch (error) {
+      fail((error as Error).message)
+      integratedJsonResponse(response, 400, { ok: false, error: (error as Error).message })
+      return
+    }
+    try {
+      if (content.length === 0 || content.length > MAX_FILE_BYTES) {
+        throw new Error("editor export size is out of range")
+      }
+      validateEditorExportContent(content, pending.format)
+      await atomicWriteBinary(pending.outputTarget, content, pending.overwrite)
+    } catch (error) {
+      fail((error as Error).message)
+      integratedJsonResponse(response, 400, { ok: false, error: (error as Error).message })
+      return
+    }
+    clearTimeout(pending.timer)
+    state.pendingEditorExports.delete(requestId)
+    const result = {
+      outputTarget: pending.outputTarget,
+      bytes: content.length,
+      contentType: editorExportContentType(pending.format),
+    }
+    pending.resolve(result)
+    integratedJsonResponse(response, 200, {
+      ok: true,
+      format: pending.format,
+      outputPath: path.relative(session.workspace, pending.outputTarget).split(path.sep).join("/"),
+      bytes: result.bytes,
+    })
+    return
+  }
+
   integratedJsonResponse(response, 404, { ok: false, error: "not found" })
 }
 
@@ -6801,10 +7118,10 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
 
     drawio_export: tool({
       description:
-        "Export a workspace Draw.io file to PNG, JPEG, or PDF through the configured Docker HTTP Export Server.",
+        "Export a workspace Draw.io file. PNG, JPEG, PDF, and editable PNG (xmlpng) go through the configured Docker HTTP Export Server; SVG, editable SVG (xmlsvg), and HTML (html2) are rendered by the Draw.io editor page in the built-in browser and require that page to be open — when it is not, the tool returns editor_required with an openUrl to open via browser.open_url before retrying.",
       args: {
         input_path: tool.schema.string().describe("Workspace-relative .drawio or .xml input file"),
-        format: tool.schema.enum(["png", "jpeg", "pdf"]),
+        format: tool.schema.enum(["png", "jpeg", "pdf", "xmlpng", "svg", "xmlsvg", "html2"]),
         output_path: tool.schema.string().optional().describe("Workspace-relative output path"),
         page_id: tool.schema.string().optional(),
         all_pages: tool.schema.boolean().default(false),
@@ -6821,11 +7138,51 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         const inputTarget = resolveWorkspacePath(context, args.input_path)
         const session = integratedSessionFor(context, inputTarget)
         const xml = session ? (await refreshIntegratedSession(session)).xml : await readDiagramFile(inputTarget)
-        const pages = parseDrawio(xml)
-        const report = validationReport(pages)
+        const report = validationReport(parseDrawio(xml))
         if (!report.valid) {
           throw new Error(`refusing to export invalid Draw.io XML: ${JSON.stringify(report.errors)}`)
         }
+
+        if (EDITOR_EXPORT_FORMATS.has(args.format)) {
+          if (args.page_id) {
+            throw new Error(
+              `page_id is not supported for ${args.format} exports yet; the editor exports the page currently open in the editor`,
+            )
+          }
+          if (args.all_pages) {
+            throw new Error(`all_pages is not supported for ${args.format} exports yet`)
+          }
+          const outcome = await exportDiagramViaEditor({
+            context,
+            inputTarget,
+            format: args.format,
+            outputPath: args.output_path,
+            overwrite: args.overwrite,
+          })
+          if (outcome.status === "editor_required") {
+            return JSON.stringify({
+              status: "editor_required",
+              message:
+                "SVG and HTML exports are rendered by the Draw.io editor page in the built-in browser, which is currently not connected for this diagram.",
+              input_path: workspaceRelative(context, inputTarget).split(path.sep).join("/"),
+              format: args.format,
+              openUrl: outcome.openUrl,
+              browserAction:
+                "Call MobileWork's built-in browser.open_url with openUrl now, wait for the editor page to finish loading, then call drawio_export again with identical arguments to complete the export.",
+              tokenExpiresAt: outcome.tokenExpiresAt,
+            }, null, 2)
+          }
+          return JSON.stringify({
+            success: true,
+            channel: "editor",
+            input_path: workspaceRelative(context, inputTarget).split(path.sep).join("/"),
+            output_path: workspaceRelative(context, outcome.outputTarget).split(path.sep).join("/"),
+            format: args.format,
+            file_size_bytes: outcome.bytes,
+            content_type: outcome.contentType,
+          }, null, 2)
+        }
+
         const exported = await exportDiagramToFile({
           context,
           inputTarget,
@@ -6837,13 +7194,14 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           scale: args.scale,
           border: args.border,
           background: args.background,
-          embedXml: args.embed_xml,
+          embedXml: args.format === "xmlpng" || args.embed_xml,
           overwrite: args.overwrite,
         })
         return JSON.stringify({
           success: true,
-          input_path: workspaceRelative(context, inputTarget),
-          output_path: workspaceRelative(context, exported.outputTarget),
+          channel: "docker",
+          input_path: workspaceRelative(context, inputTarget).split(path.sep).join("/"),
+          output_path: workspaceRelative(context, exported.outputTarget).split(path.sep).join("/"),
           format: args.format,
           file_size_bytes: exported.bytes,
           content_type: exported.contentType,
@@ -6866,7 +7224,11 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
             runtime: { status: "ok", implementation: "opencode-typescript-plugin" },
             workspace: { root: resolveWorkspaceRoot(context) },
             export_server: { url: settings.url.toString(), ...connectivity },
-            supported_formats: ["jpeg", "pdf", "png"],
+            supported_formats: ["html2", "jpeg", "pdf", "png", "svg", "xmlpng", "xmlsvg"],
+            export_channels: {
+              docker_export_server: ["jpeg", "pdf", "png", "xmlpng"],
+              builtin_browser_editor: ["html2", "svg", "xmlsvg"],
+            },
             configuration: {
               timeout_seconds: settings.timeoutMs / 1000,
               max_input_size_mb: MAX_FILE_BYTES / 1024 / 1024,
