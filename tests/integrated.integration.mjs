@@ -25,6 +25,7 @@ const PNG = Buffer.concat([
   Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
   Buffer.alloc(128, 1),
 ])
+const exportRequests = []
 const exportServer = createServer(async (request, response) => {
   if (request.method !== "POST" || request.url !== "/ImageExport4/export") {
     response.writeHead(404).end()
@@ -37,6 +38,10 @@ const exportServer = createServer(async (request, response) => {
   assert.equal(form.get("format"), "png")
   assert.equal(typeof form.get("xml"), "string")
   assert.equal(form.get("bg"), "#ffffff")
+  exportRequests.push({
+    xml: form.get("xml"),
+    pageId: form.get("pageId"),
+  })
   response.writeHead(200, { "content-type": "image/png" })
   response.end(PNG)
 })
@@ -1188,6 +1193,74 @@ try {
   assert.equal(reopenedRead.status, 200)
   await originalEventsResponse.body.cancel()
 
+  const unicodeContext = {
+    ...context,
+    sessionID: "unicode-export-session",
+    messageID: "unicode-export-message",
+  }
+  await plugin.tool.drawio_create.execute({
+    file: "unicode-created.drawio",
+    title: "中文系统架构图",
+    nodes: [{ id: "node", label: "服务", kind: "service" }],
+    edges: [],
+    direction: "left-to-right",
+    compressed: false,
+    overwrite: false,
+  }, unicodeContext)
+  const unicodeCreatedXml = await fs.readFile(path.join(workspace, "unicode-created.drawio"), "utf8")
+  assert.match(unicodeCreatedXml, /<diagram id="[\x20-\x7e]+" name="中文系统架构图">/)
+
+  const unicodePageXml = XML.replace('id="p1" name="Page-1"', 'id="中文页面" name="中文页面"')
+  await fs.writeFile(path.join(workspace, "unicode-existing.drawio"), unicodePageXml, "utf8")
+  const finalizeRequestStart = exportRequests.length
+  const unicodeFinalized = JSON.parse(await plugin.tool.drawio_finalize.execute({
+    file: "unicode-existing.drawio",
+    threshold: 0,
+    scale: 1,
+    border: 0,
+  }, unicodeContext))
+  assert.equal(unicodeFinalized.ok, true)
+  const unicodeFinalizeRequests = exportRequests.slice(finalizeRequestStart)
+    .filter((request) => request.xml.includes('name="中文页面"'))
+  assert.ok(unicodeFinalizeRequests.length >= 1)
+  for (const request of unicodeFinalizeRequests) {
+    assert.doesNotMatch(request.xml, /<diagram id="中文页面"/)
+    assert.match(request.xml, /<diagram id="[\x20-\x7e]+" name="中文页面">/)
+  }
+  assert.equal(await fs.readFile(path.join(workspace, "unicode-existing.drawio"), "utf8"), unicodePageXml)
+
+  await plugin.tool.drawio_export.execute({
+    input_path: "unicode-existing.drawio",
+    output_path: "unicode-selected.png",
+    format: "png",
+    page_id: "中文页面",
+    all_pages: false,
+    scale: 1,
+    border: 0,
+    background: "#ffffff",
+    embed_xml: false,
+    overwrite: false,
+  }, unicodeContext)
+  const unicodeSelectedRequest = exportRequests.at(-1)
+  assert.notEqual(unicodeSelectedRequest.pageId, "中文页面")
+  assert.match(unicodeSelectedRequest.pageId, /^[\x20-\x7e]+$/)
+  assert.match(unicodeSelectedRequest.xml, new RegExp(`<diagram id="${unicodeSelectedRequest.pageId}" name="中文页面">`))
+  await assert.rejects(
+    plugin.tool.drawio_export.execute({
+      input_path: "unicode-existing.drawio",
+      output_path: "unicode-missing.png",
+      format: "png",
+      page_id: "不存在的页面",
+      all_pages: false,
+      scale: 1,
+      border: 0,
+      background: "#ffffff",
+      embed_xml: false,
+      overwrite: false,
+    }, unicodeContext),
+    /requested page ID "不存在的页面" was not found/,
+  )
+
   console.log(JSON.stringify({
     ok: true,
     openUrl: true,
@@ -1223,6 +1296,7 @@ try {
     annotationSessionBoundApproval: true,
     annotationDiagramWidePolish: true,
     annotationPreWriteApproval: true,
+    unicodePageIdExport: true,
   }, null, 2))
 } finally {
   const bridge = globalThis.__drawioIntegratedBridge

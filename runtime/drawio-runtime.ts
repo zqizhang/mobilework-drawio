@@ -167,10 +167,13 @@ function xmlEscape(value: string): string {
 function slug(value: string): string {
   const normalized = value
     .normalize("NFKD")
-    .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^A-Za-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .toLowerCase()
-  return normalized || "diagram"
+  if (/^[\x00-\x7f]*$/.test(value) && normalized) return normalized
+  const digest = createHash("sha256").update(value).digest("hex").slice(0, 12)
+  return `${normalized || "diagram"}-${digest}`
 }
 
 type WorkspaceContext = {
@@ -2082,6 +2085,65 @@ type ExportOptions = {
   embedXml?: boolean
 }
 
+const EXPORT_SAFE_PAGE_ID = /^[A-Za-z0-9._:-]{1,120}$/
+
+function exportPageIdAlias(pageId: string, index: number, used: Set<string>): string {
+  const digest = createHash("sha256").update(pageId).digest("hex").slice(0, 12)
+  const base = `export-page-${index + 1}-${digest}`
+  let alias = base
+  let suffix = 2
+  while (used.has(alias)) {
+    alias = `${base}-${suffix}`
+    suffix += 1
+  }
+  used.add(alias)
+  return alias
+}
+
+function prepareDrawioExport(
+  xml: string,
+  requestedPageId?: string,
+): { xml: string; pageId: string | undefined } {
+  const document = parser.parse(xml) as Record<string, unknown>
+  const mxfile = document.mxfile as Record<string, unknown> | undefined
+  if (!mxfile) return { xml, pageId: requestedPageId }
+
+  const diagrams = asArray(
+    mxfile.diagram as Record<string, unknown> | Record<string, unknown>[] | undefined,
+  )
+  const used = new Set(
+    diagrams
+      .map((diagram) => attribute(diagram["@_id"]))
+      .filter((pageId): pageId is string => Boolean(pageId) && EXPORT_SAFE_PAGE_ID.test(pageId)),
+  )
+  const aliases = new Map<string, string>()
+  let changed = false
+
+  diagrams.forEach((diagram, index) => {
+    const pageId = attribute(diagram["@_id"])
+    if (!pageId || EXPORT_SAFE_PAGE_ID.test(pageId)) return
+    const alias = exportPageIdAlias(pageId, index, used)
+    diagram["@_id"] = alias
+    if (!aliases.has(pageId)) aliases.set(pageId, alias)
+    changed = true
+  })
+
+  let pageId = requestedPageId
+  if (requestedPageId && !EXPORT_SAFE_PAGE_ID.test(requestedPageId)) {
+    pageId = aliases.get(requestedPageId)
+    if (!pageId) {
+      throw new Error(
+        `requested page ID ${JSON.stringify(requestedPageId)} was not found in the Draw.io document`,
+      )
+    }
+  }
+
+  return {
+    xml: changed ? builder.build(document) : xml,
+    pageId,
+  }
+}
+
 function positiveEnvironmentNumber(name: string, fallback: number): number {
   const raw = process.env[name]?.trim()
   if (!raw) return fallback
@@ -2152,8 +2214,9 @@ async function requestDrawioExport(
   options: ExportOptions = {},
 ): Promise<{ content: Buffer; contentType: string; exportUrl: string }> {
   const settings = exportSettings()
-  const form = new URLSearchParams({ format, xml })
-  if (options.pageId && !options.allPages) form.set("pageId", options.pageId)
+  const prepared = prepareDrawioExport(xml, options.pageId)
+  const form = new URLSearchParams({ format, xml: prepared.xml })
+  if (prepared.pageId && !options.allPages) form.set("pageId", prepared.pageId)
   if (options.allPages) form.set("allPages", "1")
   if (options.scale !== undefined && options.scale !== 1) form.set("scale", String(options.scale))
   if (options.border !== undefined && options.border !== 0) form.set("border", String(options.border))
@@ -2173,12 +2236,24 @@ async function requestDrawioExport(
     throw new Error(`cannot reach Draw.io Export Server at ${settings.url}: ${(error as Error).message}`)
   }
   if (!response.ok) {
-    const detail = (await response.text()).trim().slice(0, 500)
+    let detail = ""
+    try {
+      detail = (await response.text()).trim().slice(0, 500)
+    } catch (error) {
+      detail = `response body unavailable: ${(error as Error).message}`
+    }
     throw new Error(
       `Draw.io Export Server returned HTTP ${response.status}${detail ? `: ${detail}` : ""}`,
     )
   }
-  const content = Buffer.from(await response.arrayBuffer())
+  let content: Buffer
+  try {
+    content = Buffer.from(await response.arrayBuffer())
+  } catch (error) {
+    throw new Error(
+      `Draw.io Export Server closed the HTTP ${response.status} response before the export completed: ${(error as Error).message}`,
+    )
+  }
   if (content.length > settings.maxOutputBytes) {
     throw new Error(`export result exceeds ${Math.floor(settings.maxOutputBytes / 1024 / 1024)} MB`)
   }
