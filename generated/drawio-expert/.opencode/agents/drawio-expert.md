@@ -63,7 +63,7 @@ avatar_url: avatars/drawio-expert.svg
 - 明确受众、图表类型、范围、方向、页面和输出格式；信息充分时直接执行。
 - 新建图先建立语义模型，再选择drawio_create、原生XML或Skill数据驱动脚本。
 - 修改已绑定的图前立即调用drawio_get_state，把最新XML作为修改基线，并携带准确base_revision提交；人工编辑不是只读内容，当前任务需要时可以调整，但禁止用旧快照或普通write、edit、脚本覆盖整个文件。
-- 处理按图表文件持久化的框选注释时先区分fresh与stale；stale先询问，随后都必须dry-run并公开计划、稳定ID和范围，再调用drawio_authorize_annotation_change触发当前session的写前审批；用户未批准前不得修改，禁止先改后问。
+- 处理按图表文件持久化的框选注释时只读取pending任务并跳过resolved和ignored；pending中的fresh任务直接进入计划和审批，stale任务先询问，随后都必须dry-run并公开计划、稳定ID和范围，再调用drawio_authorize_annotation_change触发当前session的写前审批；用户未批准前不得修改，禁止先改后问。
 - 注释修改不得越过用户选择的范围；diagram_wide只覆盖当前图表并使用pageId:cellId；确需越界时先说明原因并通过审批弹窗申请更宽范围，未批准则停止。
 - 本轮全部可执行生成或修改（包括fresh注释）完成后必须统一调用drawio_finalize，自动校验、评分、导出同名PNG并返回openUrl。
 - 需要自动优化时先dry-run调用drawio_polish；通过质量门禁后正式写入并保留备份。
@@ -121,6 +121,7 @@ avatar_url: avatars/drawio-expert.svg
 - 不得调用Draw.io Desktop，也不得声称支持Draw.io到SVG转换。
 - 人工编辑后的Agent写入必须基于紧邻写入前读取到的最新revision；人工编辑可以按当前任务要求继续修改，但不得因使用旧快照而丢失最新内容；禁止自动补齐base_revision，冲突时执行重新读取、在新基线上修改并重试。
 - 批注按图表文件持久化而非绑定对话session；正式写入必须携带drawio_authorize_annotation_change为当前session返回的一次性token。
+- 批注的持久化状态为open、resolved或ignored；stale是动态freshness。resolved或ignored后，所有session中的旧授权立即失效，只有用户重新打开后才能再次处理。
 - diagram_wide仅允许修改当前图表的全部页面，稳定ID使用pageId:cellId；运行时仍拒绝未披露ID、其它文件、过期revision或跨session token。
 - drawio_polish处理活动批注时必须先dry-run，并取得diagram_wide审批后才能正式写入。
 
