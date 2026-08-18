@@ -30,7 +30,7 @@ try {
 
   await plugin.tool.drawio_create.execute({
     file: "docker-export.drawio",
-    title: "Docker Export Integration",
+    title: "Docker 中文导出集成",
     nodes: [
       { id: "client", label: "MobileWork", kind: "application" },
       { id: "export", label: "Docker Export Server", kind: "service" },
@@ -40,6 +40,8 @@ try {
     compressed: false,
     overwrite: false,
   }, context)
+  const createdXml = await fs.readFile(path.join(workspace, "docker-export.drawio"), "utf8")
+  assert.match(createdXml, /<diagram id="[\x20-\x7e]+" name="Docker 中文导出集成">/)
 
   const finalized = JSON.parse(await plugin.tool.drawio_finalize.execute({
     file: "docker-export.drawio",
@@ -58,6 +60,23 @@ try {
   )
   assert.equal(png[25], 2, "default PNG export should be opaque truecolor, not transparent RGBA")
 
+  const unicodePageXml = createdXml.replace(/<diagram id="[^"]+"/, '<diagram id="中文页面"')
+  await fs.writeFile(path.join(workspace, "docker-export-unicode.drawio"), unicodePageXml, "utf8")
+  const unicodeFinalized = JSON.parse(await plugin.tool.drawio_finalize.execute({
+    file: "docker-export-unicode.drawio",
+    threshold: 0,
+    scale: 1,
+    border: 8,
+  }, context))
+  assert.equal(unicodeFinalized.ok, true)
+  assert.equal(
+    await fs.readFile(path.join(workspace, "docker-export-unicode.drawio"), "utf8"),
+    unicodePageXml,
+    "export compatibility mapping must not rewrite the source diagram",
+  )
+  const unicodePng = await fs.readFile(path.join(workspace, "docker-export-unicode.png"))
+  assert.equal(unicodePng.subarray(0, 8).equals(png.subarray(0, 8)), true)
+
   console.log(JSON.stringify({
     ok: true,
     implementation: "typescript-plugin",
@@ -65,6 +84,7 @@ try {
     automaticPng: true,
     openUrl: true,
     pngBytes: finalized.png.file_size_bytes,
+    unicodePageIdExport: true,
   }, null, 2))
 } finally {
   const bridge = globalThis.__drawioIntegratedBridge
