@@ -83,15 +83,18 @@ not the conversation session. Scope is `selection_only`, `selection_and_edges`,
 current file and uses `pageId:cellId` allowlist entries.
 
 ```http
-GET /api/annotations?sessionId=...&status=open
+GET /api/annotations?sessionId=...&status=pending
 ```
 
-Returns `{ ok, file, count, annotations: [...] }`. `status` may be
-`open` (all unfinished tasks, including stale ones), `resolved`, `stale`
-(unfinished tasks whose selected cells changed) or `all`. Annotation payloads
-keep lifecycle `status` as `open`/`resolved` and expose `freshness` as
-`fresh`/`stale`; stale open tasks also set `requiresConfirmation=true` and must
-be confirmed by the user before execution.
+Returns `{ ok, file, status, count, counts, annotations: [...] }`. `status` may
+be `pending` (default), `open` (a backwards-compatible alias for pending),
+`fresh`, `stale`, `resolved`, `ignored` or `all`. Stored workflow status is
+`open`, `resolved` or `ignored`; `stale` is an effective status derived from the
+latest diagram and the annotation's base cell hashes. Annotation payloads keep
+lifecycle `status`, expose `effectiveStatus` and `freshness`, and set
+`requiresConfirmation=true` for stale open tasks. The sidecar uses schema
+version 3; persisted schema-v2 `stale` entries migrate to `open` and are
+re-evaluated when loaded.
 
 ```http
 POST /api/annotations?sessionId=...
@@ -127,12 +130,14 @@ Content-Type: application/json
 { "status": "resolved", "summary": "改名并新增连线", "changedIds": ["node", "edge-2"] }
 ```
 
-`PATCH` accepts `status` of `resolved`, `open` (reopen) or legacy `stale`.
-Regardless of stored legacy state, API payloads expose stale unfinished tasks as
-`status=open, freshness=stale`. Resolving
-records `summary`, `changedIds`, `revision` and `updatedAt` in `result` without
-modifying the diagram — diagram changes go through the revision protocol above.
-Both Agent tools (`drawio_resolve_annotation`) and the wrapper UI can resolve.
+`PATCH` accepts `status` of `resolved`, `ignored` or `open` (reopen); `stale` is
+not writable. Resolving records `summary`, `changedIds`, `revision` and
+`updatedAt` in `result`; ignoring records `ignoredAt` and `ignoredReason`.
+Neither action modifies the diagram — diagram changes go through the revision
+protocol above. Resolving or ignoring also clears active annotation state and
+unused approval tokens across every session bound to the diagram. The wrapper
+UI can resolve, ignore and reopen; the Agent resolves through
+`drawio_resolve_annotation`.
 
 ## Version history
 

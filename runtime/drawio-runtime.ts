@@ -2733,6 +2733,10 @@ type AnnotationResult = {
 } | null
 
 type AnnotationScope = "selection_only" | "selection_and_edges" | "surrounding_layout" | "diagram_wide"
+type AnnotationWorkflowStatus = "open" | "resolved" | "ignored"
+type AnnotationFreshness = "fresh" | "stale"
+type AnnotationEffectiveStatus = AnnotationWorkflowStatus | "stale"
+type AnnotationStatusFilter = AnnotationWorkflowStatus | "pending" | "fresh" | "stale" | "all"
 
 type AnnotationAuthorization = {
   token: string
@@ -2756,7 +2760,7 @@ type AnnotationTask = {
   region: AnnotationRegion | null
   instruction: string
   scope: AnnotationScope
-  status: "open" | "resolved" | "stale"
+  status: AnnotationWorkflowStatus
   baseRevision: number
   baseFileHash: string
   baseCellHashes: Record<string, string>
@@ -2764,11 +2768,14 @@ type AnnotationTask = {
   createdAt: string
   updatedAt: string
   resolvedAt: string | null
+  ignoredAt: string | null
+  ignoredReason: string | null
 }
 
 type AnnotationEffectiveState = {
-  status: "open" | "resolved"
-  freshness: "fresh" | "stale"
+  status: AnnotationWorkflowStatus
+  effectiveStatus: AnnotationEffectiveStatus
+  freshness: AnnotationFreshness
   requiresConfirmation: boolean
   staleReason?: string
 }
@@ -3891,9 +3898,11 @@ async function persistStoredAnnotations(session: IntegratedSession): Promise<voi
       createdAt: task.createdAt,
       updatedAt: task.updatedAt,
       resolvedAt: task.resolvedAt,
+      ignoredAt: task.ignoredAt,
+      ignoredReason: task.ignoredReason,
     }))
     const store = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
       annotations,
     }
@@ -3932,7 +3941,11 @@ function normalizeAnnotationTask(value: Record<string, unknown>, session: Integr
       height: Number(value.region.height),
     }
     : null
-  const status = value.status === "resolved" || value.status === "stale" ? value.status : "open"
+  // Schema v2 allowed a persisted "stale" status. Staleness is now derived
+  // from the latest diagram, so legacy stale tasks migrate back to open.
+  const status: AnnotationWorkflowStatus = value.status === "resolved" || value.status === "ignored"
+    ? value.status
+    : "open"
   return {
     id: String(value.id),
     file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
@@ -3963,6 +3976,8 @@ function normalizeAnnotationTask(value: Record<string, unknown>, session: Integr
     createdAt: typeof value.createdAt === "string" ? String(value.createdAt) : new Date().toISOString(),
     updatedAt: typeof value.updatedAt === "string" ? String(value.updatedAt) : new Date().toISOString(),
     resolvedAt: typeof value.resolvedAt === "string" ? String(value.resolvedAt) : null,
+    ignoredAt: typeof value.ignoredAt === "string" ? String(value.ignoredAt) : null,
+    ignoredReason: typeof value.ignoredReason === "string" ? String(value.ignoredReason) : null,
   }
 }
 
@@ -4139,7 +4154,7 @@ function activeAnnotationTask(session: IntegratedSession): AnnotationTask | null
   const id = session.activeAnnotationId
   if (!id) return null
   const task = getDiagramAnnotations(session).get(id)
-  if (!task || task.status === "resolved") {
+  if (!task || task.status !== "open") {
     session.annotationAuthorizations.delete(id)
     session.activeAnnotationId = null
     return null
@@ -4309,7 +4324,7 @@ function annotationStaleState(
   session: IntegratedSession,
   task: AnnotationTask,
 ): { stale: boolean; reason?: string } {
-  if (task.status === "resolved") return { stale: false }
+  if (task.status !== "open") return { stale: false }
   if (task.baseFileHash && task.baseFileHash === session.fileHash) return { stale: false }
   if (!task.baseFileHash && task.baseRevision >= session.revision) return { stale: false }
   if (task.cells.length === 0) return { stale: false }
@@ -4362,26 +4377,57 @@ function annotationEffectiveState(
   session: IntegratedSession,
   task: AnnotationTask,
 ): AnnotationEffectiveState {
-  const lifecycleStatus = task.status === "resolved" ? "resolved" : "open"
+  if (task.status !== "open") {
+    return {
+      status: task.status,
+      effectiveStatus: task.status,
+      freshness: "fresh",
+      requiresConfirmation: false,
+    }
+  }
   const computed = annotationStaleState(session, task)
-  const stale = lifecycleStatus === "open" && (task.status === "stale" || computed.stale)
   return {
-    status: lifecycleStatus,
-    freshness: stale ? "stale" : "fresh",
-    requiresConfirmation: stale,
-    staleReason: stale ? computed.reason : undefined,
+    status: "open",
+    effectiveStatus: computed.stale ? "stale" : "open",
+    freshness: computed.stale ? "stale" : "fresh",
+    requiresConfirmation: computed.stale,
+    staleReason: computed.stale ? computed.reason : undefined,
   }
 }
 
 function annotationMatchesStatus(
   state: AnnotationEffectiveState,
-  statusFilter: string | null,
+  statusFilter: AnnotationStatusFilter,
 ): boolean {
-  if (!statusFilter || statusFilter === "all") return true
-  if (statusFilter === "open") return state.status === "open"
+  if (statusFilter === "all") return true
+  if (statusFilter === "pending" || statusFilter === "open") return state.status === "open"
+  if (statusFilter === "fresh") return state.status === "open" && state.freshness === "fresh"
   if (statusFilter === "resolved") return state.status === "resolved"
+  if (statusFilter === "ignored") return state.status === "ignored"
   if (statusFilter === "stale") return state.status === "open" && state.freshness === "stale"
   return false
+}
+
+function annotationStatusCounts(states: AnnotationEffectiveState[]) {
+  const counts = {
+    pending: 0,
+    open: 0,
+    fresh: 0,
+    stale: 0,
+    resolved: 0,
+    ignored: 0,
+    all: states.length,
+  }
+  for (const state of states) {
+    if (state.status === "open") {
+      counts.pending += 1
+      counts.open += 1
+      counts[state.freshness] += 1
+    } else {
+      counts[state.status] += 1
+    }
+  }
+  return counts
 }
 
 function annotationPayload(
@@ -4412,6 +4458,7 @@ function annotationPayload(
       }
       : null,
     status: state.status,
+    effectiveStatus: state.effectiveStatus,
     freshness: state.freshness,
     requiresConfirmation: state.requiresConfirmation,
     stale: state.freshness === "stale",
@@ -4422,6 +4469,8 @@ function annotationPayload(
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     resolvedAt: task.resolvedAt,
+    ignoredAt: task.ignoredAt,
+    ignoredReason: task.ignoredReason,
   }
 }
 
@@ -4644,23 +4693,29 @@ return `<!doctype html>
     #ann-drawer header button { border: 1px solid #c8d0dc; border-radius: 6px; background: #fff;
       padding: 4px 8px; cursor: pointer; }
     #ann-drawer .new-btn { border-color: #2563eb; background: #2563eb; color: #fff; }
+    #ann-filters { display: flex; align-items: center; gap: 8px; padding: 9px 14px;
+      border-bottom: 1px solid #e2e8f0; }
+    #ann-filters label { color: #64748b; font-size: 12px; }
+    #ann-filter { flex: 1; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff;
+      padding: 5px 8px; }
     #ann-list { flex: 1; overflow-y: auto; padding: 10px 14px; }
     #ann-list .item { border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px;
       margin-bottom: 10px; background: #fafbfc; }
     #ann-list .item.resolved { opacity: .65; background: #f1f5f9; }
+    #ann-list .item.ignored { opacity: .65; background: #f8fafc; }
     #ann-list .item .meta { display: flex; align-items: center; gap: 6px; font-size: 11px;
       color: #64748b; margin-bottom: 6px; }
     #ann-list .item .badge { padding: 1px 7px; border-radius: 999px; font-weight: 600; }
     #ann-list .item .badge.open { background: #dbeafe; color: #1d4ed8; }
     #ann-list .item .badge.stale { background: #fef3c7; color: #b45309; }
     #ann-list .item .badge.resolved { background: #dcfce7; color: #15803d; }
+    #ann-list .item .badge.ignored { background: #e2e8f0; color: #475569; }
     #ann-list .item .instruction { color: #1f2937; white-space: pre-wrap; word-break: break-word; }
     #ann-list .item .cells { font-size: 11px; color: #64748b; margin-top: 6px; }
-    #ann-list .item form { display: flex; gap: 6px; margin-top: 8px; }
-    #ann-list .item form button { border: 1px solid #c8d0dc; border-radius: 6px;
+    #ann-list .item .item-actions { display: flex; gap: 6px; margin-top: 8px; }
+    #ann-list .item .item-actions button { border: 1px solid #c8d0dc; border-radius: 6px;
       background: #fff; padding: 4px 10px; cursor: pointer; }
-    #ann-list .item.resolved form button { opacity: 1; }
-    #ann-list .item form input { flex: 1; }
+    #ann-list .item .item-actions button:hover { background: #f1f5f9; }
     #ann-none { color: #94a3b8; text-align: center; padding: 24px 8px; }
     #ann-form { display: none; flex: 1; flex-direction: column; }
     #ann-form.visible { display: flex; }
@@ -4684,8 +4739,10 @@ return `<!doctype html>
       body { background: #0f172a; }
       #history-btn, #ann-btn, #ann-drawer { background: #1e293b; color: #e2e8f0; border-color: #334155; }
       #history-btn:hover, #ann-btn:hover, #ann-drawer header button { background: #243049; }
+      #ann-filters { background: #172033; border-color: #334155; }
+      #ann-filter { background: #0f172a; color: #e2e8f0; border-color: #334155; }
       #ann-list .item { background: #243049; border-color: #334155; }
-      #ann-list .item form button { background: #243049; color: #e2e8f0; border-color: #334155; }
+      #ann-list .item .item-actions button { background: #243049; color: #e2e8f0; border-color: #334155; }
       #ann-list .item .instruction { color: #e2e8f0; }
       #ann-list .item .meta, #ann-list .item .cells { color: #94a3b8; }
       #ann-form textarea { background: #0f172a; color: #e2e8f0; border-color: #334155; }
@@ -4768,6 +4825,17 @@ return `<!doctype html>
       <button type="button" class="new-btn" id="ann-new">＋ 添加注释</button>
       <button type="button" id="ann-close">关闭</button>
     </header>
+    <div id="ann-filters">
+      <label for="ann-filter">状态</label>
+      <select id="ann-filter">
+        <option value="pending">待处理</option>
+        <option value="fresh">未完成</option>
+        <option value="stale">已过时</option>
+        <option value="resolved">已完成</option>
+        <option value="ignored">已忽略</option>
+        <option value="all">全部</option>
+      </select>
+    </div>
     <div id="ann-list"></div>
     <div id="ann-form">
       <div class="field">
@@ -4864,6 +4932,7 @@ return `<!doctype html>
       const annBtn = document.getElementById("ann-btn");
       const annCount = document.getElementById("ann-count");
       const annDrawer = document.getElementById("ann-drawer");
+      const annFilter = document.getElementById("ann-filter");
       const annList = document.getElementById("ann-list");
       const annForm = document.getElementById("ann-form");
       const annSelection = document.getElementById("ann-selection");
@@ -5685,25 +5754,29 @@ return `<!doctype html>
         }
       }
 
-      async function toggleResolution(id, button, action) {
+      async function updateAnnotationStatus(id, nextStatus, button) {
+        if (nextStatus === "ignored" && !window.confirm(
+          "忽略后 Agent 将不再处理这条注释。仍可在“已忽略”中重新打开。是否继续？"
+        )) return;
         if (button) button.disabled = true;
-        const resolved = action !== "reopen";
         try {
-          const url = new URL(CONFIG.annotationsUrl);
-          url.pathname += "/" + encodeURIComponent(id);
-
-          const response = await fetch(url.toString(), {
+          const body = { status: nextStatus };
+          if (nextStatus === "resolved") body.summary = "已由用户标记为已完成";
+          if (nextStatus === "ignored") body.reason = "已由用户手动忽略";
+          const statusUrl = new URL(CONFIG.annotationsUrl);
+          statusUrl.pathname = statusUrl.pathname.endsWith("/")
+            ? statusUrl.pathname + encodeURIComponent(id)
+            : statusUrl.pathname + "/" + encodeURIComponent(id);
+          const response = await fetch(statusUrl.toString(), {
             method: "PATCH",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify(resolved
-              ? { status: "resolved", summary: "已由用户标记为已解决" }
-              : { status: "open" }),
+            body: JSON.stringify(body),
           });
           const result = await response.json();
-          if (!response.ok) throw new Error(result.error || (resolved ? "标记已解决失败" : "标记未完成失败"));
+          if (!response.ok) throw new Error(result.error || "更新注释状态失败");
           await refreshAnnotations();
         } catch (error) {
-          showStatus(error.message, 5000);
+          showStatus(error.message || "更新注释状态失败", 5000);
           if (button) button.disabled = false;
         }
       }
@@ -5711,46 +5784,61 @@ return `<!doctype html>
       async function refreshAnnotations() {
         try {
           const url = new URL(CONFIG.annotationsUrl);
-          url.searchParams.set("status", "all");
+          url.searchParams.set("status", annFilter.value || "pending");
           const response = await fetch(url.toString(), { cache: "no-store" });
           const result = await response.json();
           if (!response.ok) throw new Error(result.error || "读取注释失败");
-          renderAnnotations(result.annotations || []);
+          renderAnnotations(result.annotations || [], result.counts || {});
         } catch (error) {
           showStatus(error.message || "读取注释失败", 5000);
         }
       }
 
-      function renderAnnotations(annotations) {
-        const open = annotations.filter((task) => task.status !== "resolved");
-        annCount.textContent = String(open.length);
-        annCount.classList.toggle("zero", open.length === 0);
+      function renderAnnotations(annotations, counts) {
+        const pendingCount = Number(counts.pending || 0);
+        annCount.textContent = String(pendingCount);
+        annCount.classList.toggle("zero", pendingCount === 0);
+        const filterLabels = {
+          pending: "待处理", fresh: "未完成", stale: "已过时",
+          resolved: "已完成", ignored: "已忽略", all: "全部",
+        };
+        Object.entries(filterLabels).forEach(([value, label]) => {
+          const option = annFilter.querySelector('option[value="' + value + '"]');
+          if (option) option.textContent = label + "（" + Number(counts[value] || 0) + "）";
+        });
         if (annotations.length === 0) {
-          annList.innerHTML = '<div id="ann-none">还没有注释。框选图元后点击“添加注释”，标注你要让 Agent 修改的地方。</div>';
+          const emptyText = counts.all
+            ? "当前筛选条件下没有注释。"
+            : "还没有注释。框选图元后点击“添加注释”，标注你要让 Agent 修改的地方。";
+          annList.innerHTML = '<div id="ann-none">' + emptyText + '</div>';
           return;
         }
         const escape = (value) => String(value).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
         annList.innerHTML = annotations.map((task) => {
-          const status = task.stale ? "stale" : task.status;
+          const status = task.effectiveStatus || (task.stale ? "stale" : task.status);
           const cells = (task.cells || []).map((cell) => escape(cell.label || cell.id)).join("、");
           const region = task.region
             ? "区域 x=" + Math.round(task.region.x) + " y=" + Math.round(task.region.y)
               + " w=" + Math.round(task.region.width) + " h=" + Math.round(task.region.height)
             : "";
           const result = task.result
-            ? '<div style="margin-top:6px;font-size:11px;color:#64748b">已处理：' + escape(task.result.summary || "") + "（revision " + task.result.revision + "）</div>"
+            ? '<div style="margin-top:6px;font-size:11px;color:#64748b">处理结果：' + escape(task.result.summary || "") + "（revision " + task.result.revision + "）</div>"
             : "";
-          const toggleBtn = task.status === "resolved"
-            ? '<form><button type="button" data-action="reopen" data-annotation="' + escape(task.id) + '">标记未完成</button></form>'
-            : '<form><button type="button" data-action="resolve" data-annotation="' + escape(task.id) + '">标记已解决</button></form>';
+          const ignored = task.ignoredReason
+            ? '<div style="margin-top:6px;font-size:11px;color:#64748b">忽略原因：' + escape(task.ignoredReason) + '</div>'
+            : "";
+          const actions = task.status === "open"
+            ? '<div class="item-actions"><button type="button" data-id="' + escape(task.id) + '" data-status="resolved">标记已完成</button>'
+              + '<button type="button" data-id="' + escape(task.id) + '" data-status="ignored">忽略</button></div>'
+            : '<div class="item-actions"><button type="button" data-id="' + escape(task.id) + '" data-status="open">重新打开</button></div>';
           return '<div class="item ' + status + '">'
-            + '<div class="meta"><span class="badge ' + status + '">' + ({ open: "待处理", stale: "已过时", resolved: "已解决" }[status] || status) + '</span>'
+            + '<div class="meta"><span class="badge ' + status + '">' + ({ open: "未完成", stale: "已过时", resolved: "已完成", ignored: "已忽略" }[status] || status) + '</span>'
             + '<span>页面 ' + escape(task.page.name || task.page.id) + '</span>'
             + '<span>rev ' + task.baseRevision + '→' + task.currentRevision + '</span></div>'
             + '<div class="instruction">' + escape(task.instruction) + '</div>'
             + '<div class="cells">范围：' + escape(task.scopeLabel || "只修改选区") + ' · 图元：' + (cells || "（无）") + (region ? " · " + region : "") + '</div>'
             + (task.staleReason ? '<div style="margin-top:4px;font-size:11px;color:#b45309">⚠ ' + escape(task.staleReason) + '</div>' : "")
-            + result + toggleBtn + '</div>';
+            + result + ignored + actions + '</div>';
         }).join("");
       }
 
@@ -5758,13 +5846,14 @@ return `<!doctype html>
       document.getElementById("ann-close").addEventListener("click", closeDrawer);
       document.getElementById("ann-new").addEventListener("click", startAnnotation);
       document.getElementById("ann-cancel").addEventListener("click", cancelAnnotationForm);
+      annFilter.addEventListener("change", () => void refreshAnnotations());
       annSubmit.addEventListener("click", submitAnnotation);
       annList.addEventListener("click", (event) => {
         const target = event.target;
         if (!(target instanceof HTMLElement)) return;
-        const id = target.getAttribute("data-annotation");
-        const action = target.getAttribute("data-action");
-        if (id && (action === "resolve" || action === "reopen")) void toggleResolution(id, target, action);
+        const id = target.getAttribute("data-id");
+        const nextStatus = target.getAttribute("data-status");
+        if (id && nextStatus) void updateAnnotationStatus(id, nextStatus, target);
       });
 
       historyBtn.addEventListener("click", () => void openHistory());
@@ -6229,15 +6318,27 @@ async function handleIntegratedBridgeRequest(
   if (request.method === "GET" && requestUrl.pathname === "/api/annotations") {
     await refreshIntegratedSession(session)
     const map = getDiagramAnnotations(session)
-    const statusFilter = requestUrl.searchParams.get("status")
-    const list = [...map.values()]
+    const requestedFilter = requestUrl.searchParams.get("status") || "pending"
+    const allowedFilters: AnnotationStatusFilter[] = [
+      "pending", "open", "fresh", "stale", "resolved", "ignored", "all",
+    ]
+    if (!allowedFilters.includes(requestedFilter as AnnotationStatusFilter)) {
+      integratedJsonResponse(response, 400, { ok: false, error: `unsupported annotation status: ${requestedFilter}` })
+      return
+    }
+    const statusFilter = requestedFilter as AnnotationStatusFilter
+    const entries = [...map.values()]
       .map((task) => ({ task, state: annotationEffectiveState(session, task) }))
+      .sort((left, right) => right.task.updatedAt.localeCompare(left.task.updatedAt))
+    const list = entries
       .filter((entry) => annotationMatchesStatus(entry.state, statusFilter))
       .map((entry) => annotationPayload(session, entry.task, entry.state))
     integratedJsonResponse(response, 200, {
       ok: true,
       file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
+      status: statusFilter,
       count: list.length,
+      counts: annotationStatusCounts(entries.map((entry) => entry.state)),
       annotations: list,
     })
     return
@@ -6297,6 +6398,8 @@ async function handleIntegratedBridgeRequest(
       createdAt: now,
       updatedAt: now,
       resolvedAt: null,
+      ignoredAt: null,
+      ignoredReason: null,
     }
     const map = getDiagramAnnotations(session)
     map.set(task.id, task)
@@ -6325,6 +6428,7 @@ async function handleIntegratedBridgeRequest(
   }
 
   if (annotationId && (request.method === "PATCH" || request.method === "PUT")) {
+    await refreshIntegratedSession(session)
     const map = getDiagramAnnotations(session)
     const task = map.get(annotationId)
     if (!task) {
@@ -6339,6 +6443,13 @@ async function handleIntegratedBridgeRequest(
       return
     }
     const requestedStatus = typeof body.status === "string" ? body.status : ""
+    if ((requestedStatus === "resolved" || requestedStatus === "ignored") && task.status !== "open") {
+      integratedJsonResponse(response, 409, {
+        ok: false,
+        error: `annotation is ${task.status}; reopen it before changing to ${requestedStatus}`,
+      })
+      return
+    }
     if (requestedStatus === "resolved") {
       const summary = typeof body.summary === "string" ? body.summary.trim() : ""
       const changedIds = Array.isArray(body.changedIds)
@@ -6352,13 +6463,30 @@ async function handleIntegratedBridgeRequest(
         updatedAt: new Date().toISOString(),
       }
       task.resolvedAt = task.result.updatedAt
+      task.ignoredAt = null
+      task.ignoredReason = null
       clearAnnotationSessionState(session, task.id)
-    } else if (requestedStatus === "open" || requestedStatus === "stale") {
-      task.status = requestedStatus
-      if (requestedStatus === "open") {
-        task.result = null
-        task.resolvedAt = null
-      }
+    } else if (requestedStatus === "ignored") {
+      const reason = typeof body.reason === "string" ? body.reason.trim() : ""
+      task.status = "ignored"
+      task.result = null
+      task.resolvedAt = null
+      task.ignoredAt = new Date().toISOString()
+      task.ignoredReason = reason || "已由用户手动忽略"
+      clearAnnotationSessionState(session, task.id)
+    } else if (requestedStatus === "open") {
+      clearAnnotationSessionState(session, task.id)
+      task.status = "open"
+      task.result = null
+      task.resolvedAt = null
+      task.ignoredAt = null
+      task.ignoredReason = null
+    } else {
+      integratedJsonResponse(response, 400, {
+        ok: false,
+        error: `unsupported annotation status: ${requestedStatus || "(empty)"}`,
+      })
+      return
     }
     task.updatedAt = new Date().toISOString()
     map.set(annotationId, task)
@@ -6520,12 +6648,12 @@ const DRAWIO_RUNTIME_GUIDANCE = `## Draw.io 文件写入与交付
 每次修改前必须立即调用 drawio_get_state，并把返回的最新 XML 作为修改基线。人工编辑不是只读内容，可以按当前任务要求继续调整。
 提交时必须携带该次读取返回的准确 base_revision；revision_conflict 后重新读取，在新 XML 上重新执行所需变更并重试，禁止重发旧 XML。
 禁止用普通 write、edit 或脚本直接覆盖已绑定的 .drawio 文件，因为这会绕过 revision 检查并可能用旧快照丢失最新内容。
-本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。调用前必须先调用 drawio_list_annotations(status='open') 探测未完成注释；存在 requiresConfirmation=false 的注释时 drawio_finalize 会拒绝执行，必须先逐条处理并 drawio_resolve_annotation 后再重试，不得跳过。只有返回 shouldOpenBrowser=true 时才将 openUrl 交给 MobileWork 现有 browser.open_url 打开；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
+本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。调用前必须先调用 drawio_list_annotations(status='pending') 探测未完成注释；存在 requiresConfirmation=false 的注释时 drawio_finalize 会拒绝执行，必须先逐条处理并 drawio_resolve_annotation 后再重试，不得跳过。只有返回 shouldOpenBrowser=true 时才将 openUrl 交给 MobileWork 现有 browser.open_url 打开；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
 
 ## 注释任务（框选评审）
 
 用户在内置浏览器中框选图元并提交注释后，每条注释是一条按图表文件持久化的独立任务，不绑定创建它的对话 session；任务记录稳定 ID、页面、区域范围、修改说明、允许范围和提交时的图表基线。
-注释的 status 只有 open/resolved；freshness=stale 表示图元已变化但任务仍未完成。执行 stale 注释前必须先询问用户；fresh 注释可直接进入计划和审批流程。
+注释的持久化 status 为 open/resolved/ignored；freshness=stale 表示图元已变化但任务仍未完成。执行 stale 注释前必须先询问用户；fresh 注释可直接进入计划和审批流程。resolved 和 ignored 都是终态，Agent 必须跳过，只有用户重新打开后才能处理。
 处理注释时必须先读取最新状态并 dry-run，向用户说明计划、完整稳定 ID 清单和范围，再调用 drawio_authorize_annotation_change。该工具必须由 OpenCode 以 ask 权限弹窗在写入前批准；批准后才可把当前 session 的一次性 token 传给正式 drawio_patch/drawio_update_state。非全图范围由运行时强制使用注释绑定的 pageId；diagram_wide 覆盖当前图表全部页面并使用 pageId:cellId。禁止先改后问。
 不得修改授权范围外内容。确需越界时，在 authorization 的 escalation_reason 中先说明不可避免的原因并申请更宽范围；未获批准不得写入。drawio_polish 会重排整页，存在活动注释时只有取得 diagram_wide 审批后才能正式运行。
 用户本轮另有明确任务时先完成该任务，然后在同一轮重新探测注释；最终回复前仍存在 requiresConfirmation=false 的 open 注释时必须继续处理，不能只提示用户稍后继续。
@@ -6850,8 +6978,8 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           }
           const annotation = getDiagramAnnotations(activeSession).get(args.annotation_id)
           if (!annotation) throw new Error(`annotation not found: ${args.annotation_id}`)
-          if (annotation.status === "resolved") {
-            throw new Error(`annotation is already resolved: ${args.annotation_id}`)
+          if (annotation.status !== "open") {
+            throw new Error(`annotation is ${annotation.status} and must be reopened before processing: ${args.annotation_id}`)
           }
           if (!annotation.pageId.trim()) {
             throw new Error(`annotation has no stable page id: ${args.annotation_id}`)
@@ -7211,7 +7339,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
 
     drawio_finalize: tool({
       description:
-        "Finish a Draw.io task: refresh the latest revision, validate and score it, export an up-to-date PNG, bind the browser session, and report whether a new editor must be opened. Refuses to run while any fresh (requiresConfirmation=false) annotation is still open; returns pendingAnnotations for open annotations that still need user confirmation.",
+        "Finish a Draw.io task: refresh the latest revision, validate and score it, export an up-to-date PNG, bind the browser session, and report whether a new editor must be opened. Refuses to run while any fresh (requiresConfirmation=false) annotation is still open; returns pendingAnnotations for stale open annotations that still need user confirmation. Resolved and ignored annotations are terminal and do not block finalization.",
       args: {
         file: tool.schema.string().describe("Workspace-relative .drawio or .xml file"),
         output_path: tool.schema
@@ -7318,9 +7446,9 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       args: {
         file: tool.schema.string().describe("Workspace-relative .drawio or .xml file bound to the session"),
         status: tool.schema
-          .enum(["open", "resolved", "stale", "all"])
-          .default("open")
-          .describe("Filter by status; open returns pending tasks Agent should process"),
+          .enum(["pending", "open", "fresh", "stale", "resolved", "ignored", "all"])
+          .default("pending")
+          .describe("Filter by status; pending/open return all unfinished tasks, while fresh and stale refine them"),
       },
       async execute(args, context) {
         const target = resolveWorkspacePath(context, args.file)
@@ -7328,8 +7456,10 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         if (!session) throw new Error("No active Draw.io session for this file. Call drawio_open first.")
         await refreshIntegratedSession(session)
         const map = getDiagramAnnotations(session)
-        const list = [...map.values()]
+        const entries = [...map.values()]
           .map((task) => ({ task, state: annotationEffectiveState(session, task) }))
+          .sort((left, right) => right.task.updatedAt.localeCompare(left.task.updatedAt))
+        const list = entries
           .filter((entry) => annotationMatchesStatus(entry.state, args.status))
           .map((entry) => annotationPayload(session, entry.task, entry.state))
         return JSON.stringify({
@@ -7337,8 +7467,9 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           sessionId: session.sessionId,
           currentRevision: session.revision,
           count: list.length,
+          counts: annotationStatusCounts(entries.map((entry) => entry.state)),
           annotations: list,
-          guidance: "Open includes fresh and stale unfinished tasks. Ask for confirmation before executing any task with requiresConfirmation=true. For each executable task: call drawio_get_annotation and drawio_get_state, dry-run, disclose scope and exact stable IDs with drawio_authorize_annotation_change, and wait for its OpenCode approval popup. Only then pass annotation_id and the one-time approval token to one scoped write, resolve the annotation, and finalize. Never modify first and ask later.",
+          guidance: "Pending/open include fresh and stale unfinished tasks; resolved and ignored are terminal until the user reopens them. Ask for confirmation before executing any task with requiresConfirmation=true. For each executable task: call drawio_get_annotation and drawio_get_state, dry-run, disclose scope and exact stable IDs with drawio_authorize_annotation_change, and wait for its OpenCode approval popup. Only then pass annotation_id and the one-time approval token to one scoped write, resolve the annotation, and finalize. Never modify first and ask later.",
         }, null, 2)
       },
     }),
@@ -7357,7 +7488,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         const map = getDiagramAnnotations(session)
         const task = map.get(args.id)
         if (!task) throw new Error(`annotation not found: ${args.id}`)
-        session.activeAnnotationId = task.id
+        session.activeAnnotationId = task.status === "open" ? task.id : null
         const annotationState = annotationEffectiveState(session, task)
         const payload = annotationPayload(session, task, annotationState)
         let snapshots: Array<Record<string, unknown>> = []
@@ -7388,9 +7519,11 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         return JSON.stringify({
           annotation: payload,
           cellSnapshots: snapshots,
-          guidance: annotationState.requiresConfirmation
-            ? "This annotation is stale but still open. Ask the user whether to execute it. After confirmation, call drawio_get_state, prepare a dry-run and exact changed-id plan, then call drawio_authorize_annotation_change. Wait for the OpenCode approval popup before passing annotation_id and its one-time token to drawio_patch/drawio_update_state; resolve only after the write succeeds."
-            : "Call drawio_get_state, prepare a dry-run and exact changed-id plan, then call drawio_authorize_annotation_change. Wait for the OpenCode approval popup before passing annotation_id and its one-time token to drawio_patch/drawio_update_state; resolve only after the write succeeds.",
+          guidance: task.status !== "open"
+            ? `This annotation is ${task.status} and terminal. Do not process it unless the user reopens it in the annotation panel.`
+            : annotationState.requiresConfirmation
+              ? "This annotation is stale but still open. Ask the user whether to execute it. After confirmation, call drawio_get_state, prepare a dry-run and exact changed-id plan, then call drawio_authorize_annotation_change. Wait for the OpenCode approval popup before passing annotation_id and its one-time token to drawio_patch/drawio_update_state; resolve only after the write succeeds."
+              : "Call drawio_get_state, prepare a dry-run and exact changed-id plan, then call drawio_authorize_annotation_change. Wait for the OpenCode approval popup before passing annotation_id and its one-time token to drawio_patch/drawio_update_state; resolve only after the write succeeds.",
         }, null, 2)
       },
     }),
@@ -7423,7 +7556,9 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         await refreshIntegratedSession(session)
         const task = getDiagramAnnotations(session).get(args.id)
         if (!task) throw new Error(`annotation not found: ${args.id}`)
-        if (task.status === "resolved") throw new Error(`annotation is already resolved: ${args.id}`)
+        if (task.status !== "open") {
+          throw new Error(`annotation is ${task.status} and must be reopened before authorization: ${args.id}`)
+        }
         const requestedScope = annotationScope(args.requested_scope)
         const escalationReason = args.escalation_reason?.trim() || null
         if (annotationScopeRank(requestedScope) > annotationScopeRank(task.scope) && !escalationReason) {
@@ -7522,6 +7657,9 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         const map = getDiagramAnnotations(session)
         const task = map.get(args.id)
         if (!task) throw new Error(`annotation not found: ${args.id}`)
+        if (task.status !== "open") {
+          throw new Error(`annotation is ${task.status} and must be reopened before it can be resolved: ${args.id}`)
+        }
         const now = new Date().toISOString()
         task.status = "resolved"
         task.result = {
@@ -7531,6 +7669,8 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           updatedAt: now,
         }
         task.resolvedAt = now
+        task.ignoredAt = null
+        task.ignoredReason = null
         task.updatedAt = now
         map.set(task.id, task)
         clearAnnotationSessionState(session, task.id)
