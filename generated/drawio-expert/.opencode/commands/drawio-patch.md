@@ -3,4 +3,4 @@ description: 以稳定ID安全增量修改Draw.io文件。
 agent: drawio-expert
 ---
 
-加载drawio-skill。若文件已经通过drawio_open绑定，必须先调用drawio_get_state并使用其最新XML和准确revision；再以dry_run=true调用drawio_patch，确认差异后携带base_revision正式修改。完成后必须调用drawio_finalize更新PNG和内置浏览器。revision_conflict时重新读取、合并并重试。
+加载drawio-skill。若文件已经通过drawio_open绑定，必须先调用drawio_get_state并使用其最新XML和准确revision；再以dry_run=true调用drawio_patch，把绿色新增、黄色修改、红色删除/原位置和蓝色连线预览推送到同一画布。无活动批注时调用drawio_authorize_preview触发写前审批；用户在弹窗允许后，该工具会立即提交获批候选，Agent不得等待用户再发文字确认，也不得重复调用正式drawio_patch。完成后调用drawio_finalize更新PNG和内置浏览器。revision_conflict时重新读取、重新预览并审批。

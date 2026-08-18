@@ -25,7 +25,8 @@
           "*": "deny"
         },
         "question": "allow",
-        "drawio_authorize_annotation_change": "ask"
+        "drawio_authorize_annotation_change": "ask",
+        "drawio_authorize_preview": "ask"
       }
     }
   },

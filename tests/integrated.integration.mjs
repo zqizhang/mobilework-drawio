@@ -5,7 +5,32 @@ import os from "node:os"
 import path from "node:path"
 import { Script } from "node:vm"
 
-import { DrawioExpertPlugin } from "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js"
+const runtimeModule = process.env.DRAWIO_TEST_SOURCE === "1"
+  ? "../runtime/drawio-runtime.ts"
+  : "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js"
+const { DrawioExpertPlugin } = await import(runtimeModule)
+
+function createSseFrameReader(reader, timeoutMs = 2000) {
+  const decoder = new TextDecoder()
+  let text = ""
+  return async function readSseFrame() {
+    while (!text.includes("\n\n")) {
+      let timer
+      const result = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("timed out waiting for SSE frame")), timeoutMs)
+        }),
+      ]).finally(() => clearTimeout(timer))
+      if (result.done) throw new Error("SSE stream ended before a complete frame")
+      text += decoder.decode(result.value, { stream: true })
+    }
+    const boundary = text.indexOf("\n\n") + 2
+    const frame = text.slice(0, boundary)
+    text = text.slice(boundary)
+    return frame
+  }
+}
 
 const DRAWIO_ENVIRONMENT_KEYS = [
   "DRAWIO_WEB_URL",
@@ -107,6 +132,7 @@ try {
   assert.equal(typeof plugin.tool.drawio_health_check.execute, "function")
   assert.equal(typeof plugin.tool.drawio_finalize.execute, "function")
   assert.equal(typeof plugin.tool.drawio_authorize_annotation_change.execute, "function")
+  assert.equal(typeof plugin.tool.drawio_authorize_preview.execute, "function")
   const systemOutput = { system: [] }
   await plugin["experimental.chat.system.transform"]({}, systemOutput)
   assert.match(systemOutput.system.join("\n"), /人工编辑不是只读内容/)
@@ -199,6 +225,10 @@ try {
   assert.match(editorPage, /允许调整周边布局/)
   assert.match(editorPage, /允许修改整个图表/)
   assert.match(editorPage, /所有页面、节点、连线和布局/)
+  assert.match(editorPage, /Agent 修改预览/)
+  assert.match(editorPage, /preview_active/)
+  assert.match(editorPage, /const cancelUrl = new URL\(CONFIG\.previewUrl\)/)
+  assert.doesNotMatch(editorPage, /CONFIG\.previewUrl \+ "\/"/)
 
   const apiUrl = new URL(openResult.openUrl)
   apiUrl.pathname = "/api/diagram"
@@ -333,6 +363,28 @@ try {
     base_revision: beforePatch.revision,
   }, context))
   assert.equal(dryRun.dryRun, true)
+  assert.equal(dryRun.preview.status, "pending")
+  assert.equal(dryRun.preview.baseRevision, beforePatch.revision)
+  assert.equal(dryRun.preview.summary.changed, 1)
+  const previewUrl = new URL(finalize.openUrl)
+  previewUrl.pathname = "/api/preview"
+  const visiblePreview = await fetch(previewUrl).then((response) => response.json())
+  assert.equal(visiblePreview.preview.id, dryRun.preview.id)
+  assert.match(visiblePreview.preview.xml, /__ai_preview_layer_/)
+  assert.match(visiblePreview.preview.xml, /#f59e0b/)
+  assert.doesNotMatch(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /__ai_preview_/)
+  const previewSaveBlocked = await fetch(apiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      xml: beforePatch.xml,
+      baseRevision: beforePatch.revision,
+      source: "editor",
+      clientId: "preview-write-test",
+    }),
+  })
+  assert.equal(previewSaveBlocked.status, 409)
+  assert.equal((await previewSaveBlocked.json()).error, "preview_active")
   await assert.rejects(
     plugin.tool.drawio_patch.execute({
       file: "architecture.drawio",
@@ -360,10 +412,12 @@ try {
   assert.equal(authorization.ok, true)
   assert.equal(authorization.baseRevision, beforePatch.revision)
   assert.equal(authorization.requestedScope, "selection_only")
+  assert.equal(authorization.previewId, dryRun.preview.id)
   assert.equal(approvalRequests.length, 1)
   assert.equal(approvalRequests[0].permission, "drawio_authorize_annotation_change")
   assert.deepEqual(approvalRequests[0].metadata.proposedChangedIds, ["node"])
   assert.equal(approvalRequests[0].metadata.plan, "仅把选中节点 node 改名为 Draw.io")
+  assert.equal(approvalRequests[0].metadata.previewId, dryRun.preview.id)
   assert.match(approvalRequests[0].patterns[0], /annotation:.*:revision-/)
   await assert.rejects(
     plugin.tool.drawio_patch.execute({
@@ -385,6 +439,8 @@ try {
     approval_token: authorization.approvalToken,
   }, context))
   assert.equal(patchResult.diff.summary.changed, 1)
+  assert.doesNotMatch(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /__ai_preview_/)
+  assert.equal((await fetch(previewUrl).then((response) => response.json())).preview, null)
   await assert.rejects(
     plugin.tool.drawio_patch.execute({
       file: "architecture.drawio",
@@ -418,6 +474,64 @@ try {
     status: "open",
   }, context))
   assert.equal(openAfterResolve.count, 0)
+
+  const previewEventsUrl = new URL(openResult.openUrl)
+  previewEventsUrl.pathname = "/api/events"
+  const previewEventsResponse = await fetch(previewEventsUrl)
+  assert.equal(previewEventsResponse.status, 200)
+  const previewEventsReader = previewEventsResponse.body.getReader()
+  const nextPreviewEvent = createSseFrameReader(previewEventsReader)
+  assert.match(await nextPreviewEvent(), /^: connected/)
+
+  const generalPreviewDryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    operations: [{ type: "update-node", id: "neighbor", label: "Neighbor Preview" }],
+    dry_run: true,
+    base_revision: patchResult.revision,
+  }, context))
+  const createdPreviewEvent = await nextPreviewEvent()
+  assert.match(createdPreviewEvent, /^event: preview\ndata: /)
+  assert.match(createdPreviewEvent, /"kind":"created"/)
+  const previewApprovalRequests = []
+  const previewContext = {
+    ...context,
+    async ask(input) { previewApprovalRequests.push(input) },
+  }
+  const generalPreviewAuthorization = JSON.parse(await plugin.tool.drawio_authorize_preview.execute({
+    file: "architecture.drawio",
+    preview_id: generalPreviewDryRun.preview.id,
+    plan: "将 Neighbor 节点改名为 Neighbor Preview",
+  }, previewContext))
+  assert.equal(previewApprovalRequests.length, 1)
+  assert.equal(previewApprovalRequests[0].permission, "drawio_authorize_preview")
+  assert.equal(generalPreviewAuthorization.applied, true)
+  assert.equal(generalPreviewAuthorization.preview.status, "applied")
+  assert.equal(generalPreviewAuthorization.revision, patchResult.revision + 1)
+  const authorizedPreviewEvent = await nextPreviewEvent()
+  assert.match(authorizedPreviewEvent, /"kind":"authorized"/)
+  const appliedPreviewEvent = await nextPreviewEvent()
+  assert.match(appliedPreviewEvent, /"kind":"applied"/)
+  assert.match(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /Neighbor Preview/)
+  assert.equal((await fetch(previewUrl).then((response) => response.json())).preview, null)
+
+  const cancelPreviewDryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    operations: [{ type: "update-node", id: "neighbor", label: "Cancelled Candidate" }],
+    dry_run: true,
+    base_revision: generalPreviewAuthorization.revision,
+  }, context))
+  const revisionEvent = await nextPreviewEvent()
+  assert.match(revisionEvent, /^event: diagram\ndata: /)
+  const secondCreatedPreviewEvent = await nextPreviewEvent()
+  assert.match(secondCreatedPreviewEvent, /"kind":"created"/)
+  const cancelPreviewUrl = new URL(previewUrl)
+  cancelPreviewUrl.pathname = `/api/preview/${encodeURIComponent(cancelPreviewDryRun.preview.id)}`
+  const cancelledPreview = await fetch(cancelPreviewUrl, { method: "DELETE" }).then((response) => response.json())
+  assert.equal(cancelledPreview.preview.status, "cancelled")
+  const cancelledPreviewEvent = await nextPreviewEvent()
+  assert.match(cancelledPreviewEvent, /"kind":"cancelled"/)
+  await previewEventsReader.cancel()
+  assert.doesNotMatch(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /Cancelled Candidate/)
 
   const ignoredAnn = await fetch(annotationsUrl, {
     method: "POST",
@@ -551,6 +665,14 @@ try {
     id: globalAnn.annotation.id,
   }, secondContext)
   const secondState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, secondContext))
+  const globalDryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    page: "p2",
+    operations: [{ type: "update-node", id: "remote", label: "Global Remote" }],
+    dry_run: true,
+    base_revision: secondState.revision,
+  }, secondContext))
+  assert.equal(globalDryRun.preview.status, "pending")
   const globalAuthorization = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
     file: "architecture.drawio",
     id: globalAnn.annotation.id,
@@ -560,6 +682,7 @@ try {
   }, secondContext))
   assert.equal(secondApprovalRequests.length, 1)
   assert.equal(secondApprovalRequests[0].metadata.file, "architecture.drawio")
+  assert.equal(globalAuthorization.previewId, globalDryRun.preview.id)
   assert.deepEqual(globalAuthorization.allowedExistingIds.includes("p2:remote"), true)
 
   await plugin.tool.drawio_get_annotation.execute({
@@ -645,6 +768,26 @@ try {
     changed_ids: polishDryRun.changedIds.map((id) => `p1:${id}`),
   }, context)
 
+  const beforeStalePreview = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
+  const stalePreviewDryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    operations: [{ type: "update-node", id: "neighbor", label: "Stale Preview" }],
+    dry_run: true,
+    base_revision: beforeStalePreview.revision,
+  }, context))
+  await fs.writeFile(
+    path.join(workspace, "architecture.drawio"),
+    beforeStalePreview.xml.replace("Global Remote", "Global Remote External"),
+    "utf8",
+  )
+  const afterExternalPreviewChange = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
+  assert.ok(afterExternalPreviewChange.revision > beforeStalePreview.revision)
+  const stalePreviewResult = await fetch(previewUrl).then((response) => response.json())
+  assert.equal(stalePreviewResult.preview.id, stalePreviewDryRun.preview.id)
+  assert.equal(stalePreviewResult.preview.status, "stale")
+  assert.match(stalePreviewResult.preview.statusReason, /revision|更新/)
+  assert.doesNotMatch(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /__ai_preview_/)
+
   const staleAnn = await fetch(annotationsUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -718,6 +861,14 @@ try {
     annotationIgnoreAndReopen: true,
     annotationBrowserStatusUrl: true,
     annotationTerminalAuthorizationRevocation: true,
+    patchPreviewCanvas: true,
+    patchPreviewReadOnlyGuard: true,
+    patchPreviewExactCandidateApproval: true,
+    patchPreviewCancelWithoutWrite: true,
+    patchPreviewRevisionInvalidation: true,
+    patchPreviewBrowserActions: true,
+    integratedEventStream: true,
+    patchPreviewOneClickApply: true,
   }, null, 2))
 } finally {
   const bridge = globalThis.__drawioIntegratedBridge

@@ -1,6 +1,6 @@
 ---
 name: drawio-session-editing
-description: 当用户需要在MobileWork内置浏览器中手动编辑Draw.io工作区文件，或Agent需要在人工编辑后继续修改时使用。负责读取最新会话revision、把用户保存版本作为新的修改基线、以乐观并发方式提交XML，并在revision_conflict时重新读取和重试，避免旧快照造成内容丢失。同时覆盖按图表持久化的框选注释任务流程：用户提交稳定ID、页面、区域、说明和允许修改范围（含整个图表）；Agent必须先dry-run和说明计划，再通过OpenCode审批弹窗获得当前session的一次性授权，运行时拒绝未授权、越界或过期revision写入，禁止先修改后确认。
+description: 当用户需要在MobileWork内置浏览器中手动编辑Draw.io工作区文件，或Agent需要在人工编辑后继续修改时使用。负责读取最新会话revision、把用户保存版本作为新的修改基线、以乐观并发方式提交XML，并在revision_conflict时重新读取和重试，避免旧快照造成内容丢失。已绑定图表的patch和polish先在同一画布展示临时只读差异预览，再通过OpenCode审批绑定候选哈希后写入。同时覆盖按图表持久化的框选注释任务流程和稳定ID范围守卫，禁止先修改后确认。
 ---
 
 # Draw.io 会话同步与并发控制
@@ -14,7 +14,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 3. 如果任务依赖项目内容，先读取相关工作区文件再设计或修改图表。
 4. 每次修改前立即调用`drawio_get_state`，取得最新XML和revision。
 5. 以最新XML中的图元、标签、几何和样式为起点，根据当前任务判断哪些内容需要保留、调整、删除或重构。
-6. 调用`drawio_update_state`提交完整XML，或调用`drawio_patch`/`drawio_polish`执行最小修改，并携带紧邻本次写入前读取到的准确`base_revision`；不得自动补齐revision。
+6. 调用`drawio_patch(dry_run=true)`或`drawio_polish(dry_run=true)`生成同画布差异预览；普通任务调用`drawio_authorize_preview`，用户在弹窗允许后该工具会立即提交已展示的精确候选，Agent不得再重复调用正式patch/polish。注释任务继续调用`drawio_authorize_annotation_change`并按其范围授权流程写入。
 7. 收到`revision_conflict`时，重新读取最新状态，在新XML上重新执行当前任务所需的变更，再以新revision重试。禁止原样重发旧XML。
 8. 更新成功后，简要说明结构变化、当前revision以及是否合并了人工修改。
 
@@ -34,6 +34,8 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 - `drawio_finalize(file=...)`：读取最新revision、校验、评分、导出同名PNG并返回必须交给`browser.open_url`的URL。
 - `drawio_get_state(since_revision=...)`：返回最新XML、revision及可选的稳定ID变化。
 - `drawio_update_state(base_revision=..., xml=...)`：以乐观并发方式提交完整XML。
+- `drawio_patch(dry_run=true)` / `drawio_polish(dry_run=true)`：除返回结构化diff外，还会把临时预览XML推送到同一画布；绿色为新增、黄色为修改、红色为删除或原位置、蓝色为变更连线。预览不写入源文件。
+- `drawio_authorize_preview(preview_id, plan)`：无活动注释的普通修改在看图后调用；OpenCode弹窗允许后，运行时在同一次工具调用中校验候选哈希和revision并立即写入，返回`applied=true`与新revision。无需也不得要求用户再发文字确认。
 - 这些工具根据运行时上下文识别session，不需要用户手动传入session ID。
 - 如果会话工具不可用，应明确说明无法提供冲突安全的浏览器编辑，不得假装当前画布已同步。
 
@@ -75,16 +77,16 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 
 - `drawio_list_annotations(file, status="pending")`：列出待处理注释。每轮第一句对话必调一次。`pending` 聚合未完成和已过时；精确筛选可用 `"open"`、`"stale"`、`"resolved"`、`"ignored"`，也可用 `"all"`。
 - `drawio_get_annotation(id)`：取注释详情并把它设为当前活动注释，含选中id、region、范围、过时标记和最新图元快照。
-- `drawio_authorize_annotation_change(id, plan, proposed_changed_ids, requested_scope, escalation_reason?)`：必须在正式写入前调用；该工具权限固定为`ask`，OpenCode先弹窗，用户批准后才返回绑定当前revision和计划ID的一次性token。请求比用户原选项更宽的范围时，`escalation_reason`必填。
+- `drawio_authorize_annotation_change(id, plan, proposed_changed_ids, requested_scope, escalation_reason?, preview_id?)`：必须在正式写入前调用；它自动绑定当前画布预览，并校验披露的稳定ID与预览一致。该工具权限固定为`ask`，OpenCode先弹窗，用户批准后才返回绑定当前revision、候选哈希和计划ID的一次性token。请求比用户原选项更宽的范围时，`escalation_reason`必填。
 - `drawio_resolve_annotation(id, summary, changed_ids?)`：标记已完成并记录 summary；只改任务状态，不改图。
 
 ### 处理一条注释的标准闭环
 
 1. `drawio_get_annotation(id)` 取详情；
 2. `drawio_get_state` 取最新 XML 与 revision——这一步拿到的 XML 已经包含用户全部手动编辑（用户保存即 bump revision，agent 拿到的是最新版），patch 在这个基线上完成增量修改；
-3. 用`drawio_patch(dry_run=true)`或等价差异分析形成精确计划，列出所有会改变的稳定ID和所需范围；此时不得写入；
-4. 调`drawio_authorize_annotation_change`。OpenCode弹窗出现前，Agent先用`plan`说明将改什么；用户拒绝或关闭弹窗则立即停止，不得改图；
-5. 用户批准后，把返回的`approvalToken`、`annotation_id`和同一`base_revision`传给一次正式`drawio_patch`或`drawio_update_state`。token仅能使用一次，revision变化后必须重新规划和审批；
+3. 用`drawio_patch(dry_run=true)`或`drawio_polish(dry_run=true)`形成精确计划并把差异预览推送到画布，列出所有会改变的稳定ID和所需范围；此时不得写入；
+4. 调`drawio_authorize_annotation_change`并传入返回的`preview_id`。OpenCode弹窗出现前，Agent先用`plan`说明将改什么；用户应先看画布高亮，再决定是否批准。拒绝或关闭弹窗则立即停止，不得改图；
+5. 用户批准后，把返回的`approvalToken`、`previewId`、`annotation_id`和同一`base_revision`传给一次正式`drawio_patch`或`drawio_polish`。运行时会核对候选哈希；token仅能使用一次，revision变化后必须重新规划、预览和审批；
 6. `drawio_resolve_annotation(id, summary, changed_ids)`；
 7. `drawio_finalize`刷新PNG与浏览器。
 

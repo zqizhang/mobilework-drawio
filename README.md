@@ -18,6 +18,7 @@
 - 通过自托管的 `jgraph/drawio` + `jgraph/export-server` 导出 PNG、JPEG 和 PDF。
 - 创建或修改结束后自动导出同名 PNG，并在 MobileWork / OpenWork 内置浏览器中打开。
 - 用户在浏览器保存后，将最新 XML 和 revision 作为 Agent 下一次修改的基线。
+- 已绑定图表的增量修改和自动布局会先在同一 Draw.io 画布加载临时只读差异预览：绿色标识新增、黄色标识修改、红色标识删除或移动前位置、蓝色标识变更连线；退出预览不会写入源文件，正式提交必须匹配预览候选哈希与基线 revision。
 - 用户可对选区提交按图表文件持久化的注释，并选择“只修改选区”“允许调整关联连线”“允许调整周边布局”或“允许修改整个图表”；注释列表支持按待处理、未完成、已过时、已完成、已忽略筛选，也可手动完成、忽略和重新打开；全图范围会额外确认，Agent正式写入前仍必须通过OpenCode审批弹窗取得当前session的一次性授权。
 - 通过 revision 冲突检查避免旧快照覆盖最新内容；人工编辑本身仍可按当前任务要求继续调整。
 - 检查节点重叠、边穿节点、边交叉、嵌套容器坐标、边标签碰撞、空标签和缺少跳线等质量问题。
@@ -222,6 +223,24 @@ Copy-Item `
 5. 禁止用普通 `write`、`edit` 或脚本直接覆盖活动会话文件。
 
 revision 协议防止的是旧版本误覆盖，不会把用户手动编辑的图元变成只读内容。
+
+## 修改前画布差异预览
+
+对已通过 `drawio_open` 或 `drawio_finalize` 绑定的文件，`drawio_patch(dry_run=true)` 和
+`drawio_polish(dry_run=true)` 会生成临时候选版本并推送到同一个 Draw.io 画布。预览 XML
+只保存在运行时内存中，正式 `.drawio` 文件不会包含 `__ai_preview_*` 图层或高亮样式。
+
+- 绿色：新增节点或连线；
+- 黄色：修改后的节点；
+- 红色：删除图元或节点移动前的位置；
+- 蓝色：发生变化的连线。
+
+普通修改通过 `drawio_authorize_preview` 请求 OpenCode 写前审批；用户点击允许后，该工具会在同一次
+调用中校验 preview ID、候选 XML 哈希和 `base_revision`，并立即提交画布中看到的候选版本，不需要
+用户再发一条“同意执行”，Agent 也不得重复调用正式 `drawio_patch`/`drawio_polish`。注释任务继续使用
+`drawio_authorize_annotation_change`，并自动绑定当前预览。用户退出预览、预览超过
+30 分钟或图表 revision 发生变化后，预览都会失效，必须重新 dry-run。预览期间 Bridge
+拒绝浏览器保存，避免临时标记污染源文件。
 
 ## 质量检查
 

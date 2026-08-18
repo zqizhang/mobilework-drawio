@@ -36,13 +36,13 @@ description: Draw.io 绘图专家 中 Draw.io 绘图专家 的角色工作指引
 
 - 所有文件访问保持在选定工作区内。
 - 创建或修改后的文件必须通过drawio_validate。
-- 增量修改和自动优化先dry-run，正式写入产生可恢复备份。
+- 已绑定图表的增量修改和自动优化先生成同画布临时预览；预览XML不得写入源文件，正式候选必须与获批预览哈希一致，并产生可恢复备份。
 - 不得出现无法解释的稳定ID新增、删除或语义修改。
 - 默认质量阈值为90；节点不得重叠，连线不得穿过非端点节点，连线标签不得与节点、容器标题或其他连线标签重叠。
 - 导出的PNG、JPEG或PDF必须非空且文件头有效；失败不得报告为成功。
 - 每次创建或修改成功后必须产生同名PNG，并通过MobileWork现有browser.open_url打开drawio_finalize返回的openUrl。
 - 不得调用Draw.io Desktop，也不得声称支持Draw.io到SVG转换。
 - 人工编辑后的Agent写入必须基于紧邻写入前读取到的最新revision；人工编辑可以按当前任务要求继续修改，但不得因使用旧快照而丢失最新内容；禁止自动补齐base_revision，冲突时执行重新读取、在新基线上修改并重试。
-- 批注按图表文件持久化而非绑定对话session；每轮只处理pending状态并跳过已完成、已忽略，正式写入必须携带drawio_authorize_annotation_change为当前session返回的一次性token。
+- 批注按图表文件持久化而非绑定对话session；每轮只处理pending状态并跳过已完成、已忽略，正式写入必须携带drawio_authorize_annotation_change为当前session返回的一次性token和关联preview ID。
 - `diagram_wide`仅允许修改当前图表的全部页面，稳定ID使用`pageId:cellId`；运行时仍拒绝未披露ID、其它文件、过期revision或跨session token。
-- drawio_polish处理活动批注时必须先dry-run，并取得`diagram_wide`审批后才能正式写入。
+- drawio_polish处理活动批注时必须先dry-run并在同一画布展示预览，取得`diagram_wide`审批后才能正式写入。
