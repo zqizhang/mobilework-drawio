@@ -4657,6 +4657,9 @@ return `<!doctype html>
     #ann-list .item .instruction { color: #1f2937; white-space: pre-wrap; word-break: break-word; }
     #ann-list .item .cells { font-size: 11px; color: #64748b; margin-top: 6px; }
     #ann-list .item form { display: flex; gap: 6px; margin-top: 8px; }
+    #ann-list .item form button { border: 1px solid #c8d0dc; border-radius: 6px;
+      background: #fff; padding: 4px 10px; cursor: pointer; }
+    #ann-list .item.resolved form button { opacity: 1; }
     #ann-list .item form input { flex: 1; }
     #ann-none { color: #94a3b8; text-align: center; padding: 24px 8px; }
     #ann-form { display: none; flex: 1; flex-direction: column; }
@@ -4682,6 +4685,7 @@ return `<!doctype html>
       #history-btn, #ann-btn, #ann-drawer { background: #1e293b; color: #e2e8f0; border-color: #334155; }
       #history-btn:hover, #ann-btn:hover, #ann-drawer header button { background: #243049; }
       #ann-list .item { background: #243049; border-color: #334155; }
+      #ann-list .item form button { background: #243049; color: #e2e8f0; border-color: #334155; }
       #ann-list .item .instruction { color: #e2e8f0; }
       #ann-list .item .meta, #ann-list .item .cells { color: #94a3b8; }
       #ann-form textarea { background: #0f172a; color: #e2e8f0; border-color: #334155; }
@@ -5681,8 +5685,9 @@ return `<!doctype html>
         }
       }
 
-      async function resolveAnnotation(id, button) {
+      async function toggleResolution(id, button, action) {
         if (button) button.disabled = true;
+        const resolved = action !== "reopen";
         try {
           const url = new URL(CONFIG.annotationsUrl);
           url.pathname += "/" + encodeURIComponent(id);
@@ -5690,13 +5695,15 @@ return `<!doctype html>
           const response = await fetch(url.toString(), {
             method: "PATCH",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ status: "resolved", summary: "已由用户标记为已解决" }),
+            body: JSON.stringify(resolved
+              ? { status: "resolved", summary: "已由用户标记为已解决" }
+              : { status: "open" }),
           });
           const result = await response.json();
-          if (!response.ok) throw new Error(result.error || "标记已解决失败");
+          if (!response.ok) throw new Error(result.error || (resolved ? "标记已解决失败" : "标记未完成失败"));
           await refreshAnnotations();
         } catch (error) {
-          showStatus(error.message || "标记已解决失败", 5000);
+          showStatus(error.message, 5000);
           if (button) button.disabled = false;
         }
       }
@@ -5733,9 +5740,9 @@ return `<!doctype html>
           const result = task.result
             ? '<div style="margin-top:6px;font-size:11px;color:#64748b">已处理：' + escape(task.result.summary || "") + "（revision " + task.result.revision + "）</div>"
             : "";
-          const resolveBtn = task.status !== "resolved"
-            ? '<form><button type="button" data-resolve="' + escape(task.id) + '">标记已解决</button></form>'
-            : "";
+          const toggleBtn = task.status === "resolved"
+            ? '<form><button type="button" data-action="reopen" data-annotation="' + escape(task.id) + '">标记未完成</button></form>'
+            : '<form><button type="button" data-action="resolve" data-annotation="' + escape(task.id) + '">标记已解决</button></form>';
           return '<div class="item ' + status + '">'
             + '<div class="meta"><span class="badge ' + status + '">' + ({ open: "待处理", stale: "已过时", resolved: "已解决" }[status] || status) + '</span>'
             + '<span>页面 ' + escape(task.page.name || task.page.id) + '</span>'
@@ -5743,7 +5750,7 @@ return `<!doctype html>
             + '<div class="instruction">' + escape(task.instruction) + '</div>'
             + '<div class="cells">范围：' + escape(task.scopeLabel || "只修改选区") + ' · 图元：' + (cells || "（无）") + (region ? " · " + region : "") + '</div>'
             + (task.staleReason ? '<div style="margin-top:4px;font-size:11px;color:#b45309">⚠ ' + escape(task.staleReason) + '</div>' : "")
-            + result + resolveBtn + '</div>';
+            + result + toggleBtn + '</div>';
         }).join("");
       }
 
@@ -5755,8 +5762,9 @@ return `<!doctype html>
       annList.addEventListener("click", (event) => {
         const target = event.target;
         if (!(target instanceof HTMLElement)) return;
-        const id = target.getAttribute("data-resolve");
-        if (id) void resolveAnnotation(id, target);
+        const id = target.getAttribute("data-annotation");
+        const action = target.getAttribute("data-action");
+        if (id && (action === "resolve" || action === "reopen")) void toggleResolution(id, target, action);
       });
 
       historyBtn.addEventListener("click", () => void openHistory());
@@ -6512,7 +6520,7 @@ const DRAWIO_RUNTIME_GUIDANCE = `## Draw.io 文件写入与交付
 每次修改前必须立即调用 drawio_get_state，并把返回的最新 XML 作为修改基线。人工编辑不是只读内容，可以按当前任务要求继续调整。
 提交时必须携带该次读取返回的准确 base_revision；revision_conflict 后重新读取，在新 XML 上重新执行所需变更并重试，禁止重发旧 XML。
 禁止用普通 write、edit 或脚本直接覆盖已绑定的 .drawio 文件，因为这会绕过 revision 检查并可能用旧快照丢失最新内容。
-本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。只有返回 shouldOpenBrowser=true 时才将 openUrl 交给 MobileWork 现有 browser.open_url 打开；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
+本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。调用前必须先调用 drawio_list_annotations(status='open') 探测未完成注释；存在 requiresConfirmation=false 的注释时 drawio_finalize 会拒绝执行，必须先逐条处理并 drawio_resolve_annotation 后再重试，不得跳过。只有返回 shouldOpenBrowser=true 时才将 openUrl 交给 MobileWork 现有 browser.open_url 打开；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
 
 ## 注释任务（框选评审）
 
@@ -7203,7 +7211,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
 
     drawio_finalize: tool({
       description:
-        "Finish a Draw.io task: refresh the latest revision, validate and score it, export an up-to-date PNG, bind the browser session, and report whether a new editor must be opened.",
+        "Finish a Draw.io task: refresh the latest revision, validate and score it, export an up-to-date PNG, bind the browser session, and report whether a new editor must be opened. Refuses to run while any fresh (requiresConfirmation=false) annotation is still open; returns pendingAnnotations for open annotations that still need user confirmation.",
       args: {
         file: tool.schema.string().describe("Workspace-relative .drawio or .xml file"),
         output_path: tool.schema
@@ -7234,6 +7242,28 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           throw new Error(`refusing to finalize invalid Draw.io XML: ${JSON.stringify(validation.errors)}`)
         }
         const quality = qualityReport(pages, args.threshold)
+        const bound = await bindIntegratedSession(context, source)
+        const openAnnotationTasks = [...getDiagramAnnotations(bound.session).values()]
+          .filter((task) => task.status === "open")
+        const blockingAnnotations = openAnnotationTasks.filter(
+          (task) => !annotationEffectiveState(bound.session, task).requiresConfirmation,
+        )
+        if (blockingAnnotations.length > 0) {
+          throw new Error(
+            `refusing to finalize: ${blockingAnnotations.length} unfinished fresh annotation(s) must be handled first — `
+            + blockingAnnotations.map((task) => `${task.id}: ${task.instruction.slice(0, 120)}`).join(" | ")
+            + ". Handle each one (plan, get approval, write, then drawio_resolve_annotation) before calling drawio_finalize again.",
+          )
+        }
+        const pendingAnnotations = openAnnotationTasks.map((task) => {
+          const state = annotationEffectiveState(bound.session, task)
+          return {
+            id: task.id,
+            instruction: task.instruction,
+            requiresConfirmation: state.requiresConfirmation,
+            freshness: state.freshness,
+          }
+        })
         const exported = await exportDiagramToFile({
           context,
           inputTarget: source,
@@ -7245,7 +7275,6 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           background: args.background,
           overwrite: true,
         })
-        const bound = await bindIntegratedSession(context, source)
         const editorUrl = drawioEditorUrl(
           args.drawio_url?.trim()
           || process.env.DRAWIO_WEB_URL?.trim()
@@ -7269,6 +7298,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
             content_type: exported.contentType,
             export_url: exported.exportUrl,
           },
+          pendingAnnotations,
           openUrl: openUrl.toString(),
           editorUrl: editorUrl.toString(),
           editorConnected,

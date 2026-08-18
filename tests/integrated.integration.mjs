@@ -588,6 +588,43 @@ try {
   }, context))
   assert.equal(openAfterResolve.count, 0)
 
+  // Reopen a resolved annotation via the UI-toggle server path (PATCH status=open):
+  // the state must revert, result/resolvedAt must clear, and no stale approval survives.
+  const reopenUrl = new URL(annotationsUrl.toString())
+  reopenUrl.pathname += "/" + encodeURIComponent(submitted.annotation.id)
+  const reopened = await fetch(reopenUrl, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ status: "open" }),
+  }).then((response) => response.json())
+  assert.equal(reopened.ok, true)
+  assert.equal(reopened.annotation.status, "open")
+  assert.equal(reopened.annotation.result, null)
+  assert.equal(reopened.annotation.resolvedAt, null)
+
+  const reopenedDetail = JSON.parse(await plugin.tool.drawio_get_annotation.execute({
+    file: "architecture.drawio",
+    id: submitted.annotation.id,
+  }, context))
+  assert.equal(reopenedDetail.annotation.status, "open")
+  assert.equal(reopenedDetail.annotation.resolvedAt, null, "reopen must clear the resolved timestamp")
+  assert.equal(reopenedDetail.annotation.authorization, null, "reopen must not carry over a stale approval")
+
+  const reopenedList = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
+    file: "architecture.drawio",
+    status: "open",
+  }, context))
+  assert.equal(reopenedList.count, 1, "reopened annotation must reappear in open tasks")
+
+  const reResolved = await fetch(reopenUrl, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ status: "resolved", summary: "已由用户标记为已解决" }),
+  }).then((response) => response.json())
+  assert.equal(reResolved.ok, true)
+  assert.equal(reResolved.annotation.status, "resolved")
+  assert.equal(reResolved.annotation.resolvedAt, reResolved.annotation.result.updatedAt)
+
   const globalAnn = await fetch(annotationsUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -852,6 +889,110 @@ try {
   assert.equal(annotationFinalize.ok, true)
   assert.equal(annotationFinalize.png.output_path, "architecture.png")
   assert.match(annotationFinalize.openUrl, /\/editor\?/)
+  assert.deepEqual(annotationFinalize.pendingAnnotations, [])
+
+  // The finalize gate must hard-block while a fresh (requiresConfirmation=false)
+  // annotation is still open: it cannot silently finalize unfinished work.
+  const blockingAnn = await fetch(annotationsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "必须先行处理的门禁注释",
+      scope: "selection_only",
+      pageId,
+      pageName,
+      cells: [{ id: "node", kind: "node", label: "Draw.io Confirmed" }],
+    }),
+  }).then((response) => response.json())
+  assert.equal(blockingAnn.ok, true)
+  await assert.rejects(
+    () => plugin.tool.drawio_finalize.execute({
+      file: "architecture.drawio",
+      threshold: 0,
+      scale: 1,
+      border: 0,
+    }, context),
+    /refusing to finalize: 1 unfinished fresh annotation/,
+  )
+
+  // Handle and resolve the fresh annotation, then finalize succeeds with no pending work.
+  await plugin.tool.drawio_get_annotation.execute({ id: blockingAnn.annotation.id }, context)
+  const blockingState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
+  const blockingPatchDryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    annotation_id: blockingAnn.annotation.id,
+    operations: [{ type: "update-node", id: "node", label: "Draw.io Gated" }],
+    dry_run: true,
+    base_revision: blockingState.revision,
+  }, context))
+  assert.equal(blockingPatchDryRun.dryRun, true)
+  const blockingApproval = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
+    id: blockingAnn.annotation.id,
+    plan: "用户确认后把选中节点门禁注释对应的改名执行完成",
+    proposed_changed_ids: ["node"],
+    requested_scope: "selection_only",
+  }, context))
+  const blockingPatch = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    annotation_id: blockingAnn.annotation.id,
+    operations: [{ type: "update-node", id: "node", label: "Draw.io Gated" }],
+    dry_run: false,
+    base_revision: blockingState.revision,
+    approval_token: blockingApproval.approvalToken,
+  }, context))
+  assert.equal(blockingPatch.diff.summary.changed, 1)
+  const blockingResolved = JSON.parse(await plugin.tool.drawio_resolve_annotation.execute({
+    id: blockingAnn.annotation.id,
+    summary: "门禁注释已处理",
+    changed_ids: ["node"],
+  }, context))
+  assert.equal(blockingResolved.annotation.status, "resolved")
+  const gateFinalize = JSON.parse(await plugin.tool.drawio_finalize.execute({
+    file: "architecture.drawio",
+    threshold: 0,
+    scale: 1,
+    border: 0,
+  }, context))
+  assert.equal(gateFinalize.ok, true)
+  assert.equal(gateFinalize.pendingAnnotations.length, 0)
+
+  // A stale (requiresConfirmation=true) annotation does not block finalize, but is
+  // reported through pendingAnnotations so the agent asks the user before ending.
+  const staleGateAnn = await fetch(annotationsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "等待用户确认的过时注释",
+      scope: "selection_only",
+      pageId,
+      pageName,
+      cells: [{ id: "node", kind: "node", label: "Draw.io Gated" }],
+    }),
+  }).then((response) => response.json())
+  assert.equal(staleGateAnn.ok, true)
+  const staleGateState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
+  const staleGateExternal = await fetch(apiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      xml: JSON.parse(await plugin.tool.drawio_get_state.execute({}, context)).xml.replace("Draw.io Gated", "Draw.io Gated Manual"),
+      baseRevision: staleGateState.revision,
+      source: "editor",
+      clientId: "stale-gate-test",
+    }),
+  })
+  assert.equal(staleGateExternal.status, 200)
+  const staleGateFinalize = JSON.parse(await plugin.tool.drawio_finalize.execute({
+    file: "architecture.drawio",
+    threshold: 0,
+    scale: 1,
+    border: 0,
+  }, context))
+  assert.equal(staleGateFinalize.ok, true)
+  assert.equal(staleGateFinalize.pendingAnnotations.length, 1)
+  assert.equal(staleGateFinalize.pendingAnnotations[0].id, staleGateAnn.annotation.id)
+  assert.equal(staleGateFinalize.pendingAnnotations[0].requiresConfirmation, true)
+  assert.equal(staleGateFinalize.pendingAnnotations[0].freshness, "stale")
 
   await fs.writeFile(path.join(workspace, "other.drawio"), XML, "utf8")
   const originalEventsUrl = new URL(annotationFinalize.openUrl)
