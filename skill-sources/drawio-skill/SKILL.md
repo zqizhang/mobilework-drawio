@@ -1,7 +1,7 @@
 ---
 name: drawio-skill
 version: 3.0.0
-description: 当用户需要生成图表、流程图、架构图、ER图、UML/序列/类图、SysML/MBSE图（块定义、内部块、需求、参数）、BPMN业务流程图、泳道/跨职能流程图、网络拓扑、Terraform或Kubernetes基础设施图、ML/DL模型图（Transformer/CNN/LSTM）、思维导图等可视化内容时使用。也应在解释含有3个以上组件、复杂数据流或适合可视化的系统关系时主动使用。适用于需要自定义样式、丰富形状词汇、泳道或导出图像（PNG/JPEG/PDF）的场景。生成.drawio XML并通过专家包内TypeScript运行时调用Docker Export Server导出图像。
+description: 当用户需要生成图表、流程图、架构图、ER图、UML/序列/类图、SysML/MBSE图（块定义、内部块、需求、参数）、BPMN业务流程图、泳道/跨职能流程图、网络拓扑、Terraform或Kubernetes基础设施图、ML/DL模型图（Transformer/CNN/LSTM）、思维导图等可视化内容时使用。也应在解释含有3个以上组件、复杂数据流或适合可视化的系统关系时主动使用。适用于需要自定义样式、丰富形状词汇、泳道或导出PNG/JPEG/PDF/xmlpng/SVG/xmlsvg/html2的场景。生成.drawio XML；位图和PDF通过Docker Export Server导出，SVG、可编辑SVG和HTML通过自动打开的内置浏览器与Bridge导出。
 license: MIT
 homepage: https://github.com/Agents365-ai/drawio-skill
 compatibility: 核心创建、校验、质量检查、Docker HTTP导出和内置浏览器协同由专家包内OpenCode TypeScript插件提供，用户无需安装Python、uv、npm或Draw.io Desktop。可选高级脚本需要Python，autolayout.py还需要Graphviz（dot）；缺少时不得作为默认主流程。
@@ -13,15 +13,15 @@ metadata: {"openclaw":{"emoji":"📐","os":["darwin","linux","win32"]},"hermes":
 
 ## 概述
 
-通过编写`.drawio` XML生成专业图表，并调用专家包内**TypeScript运行时工具**将图表导出为PNG、JPEG或PDF。
+通过编写`.drawio` XML生成专业图表，并调用专家包内**TypeScript运行时工具**导出PNG、JPEG、PDF、可编辑PNG、SVG、可编辑SVG或HTML。
 
-**支持格式：** PNG、JPEG、PDF —— 全部通过运行时工具`drawio_export`完成。
+**支持格式：** PNG、JPEG、PDF、xmlpng、SVG、xmlsvg、html2 —— 全部通过运行时工具`drawio_export`完成。
 
-> **注意：** PNG、JPEG和PDF通过TypeScript插件调用Docker HTTP Export Server完成，不依赖Python MCP、npm命令或宿主机Draw.io Desktop。
+> **注意：** PNG、JPEG、PDF和xmlpng通过TypeScript插件调用Docker HTTP Export Server；SVG、xmlsvg和html2由内置浏览器中的Draw.io编辑器渲染并通过Bridge写回工作区。编辑器未连接时，Agent必须自动打开工具返回的`openUrl`并重试。整个流程不依赖Python MCP、npm命令或宿主机Draw.io Desktop。
 
 ## 适用与不适用场景
 
-**使用本Skill：** 需要精美、精确的图表（架构、网络、严格UML、ERD），需要不透明填充、10,000+官方/品牌形状、泳道或自定义几何图形，导出为PNG/JPEG/PDF。
+**使用本Skill：** 需要精美、精确的图表（架构、网络、严格UML、ERD），需要不透明填充、10,000+官方/品牌形状、泳道或自定义几何图形，或需要导出上述七种格式。
 
 **不使用本Skill，改用其他方案：**
 
@@ -235,8 +235,8 @@ drawio_export(
 | `input_path` | string | 是 | 本地.drawio文件路径 |
 | `format` | string | 是 | 输出格式：`png`、`jpeg`、`pdf`、`xmlpng`、`svg`、`xmlsvg`、`html2` |
 | `output_path` | string | 否 | 输出路径；未提供时在输入文件旁自动生成（xmlpng默认`.editable.png`，xmlsvg默认`.editable.svg`） |
-| `page_id` | string | 否 | 指定导出的页面ID（仅Docker通道格式支持） |
-| `all_pages` | bool | 否 | 导出所有页面（默认false，仅Docker通道格式支持） |
+| `page_id` | string | 否 | 指定导出的稳定页面ID；所有格式均支持，不能与`all_pages`同时使用 |
+| `all_pages` | bool | 否 | 导出所有页面（默认false）：PNG/JPEG/xmlpng/SVG/xmlsvg逐页生成独立文件并返回`outputs[]`；PDF和html2各生成一个包含全部页面的文件 |
 | `scale` | float | 否 | 缩放比例（默认1） |
 | `border` | int | 否 | 边框宽度像素（默认0） |
 | `background` | string | 否 | 背景色，默认白色`#ffffff`；需要其他背景时可显式覆盖 |
@@ -246,7 +246,9 @@ drawio_export(
 **预览建议：** `format="png"`，输出到`preview/`或临时目录，`overwrite=true`。
 **最终文件建议：** `overwrite=false`（默认），未经用户允许不得覆盖已有文件。
 
-**SVG/HTML导出流程（编辑器通道）：** 若编辑器页面未打开，工具返回`status="editor_required"`及`openUrl`，此时先用MobileWork内置浏览器`browser.open_url`打开`openUrl`，等待编辑器加载完成后再以相同参数重试`drawio_export`即可完成导出。`page_id`/`all_pages`对编辑器通道格式暂不支持（导出编辑器当前打开的页面）。
+**SVG/HTML导出流程（编辑器通道）：** 若编辑器页面未打开，工具返回`status="editor_required"`及`openUrl`。Agent必须立即用MobileWork内置浏览器`browser.open_url`自动打开`openUrl`，等待编辑器连接后以相同参数重试`drawio_export`，由Bridge接收编辑器产物并写入工作区；不得把`editor_required`解释为格式不支持，也不应让用户手工执行菜单导出。指定`page_id`时，Bridge使用隐藏的导出专用编辑器加载冻结XML，不切换用户可见页面；`all_pages=true`时SVG/xmlsvg返回逐页文件，html2返回一个多页HTML文件。
+
+**禁止错误降级：** 用户请求SVG或xmlsvg的`all_pages=true`时，必须直接调用`drawio_export`并使用返回的`outputs[]`；不得声称运行时不支持，也不得在未调用工具时改成逐个`page_id`导出。只有工具真实返回错误时才能报告失败，`editor_required`应按上述自动打开与重试流程处理。
 
 ### drawio_validate
 
@@ -353,6 +355,10 @@ PNG导出统一调用专家提供的`drawio_export`或`drawio_finalize`工具，
 - ✅ SVG导出（`drawio_export`，format="svg"，编辑器通道）
 - ✅ 可编辑SVG导出（`drawio_export`，format="xmlsvg"，编辑器通道）
 - ✅ HTML导出（`drawio_export`，format="html2"，编辑器通道）
+- ✅ 多页PNG/JPEG/xmlpng逐页导出（`all_pages=true`返回与页面数一致的`outputs[]`）
+- ✅ 多页PDF单文件导出（`all_pages=true`）
+- ✅ SVG/xmlsvg按`page_id`导出及多页逐页导出（编辑器通道，`all_pages=true`返回`outputs[]`）
+- ✅ HTML按`page_id`导出及多页单文件导出（编辑器通道，`all_pages=true`）
 - ✅ 服务健康检查（`drawio_health_check`）
 - ✅ deep模式实际导出验证
 
@@ -363,7 +369,6 @@ PNG导出统一调用专家提供的`drawio_export`或`drawio_finalize`工具，
 - ❌ **嵌入XML的可编辑PDF** —— 当前Docker后端的PDF导出可能不嵌入源XML。
 - ❌ **Mermaid→原生.drawio自动转换** —— 当前专家不提供该转换；改用原生XML、`drawio_create`或Graphviz自动布局。
 - ❌ **Draw.io ELK布局命令** —— 当前专家不提供；大型图使用`autolayout.py`的Graphviz布局。
-- ❌ **编辑器通道的页面选择** —— svg/xmlsvg/html2导出编辑器当前打开的页面，暂不支持`page_id`/`all_pages`。
 
 **处理原则：**
 1. 用户请求这些功能时，明确说明当前运行时暂不支持。

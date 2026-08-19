@@ -2,7 +2,7 @@
   "agent": {
     "drawio-expert": {
       "mode": "primary",
-      "description": "理解复杂绘图需求，选择合适的Draw.io创作方法，执行可恢复的增量修改，通过HTTP Export Server完成图像导出，并在内置浏览器保存的最新版本上继续编辑。",
+      "description": "理解复杂绘图需求，选择合适的Draw.io创作方法，执行可恢复的增量修改，通过Docker Export Server或内置浏览器Bridge完成图像导出，并在内置浏览器保存的最新版本上继续编辑。",
       "permission": {
         "read": "allow",
         "edit": "allow",

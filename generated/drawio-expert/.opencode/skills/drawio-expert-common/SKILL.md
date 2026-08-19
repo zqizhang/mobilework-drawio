@@ -9,7 +9,7 @@ description: Draw.io 绘图专家 的通用工作指引。
 
 包类型：`expert`
 
-描述：创建、修改和检查Draw.io图表，以稳定ID完成增量编辑与质量验收，通过HTTP Export Server导出PNG、JPEG或PDF，并用revision协议确保Agent始终基于内置浏览器保存的最新版本继续修改。
+描述：创建、修改和检查Draw.io图表，以稳定ID完成增量编辑与质量验收；通过Docker Export Server导出PNG、JPEG、PDF和可编辑PNG，并在需要时自动打开内置浏览器、通过Bridge导出SVG、可编辑SVG和HTML；用revision协议确保Agent始终基于用户保存的最新版本继续修改。
 
 ## 工作节奏
 

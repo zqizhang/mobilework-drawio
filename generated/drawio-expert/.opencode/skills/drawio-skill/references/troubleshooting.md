@@ -9,7 +9,7 @@
 | Empty or wrong file type | Run `drawio_health_check(deep=true)`; the client rejects invalid PNG/JPEG/PDF magic bytes. |
 | Output already exists | Choose another path or explicitly set `overwrite=true`. |
 | Path rejected | Keep input and output under the selected MobileWork workspace and set `DRAWIO_WORKSPACE_ROOT` only when the runtime needs an explicit root. |
-| Need SVG | The current HTTP backend does not support Draw.io-to-SVG conversion. Keep the `.drawio` source or use an explicit external workflow. |
+| Need SVG / editable SVG / HTML | These formats do not use the HTTP Export Server. Call `drawio_export`; on `editor_required`, immediately open the returned `openUrl` in MobileWork's built-in browser and retry so the editor renders the artifact through the Bridge. |
 
 ## Diagram quality
 
