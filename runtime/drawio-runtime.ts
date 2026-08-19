@@ -2083,6 +2083,8 @@ type ExportFormat = "png" | "jpeg" | "pdf" | "svg" | "xmlsvg" | "xmlpng" | "html
 // Formats rendered by the Draw.io editor iframe in the built-in browser (embed
 // protocol export action) instead of the Docker ImageExport4 server.
 const EDITOR_EXPORT_FORMATS = new Set<ExportFormat>(["svg", "xmlsvg", "html2"])
+const MULTI_FILE_EXPORT_FORMATS = new Set<ExportFormat>(["png", "jpeg", "xmlpng"])
+const EDITOR_MULTI_FILE_EXPORT_FORMATS = new Set<ExportFormat>(["svg", "xmlsvg"])
 
 type ExportOptions = {
   pageId?: string
@@ -2206,6 +2208,50 @@ function resolveExportOutput(
     throw new Error("output file must resolve inside the current workspace")
   }
   return target
+}
+
+function resolveMultiPageExportOutputs(
+  context: WorkspaceContext,
+  input: string,
+  output: string | undefined,
+  format: ExportFormat,
+  pages: ParsedPage[],
+): Array<{ page: ParsedPage; pageIndex: number; outputTarget: string }> {
+  const baseTarget = resolveExportOutput(context, input, output, format)
+  const extension = [...allowedOutputExtensions(format)]
+    .sort((left, right) => right.length - left.length)
+    .find((candidate) => baseTarget.toLowerCase().endsWith(candidate))
+  if (!extension) throw new Error(`cannot derive a multi-page output name for ${format}`)
+  const stem = baseTarget.slice(0, -extension.length)
+  return pages.map((page, index) => ({
+    page,
+    pageIndex: index + 1,
+    outputTarget: `${stem}.page-${index + 1}-${slug(page.name)}${extension}`,
+  }))
+}
+
+function requireExportPage(xml: string, pageId: string): ParsedPage {
+  const page = parseDrawio(xml).find((candidate) => candidate.id === pageId)
+  if (!page) {
+    throw new Error(`requested page ID ${JSON.stringify(pageId)} was not found in the Draw.io document`)
+  }
+  return page
+}
+
+function singlePageDrawioXml(xml: string, pageId: string): string {
+  requireExportPage(xml, pageId)
+  const document = parser.parse(xml) as Record<string, unknown>
+  const mxfile = document.mxfile as Record<string, unknown> | undefined
+  if (!mxfile) throw new Error("Draw.io document is missing mxfile")
+  const diagrams = asArray(
+    mxfile.diagram as Record<string, unknown> | Record<string, unknown>[] | undefined,
+  )
+  const selected = diagrams.find((diagram) => attribute(diagram["@_id"]) === pageId)
+  if (!selected) {
+    throw new Error(`requested page ID ${JSON.stringify(pageId)} was not found in the Draw.io document`)
+  }
+  mxfile.diagram = selected
+  return builder.build(document)
 }
 
 function validateExportBytes(content: Buffer, format: ExportFormat, contentType: string) {
@@ -2336,6 +2382,81 @@ async function atomicWriteBinary(target: string, content: Buffer, overwrite: boo
   await fs.rename(temporary, target)
 }
 
+async function atomicWriteBinaryBatch(
+  files: Array<{ target: string; content: Buffer }>,
+  overwrite: boolean,
+): Promise<void> {
+  const uniqueTargets = new Set(files.map((file) => path.resolve(file.target)))
+  if (uniqueTargets.size !== files.length) throw new Error("multi-page export resolved duplicate output paths")
+
+  const staged: Array<{
+    target: string
+    temporary: string
+    backup: string | null
+    existed: boolean
+  }> = []
+  try {
+    for (const [index, file] of files.entries()) {
+      await fs.mkdir(path.dirname(file.target), { recursive: true })
+      let existed = false
+      try {
+        existed = (await fs.stat(file.target)).isFile()
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+      }
+      if (existed && !overwrite) {
+        throw new Error(`output already exists: ${file.target}; set overwrite=true to replace it`)
+      }
+      const nonce = `${process.pid}.${Date.now()}.${index}.${randomUUID()}`
+      const temporary = `${file.target}.${nonce}.tmp`
+      await fs.writeFile(temporary, file.content)
+      staged.push({
+        target: file.target,
+        temporary,
+        backup: existed ? `${file.target}.${nonce}.previous` : null,
+        existed,
+      })
+    }
+
+    const committed: typeof staged = []
+    try {
+      for (const file of staged) {
+        if (file.existed && file.backup) await fs.rename(file.target, file.backup)
+        try {
+          await fs.rename(file.temporary, file.target)
+          committed.push(file)
+        } catch (error) {
+          if (file.existed && file.backup) await fs.rename(file.backup, file.target)
+          throw error
+        }
+      }
+    } catch (error) {
+      for (const file of committed.reverse()) {
+        await fs.rm(file.target, { force: true })
+        if (file.existed && file.backup) await fs.rename(file.backup, file.target)
+      }
+      throw error
+    }
+
+    for (const file of staged) {
+      if (file.backup) await fs.rm(file.backup, { force: true })
+    }
+  } finally {
+    for (const file of staged) {
+      await fs.rm(file.temporary, { force: true })
+      if (file.backup) {
+        try {
+          await fs.access(file.target)
+        } catch {
+          try {
+            await fs.rename(file.backup, file.target)
+          } catch { /* best-effort rollback after an interrupted batch commit */ }
+        }
+      }
+    }
+  }
+}
+
 async function exportDiagramToFile(options: {
   context: WorkspaceContext
   inputTarget: string
@@ -2373,12 +2494,83 @@ async function exportDiagramToFile(options: {
   }
 }
 
+async function exportDiagramPagesToFiles(options: {
+  context: WorkspaceContext
+  inputTarget: string
+  xml: string
+  format: ExportFormat
+  outputPath?: string
+  scale?: number
+  border?: number
+  background?: string
+  embedXml?: boolean
+  overwrite: boolean
+}) {
+  if (!MULTI_FILE_EXPORT_FORMATS.has(options.format)) {
+    throw new Error(`${options.format} is not a per-page multi-file export format`)
+  }
+  const pages = parseDrawio(options.xml)
+  const outputs = resolveMultiPageExportOutputs(
+    options.context,
+    options.inputTarget,
+    options.outputPath,
+    options.format,
+    pages,
+  )
+  if (!options.overwrite) {
+    for (const output of outputs) {
+      try {
+        if ((await fs.stat(output.outputTarget)).isFile()) {
+          throw new Error(
+            `output already exists: ${workspaceRelative(options.context, output.outputTarget)}; set overwrite=true to replace it`,
+          )
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+      }
+    }
+  }
+
+  const rendered: Array<{
+    page: ParsedPage
+    pageIndex: number
+    outputTarget: string
+    content: Buffer
+    contentType: string
+    exportUrl: string
+  }> = []
+  for (const output of outputs) {
+    const result = await requestDrawioExport(options.xml, options.format, {
+      pageId: output.page.id,
+      scale: options.scale,
+      border: options.border,
+      background: options.background,
+      embedXml: options.embedXml,
+    })
+    rendered.push({ ...output, ...result })
+  }
+  for (const output of rendered) {
+    await atomicWriteBinary(output.outputTarget, output.content, options.overwrite)
+  }
+  return rendered.map((output) => ({
+    pageId: output.page.id,
+    pageName: output.page.name,
+    pageIndex: output.pageIndex,
+    outputTarget: output.outputTarget,
+    bytes: output.content.length,
+    contentType: output.contentType,
+    exportUrl: output.exportUrl,
+  }))
+}
+
 type EditorExportOutcome =
   | {
     status: "exported"
     outputTarget: string
     bytes: number
     contentType: string
+    content?: Buffer
+    sourceRevision?: number
   }
   | {
     status: "editor_required"
@@ -2408,6 +2600,11 @@ async function exportDiagramViaEditor(options: {
   inputTarget: string
   format: ExportFormat
   outputPath?: string
+  xml?: string
+  pageId?: string
+  allPages?: boolean
+  sourceRevision?: number
+  writeOutput?: boolean
   overwrite: boolean
 }): Promise<EditorExportOutcome> {
   if (!EDITOR_EXPORT_FORMATS.has(options.format)) {
@@ -2453,15 +2650,122 @@ async function exportDiagramViaEditor(options: {
       format: options.format,
       outputTarget,
       overwrite: options.overwrite,
-      resolve: (result) => resolve({ status: "exported", ...result }),
+      writeOutput: options.writeOutput !== false,
+      resolve: (result) => resolve({
+        status: "exported",
+        ...result,
+        sourceRevision: options.sourceRevision,
+      }),
       reject,
       timer,
     })
     broadcastEditorCommand(
       bound.session,
-      { action: "export", requestId, format: options.format },
+      {
+        action: "export",
+        requestId,
+        format: options.format,
+        pageId: options.pageId,
+        allPages: options.allPages === true,
+        xml: options.xml,
+        sourceRevision: options.sourceRevision,
+      },
     )
   })
+}
+
+type EditorMultiPageExportOutcome =
+  | {
+    status: "exported"
+    outputs: Array<{
+      pageId: string
+      pageName: string
+      pageIndex: number
+      outputTarget: string
+      bytes: number
+      contentType: string
+    }>
+    sourceRevision?: number
+  }
+  | {
+    status: "editor_required"
+    openUrl: string
+    tokenExpiresAt: string
+  }
+
+async function exportDiagramPagesViaEditor(options: {
+  context: { sessionID: string; directory: string; worktree?: string }
+  inputTarget: string
+  xml: string
+  format: ExportFormat
+  outputPath?: string
+  sourceRevision?: number
+  overwrite: boolean
+}): Promise<EditorMultiPageExportOutcome> {
+  if (!EDITOR_MULTI_FILE_EXPORT_FORMATS.has(options.format)) {
+    throw new Error(`${options.format} is not an editor per-page multi-file export format`)
+  }
+  const pages = parseDrawio(options.xml)
+  const outputs = resolveMultiPageExportOutputs(
+    options.context,
+    options.inputTarget,
+    options.outputPath,
+    options.format,
+    pages,
+  )
+  if (!options.overwrite) {
+    for (const output of outputs) {
+      try {
+        if ((await fs.stat(output.outputTarget)).isFile()) {
+          throw new Error(
+            `output already exists: ${workspaceRelative(options.context, output.outputTarget)}; set overwrite=true to replace it`,
+          )
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+      }
+    }
+  }
+
+  const rendered: Array<{
+    page: ParsedPage
+    pageIndex: number
+    outputTarget: string
+    content: Buffer
+    contentType: string
+  }> = []
+  for (const output of outputs) {
+    const result = await exportDiagramViaEditor({
+      context: options.context,
+      inputTarget: options.inputTarget,
+      format: options.format,
+      outputPath: workspaceRelative(options.context, output.outputTarget),
+      xml: options.xml,
+      pageId: output.page.id,
+      sourceRevision: options.sourceRevision,
+      writeOutput: false,
+      overwrite: options.overwrite,
+    })
+    if (result.status === "editor_required") return result
+    if (!result.content) throw new Error("editor export completed without buffered content")
+    rendered.push({ ...output, content: result.content, contentType: result.contentType })
+  }
+  await atomicWriteBinaryBatch(
+    rendered.map((output) => ({ target: output.outputTarget, content: output.content })),
+    options.overwrite,
+  )
+  return {
+    status: "exported",
+    sourceRevision: options.sourceRevision,
+    outputs: rendered.map((output) => ({
+      pageId: output.page.id,
+      pageName: output.page.name,
+      pageIndex: output.pageIndex,
+      outputTarget: output.outputTarget,
+      bytes: output.content.length,
+      contentType: output.contentType,
+    })),
+  }
 }
 
 async function checkExportConnectivity(): Promise<{ reachable: boolean; error?: string }> {
@@ -3010,7 +3314,13 @@ type PendingEditorExport = {
   format: ExportFormat
   outputTarget: string
   overwrite: boolean
-  resolve: (result: { outputTarget: string; bytes: number; contentType: string }) => void
+  writeOutput: boolean
+  resolve: (result: {
+    outputTarget: string
+    bytes: number
+    contentType: string
+    content?: Buffer
+  }) => void
   reject: (error: Error) => void
   timer: ReturnType<typeof setTimeout>
 }
@@ -3355,7 +3665,7 @@ function broadcastIntegratedRevision(session: IntegratedSession, clientId: strin
     updatedBy: session.updatedBy,
     updatedAt: session.updatedAt,
     clientId,
-  })}\\n\\n`
+  })}\n\n`
   const diagramKey = integratedDiagramKey(session.file)
   for (const client of getIntegratedBridgeState().eventClients.get(session.sessionId) || []) {
     if (client.diagramKey === diagramKey) client.response.write(payload)
@@ -3544,7 +3854,7 @@ function broadcastHistory(
   kind: string,
   payload: Record<string, unknown>,
 ): void {
-  const data = `event: history\\ndata: ${JSON.stringify({ kind, ...payload })}\\n\\n`
+  const data = `event: history\ndata: ${JSON.stringify({ kind, ...payload })}\n\n`
   const diagramKey = integratedDiagramKey(session.file)
   for (const client of getIntegratedBridgeState().eventClients.get(session.sessionId) || []) {
     if (client.diagramKey === diagramKey) client.response.write(data)
@@ -4311,7 +4621,9 @@ function annotationScopeContext(
   scope: AnnotationScope,
 ): AnnotationScopeContext {
   const pages = parseDrawio(session.xml)
-  const page = pages.find((candidate) => candidate.id === task.pageId) || pages[0]
+  const page = task.pageId
+    ? pages.find((candidate) => candidate.id === task.pageId)
+    : pages[0]
   if (!page) throw new Error(`annotation page not found: ${task.pageId || "(first page)"}`)
   const cellsById = new Map(page.cells.map((cell) => [cell.id, cell]))
   const selectedIds = new Set(task.cells.map((cell) => cell.id))
@@ -4731,7 +5043,7 @@ function broadcastAnnotation(session: IntegratedSession, task: AnnotationTask, k
     const payload = `event: annotation\\ndata: ${JSON.stringify({
       kind,
       annotation: annotationPayload(candidate, task),
-    })}\\n\\n`
+    })}\n\n`
     const candidateDiagramKey = integratedDiagramKey(candidate.file)
     for (const client of state.eventClients.get(candidate.sessionId) || []) {
       if (client.diagramKey === candidateDiagramKey) client.response.write(payload)
@@ -5170,7 +5482,10 @@ return `<!doctype html>
       let saveChain = Promise.resolve();
       let externalTimer = null;
       let editorReady = false;
-      let pendingExport = null; // { format, requestId } file export requested via SSE editor-command
+      let pendingExport = null; // file export requested via SSE editor-command
+      let exportWorker = null;
+      let exportWorkerReady = false;
+      let exportWorkerLoaded = false;
       let pendingSelection = null;
       let awaitingSelection = false;
       let editorMode = "editing"; // editing | restoring | loading-restored-xml | conflict
@@ -5220,16 +5535,49 @@ return `<!doctype html>
         editor.contentWindow?.postMessage(JSON.stringify(payload), CONFIG.drawioOrigin);
       }
 
+      function sendExportWorker(payload) {
+        exportWorker?.contentWindow?.postMessage(JSON.stringify(payload), CONFIG.drawioOrigin);
+      }
+
+      function clearExportWorker() {
+        exportWorkerReady = false;
+        exportWorkerLoaded = false;
+        if (exportWorker) exportWorker.remove();
+        exportWorker = null;
+      }
+
+      function startExportWorker(active) {
+        clearExportWorker();
+        const workerUrl = new URL(CONFIG.drawioUrl);
+        if (active.pageId) workerUrl.searchParams.set("page-id", active.pageId);
+        workerUrl.searchParams.set("export-worker", active.requestId);
+        exportWorker = document.createElement("iframe");
+        exportWorker.setAttribute("aria-hidden", "true");
+        exportWorker.style.position = "fixed";
+        exportWorker.style.left = "-10000px";
+        exportWorker.style.top = "0";
+        exportWorker.style.width = "1200px";
+        exportWorker.style.height = "800px";
+        exportWorker.style.opacity = "0";
+        exportWorker.style.pointerEvents = "none";
+        exportWorker.src = workerUrl.toString();
+        document.body.appendChild(exportWorker);
+      }
+
       function dispatchExport() {
-        if (!editorReady || !pendingExport) return;
+        if (!pendingExport) return;
         const active = pendingExport;
-        sendEditor({
+        if (active.useWorker && (!exportWorkerReady || !exportWorkerLoaded)) return;
+        if (!active.useWorker && !editorReady) return;
+        const payload = {
           action: "export",
           format: active.format,
-          currentPage: true,
-          allPages: false,
+          currentPage: !active.allPages,
+          allPages: active.allPages,
           message: { requestId: active.requestId },
-        });
+        };
+        if (active.useWorker) sendExportWorker(payload);
+        else sendEditor(payload);
       }
 
       async function reportEditorExportError(requestId, message) {
@@ -5245,6 +5593,7 @@ return `<!doctype html>
       async function saveExport(message) {
         const active = pendingExport;
         pendingExport = null;
+        clearExportWorker();
         try {
           if (typeof message.data !== "string" || !message.data) {
             throw new Error("Draw.io 未返回导出数据");
@@ -5273,8 +5622,18 @@ return `<!doctype html>
           void reportEditorExportError(command.requestId, "another export is already running on this page");
           return;
         }
-        pendingExport = { format: command.format, requestId: command.requestId };
+        const useWorker = typeof command.xml === "string" && command.xml.length > 0
+          && (Boolean(command.pageId) || command.allPages === true);
+        pendingExport = {
+          format: command.format,
+          requestId: command.requestId,
+          pageId: typeof command.pageId === "string" ? command.pageId : null,
+          allPages: command.allPages === true,
+          xml: useWorker ? command.xml : null,
+          useWorker,
+        };
         showStatus((editorReady ? "正在导出 " : "等待编辑器就绪后导出 ") + command.format + "…", 10000);
+        if (useWorker) startExportWorker(pendingExport);
         dispatchExport();
       }
 
@@ -6051,6 +6410,7 @@ return `<!doctype html>
         )) return;
         annSubmit.disabled = true;
         try {
+          await saveChain;
           const response = await fetch(CONFIG.annotationsUrl, {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -6230,10 +6590,31 @@ return `<!doctype html>
 
       editor.src = CONFIG.drawioUrl;
       window.addEventListener("message", async event => {
-        if (event.origin !== CONFIG.drawioOrigin || event.source !== editor.contentWindow) return;
+        if (event.origin !== CONFIG.drawioOrigin) return;
         let message = event.data;
         try { if (typeof message === "string") message = JSON.parse(message); } catch { return; }
         if (!message || typeof message !== "object") return;
+        if (exportWorker && event.source === exportWorker.contentWindow) {
+          if (message.event === "configure") {
+            sendExportWorker({ action: "configure", config: { autosaveDelay: 0, preserveViewState: true } });
+          } else if (message.event === "init" && pendingExport?.useWorker) {
+            exportWorkerReady = true;
+            sendExportWorker({
+              action: "load",
+              xml: pendingExport.xml,
+              autosave: 0,
+              diffSync: false,
+              title: CONFIG.file,
+            });
+          } else if (message.event === "load" && pendingExport?.useWorker) {
+            exportWorkerLoaded = true;
+            dispatchExport();
+          } else if (message.event === "export" && message.format !== "json" && pendingExport?.useWorker) {
+            void saveExport(message);
+          }
+          return;
+        }
+        if (event.source !== editor.contentWindow) return;
         if (message.event === "configure") {
           sendEditor({ action: "configure", config: { autosaveDelay: 250, preserveViewState: true } });
         } else if (message.event === "init") {
@@ -6411,7 +6792,7 @@ async function handleIntegratedBridgeRequest(
       Connection: "keep-alive",
       "Content-Type": "text/event-stream; charset=utf-8",
     })
-    response.write(": connected\\n\\n")
+    response.write(": connected\n\n")
     const requestedFile = requestUrl.searchParams.get("file")
     const connectedFile = requestedFile
       ? resolveWorkspacePath({ directory: session.workspace }, requestedFile)
@@ -6699,15 +7080,65 @@ async function handleIntegratedBridgeRequest(
     }
     await refreshIntegratedSession(session)
     const pages = parseDrawio(session.xml)
-    const pageName = typeof body.pageName === "string" ? body.pageName
-      : pages.find((page) => page.id === pageId)?.name || ""
-    const region = annotationRegion(pages, pageId, cells.map((cell) => cell.id))
+    const resolvedPage = pageId ? pages.find((page) => page.id === pageId) : pages[0]
+    if (!resolvedPage) {
+      integratedJsonResponse(response, 400, {
+        ok: false,
+        error: pageId ? `page "${pageId}" not found` : "the diagram has no pages to annotate",
+        pages: pages.map((page) => ({ id: page.id, name: page.name })),
+      })
+      return
+    }
+    const pageCellsById = new Map(resolvedPage.cells.map((cell) => [cell.id, cell]))
+    for (const cell of cells) {
+      const actual = pageCellsById.get(cell.id)
+      if (!actual) {
+        integratedJsonResponse(response, 400, {
+          ok: false,
+          error: `cell "${cell.id}" not found on page "${resolvedPage.name || resolvedPage.id}"`,
+        })
+        return
+      }
+      if (cell.kind === "node" && !actual.vertex) {
+        integratedJsonResponse(response, 400, {
+          ok: false,
+          error: `cell "${cell.id}" is not a node on page "${resolvedPage.name || resolvedPage.id}"`,
+        })
+        return
+      }
+      if (cell.kind === "edge" && !actual.edge) {
+        integratedJsonResponse(response, 400, {
+          ok: false,
+          error: `cell "${cell.id}" is not an edge on page "${resolvedPage.name || resolvedPage.id}"`,
+        })
+        return
+      }
+      if (cell.kind === "edge" && actual.edge) {
+        if (cell.source !== undefined && cell.source !== (actual.source ?? "")) {
+          integratedJsonResponse(response, 400, {
+            ok: false,
+            error: `edge "${cell.id}" source mismatch: "${cell.source}" does not match "${actual.source ?? ""}"`,
+          })
+          return
+        }
+        if (cell.target !== undefined && cell.target !== (actual.target ?? "")) {
+          integratedJsonResponse(response, 400, {
+            ok: false,
+            error: `edge "${cell.id}" target mismatch: "${cell.target}" does not match "${actual.target ?? ""}"`,
+          })
+          return
+        }
+      }
+    }
+    const resolvedPageId = resolvedPage.id
+    const pageName = typeof body.pageName === "string" ? body.pageName : resolvedPage.name || ""
+    const region = annotationRegion(pages, resolvedPageId, cells.map((cell) => cell.id))
     const now = new Date().toISOString()
     const id = `ant_${randomBytes(6).toString("base64url")}`
     const task: AnnotationTask = {
       id,
       file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
-      pageId,
+      pageId: resolvedPageId,
       pageName,
       cells,
       region,
@@ -6716,7 +7147,7 @@ async function handleIntegratedBridgeRequest(
       status: "open",
       baseRevision: session.revision,
       baseFileHash: session.fileHash,
-      baseCellHashes: annotationBaseCellHashes(pages, pageId, cells.map((cell) => cell.id)),
+      baseCellHashes: annotationBaseCellHashes(pages, resolvedPageId, cells.map((cell) => cell.id)),
       result: null,
       createdAt: now,
       updatedAt: now,
@@ -6868,7 +7299,9 @@ async function handleIntegratedBridgeRequest(
         throw new Error("editor export size is out of range")
       }
       validateEditorExportContent(content, pending.format)
-      await atomicWriteBinary(pending.outputTarget, content, pending.overwrite)
+      if (pending.writeOutput) {
+        await atomicWriteBinary(pending.outputTarget, content, pending.overwrite)
+      }
     } catch (error) {
       fail((error as Error).message)
       integratedJsonResponse(response, 400, { ok: false, error: (error as Error).message })
@@ -6880,6 +7313,7 @@ async function handleIntegratedBridgeRequest(
       outputTarget: pending.outputTarget,
       bytes: content.length,
       contentType: editorExportContentType(pending.format),
+      content: pending.writeOutput ? undefined : content,
     }
     pending.resolve(result)
     integratedJsonResponse(response, 200, {
@@ -7041,6 +7475,7 @@ const DRAWIO_RUNTIME_GUIDANCE = `## Draw.io 文件写入与交付
 提交时必须携带该次读取返回的准确 base_revision；revision_conflict 后重新读取，在新 XML 上重新执行所需变更并重试，禁止重发旧 XML。
 禁止用普通 write、edit 或脚本直接覆盖已绑定的 .drawio 文件，因为这会绕过 revision 检查并可能用旧快照丢失最新内容。
 本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。调用前必须先调用 drawio_list_annotations(status='pending') 探测未完成注释；存在 requiresConfirmation=false 的注释时 drawio_finalize 会拒绝执行，必须先逐条处理并 drawio_resolve_annotation 后再重试，不得跳过。只有返回 shouldOpenBrowser=true 时才将 openUrl 交给 MobileWork 现有 browser.open_url 打开；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
+drawio_export 支持 PNG、JPEG、PDF、xmlpng、SVG、xmlsvg 和 html2。SVG、xmlsvg、html2 由内置浏览器编辑器渲染并通过 Bridge 写回工作区；返回 editor_required 时必须立即调用 browser.open_url 自动打开其 openUrl，等待编辑器连接后用完全相同的参数重试，禁止把该状态解释为不支持格式或要求用户手工导出。PNG、JPEG、xmlpng、SVG、xmlsvg 使用 all_pages=true 时逐页生成文件并返回 outputs[]，必须核对 page_count 与 outputs 数量一致；PDF 和 html2 的 all_pages=true 各返回一个包含全部页面的多页单文件，html2 还需核对 contains_all_pages=true。
 
 ## 注释任务（框选评审）
 
@@ -7118,13 +7553,13 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
 
     drawio_export: tool({
       description:
-        "Export a workspace Draw.io file. PNG, JPEG, PDF, and editable PNG (xmlpng) go through the configured Docker HTTP Export Server; SVG, editable SVG (xmlsvg), and HTML (html2) are rendered by the Draw.io editor page in the built-in browser and require that page to be open — when it is not, the tool returns editor_required with an openUrl to open via browser.open_url before retrying.",
+        "Export a workspace Draw.io file. PNG, JPEG, PDF, and editable PNG (xmlpng) use the Docker HTTP Export Server. SVG, editable SVG (xmlsvg), and HTML (html2) use the built-in browser Bridge. all_pages=true writes one file per page for PNG/JPEG/xmlpng/SVG/XMLSVG, while PDF and HTML2 each produce one multi-page file. page_id exports one page for every format. When an editor-channel export is not connected, open the returned openUrl with browser.open_url and retry the same export.",
       args: {
         input_path: tool.schema.string().describe("Workspace-relative .drawio or .xml input file"),
         format: tool.schema.enum(["png", "jpeg", "pdf", "xmlpng", "svg", "xmlsvg", "html2"]),
         output_path: tool.schema.string().optional().describe("Workspace-relative output path"),
-        page_id: tool.schema.string().optional(),
-        all_pages: tool.schema.boolean().default(false),
+        page_id: tool.schema.string().optional().describe("Stable page id to export; cannot be combined with all_pages"),
+        all_pages: tool.schema.boolean().default(false).describe("Export every page; multi-file formats return outputs[], while PDF and HTML2 return one multi-page file"),
         scale: tool.schema.number().positive().default(1),
         border: tool.schema.number().int().min(0).default(0),
         background: tool.schema
@@ -7137,26 +7572,73 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       async execute(args, context) {
         const inputTarget = resolveWorkspacePath(context, args.input_path)
         const session = integratedSessionFor(context, inputTarget)
-        const xml = session ? (await refreshIntegratedSession(session)).xml : await readDiagramFile(inputTarget)
+        const refreshedSession = session ? await refreshIntegratedSession(session) : null
+        const xml = refreshedSession?.xml || await readDiagramFile(inputTarget)
+        const sourceRevision = refreshedSession?.revision
         const report = validationReport(parseDrawio(xml))
         if (!report.valid) {
           throw new Error(`refusing to export invalid Draw.io XML: ${JSON.stringify(report.errors)}`)
         }
+        if (args.page_id && args.all_pages) {
+          throw new Error("page_id and all_pages cannot be used together")
+        }
 
         if (EDITOR_EXPORT_FORMATS.has(args.format)) {
-          if (args.page_id) {
-            throw new Error(
-              `page_id is not supported for ${args.format} exports yet; the editor exports the page currently open in the editor`,
-            )
+          const selectedPage = args.page_id ? requireExportPage(xml, args.page_id) : null
+          if (args.all_pages && EDITOR_MULTI_FILE_EXPORT_FORMATS.has(args.format)) {
+            const outcome = await exportDiagramPagesViaEditor({
+              context,
+              inputTarget,
+              xml,
+              format: args.format,
+              outputPath: args.output_path,
+              sourceRevision,
+              overwrite: args.overwrite,
+            })
+            if (outcome.status === "editor_required") {
+              return JSON.stringify({
+                status: "editor_required",
+                message:
+                  "SVG and HTML exports are rendered by the Draw.io editor page in the built-in browser, which is currently not connected for this diagram.",
+                input_path: workspaceRelative(context, inputTarget).split(path.sep).join("/"),
+                format: args.format,
+                all_pages: true,
+                openUrl: outcome.openUrl,
+                browserAction:
+                  "Call MobileWork's built-in browser.open_url with openUrl now, wait for the editor page to finish loading, then call drawio_export again with identical arguments to complete the export.",
+                tokenExpiresAt: outcome.tokenExpiresAt,
+              }, null, 2)
+            }
+            return JSON.stringify({
+              success: true,
+              channel: "editor",
+              input_path: workspaceRelative(context, inputTarget).split(path.sep).join("/"),
+              format: args.format,
+              all_pages: true,
+              page_count: outcome.outputs.length,
+              source_revision: outcome.sourceRevision,
+              outputs: outcome.outputs.map((output) => ({
+                page_index: output.pageIndex,
+                page_id: output.pageId,
+                page_name: output.pageName,
+                output_path: workspaceRelative(context, output.outputTarget).split(path.sep).join("/"),
+                file_size_bytes: output.bytes,
+                content_type: output.contentType,
+              })),
+            }, null, 2)
           }
-          if (args.all_pages) {
-            throw new Error(`all_pages is not supported for ${args.format} exports yet`)
-          }
+          const workerXml = args.page_id
+            ? args.format === "html2" ? singlePageDrawioXml(xml, args.page_id) : xml
+            : args.all_pages ? xml : undefined
           const outcome = await exportDiagramViaEditor({
             context,
             inputTarget,
             format: args.format,
             outputPath: args.output_path,
+            xml: workerXml,
+            pageId: args.page_id,
+            allPages: args.all_pages,
+            sourceRevision,
             overwrite: args.overwrite,
           })
           if (outcome.status === "editor_required") {
@@ -7180,6 +7662,44 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
             format: args.format,
             file_size_bytes: outcome.bytes,
             content_type: outcome.contentType,
+            page_id: selectedPage?.id,
+            page_name: selectedPage?.name,
+            all_pages: args.all_pages,
+            page_count: args.all_pages && args.format === "html2" ? report.stats.pages : undefined,
+            contains_all_pages: args.all_pages && args.format === "html2" ? true : undefined,
+            source_revision: outcome.sourceRevision,
+          }, null, 2)
+        }
+
+        if (args.all_pages && MULTI_FILE_EXPORT_FORMATS.has(args.format)) {
+          const exportedPages = await exportDiagramPagesToFiles({
+            context,
+            inputTarget,
+            xml,
+            format: args.format,
+            outputPath: args.output_path,
+            scale: args.scale,
+            border: args.border,
+            background: args.background,
+            embedXml: args.format === "xmlpng" || args.embed_xml,
+            overwrite: args.overwrite,
+          })
+          return JSON.stringify({
+            success: true,
+            channel: "docker",
+            input_path: workspaceRelative(context, inputTarget).split(path.sep).join("/"),
+            format: args.format,
+            all_pages: true,
+            page_count: exportedPages.length,
+            outputs: exportedPages.map((output) => ({
+              page_index: output.pageIndex,
+              page_id: output.pageId,
+              page_name: output.pageName,
+              output_path: workspaceRelative(context, output.outputTarget).split(path.sep).join("/"),
+              file_size_bytes: output.bytes,
+              content_type: output.contentType,
+              export_url: output.exportUrl,
+            })),
           }, null, 2)
         }
 
@@ -7206,6 +7726,8 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           file_size_bytes: exported.bytes,
           content_type: exported.contentType,
           export_url: exported.exportUrl,
+          all_pages: args.all_pages,
+          page_count: args.all_pages ? report.stats.pages : undefined,
         }, null, 2)
       },
     }),

@@ -39,11 +39,14 @@ const exportServer = createServer(async (request, response) => {
   assert.equal(typeof form.get("xml"), "string")
   assert.equal(form.get("bg"), "#ffffff")
   exportRequests.push({
+    format: form.get("format"),
     xml: form.get("xml"),
     pageId: form.get("pageId"),
+    allPages: form.get("allPages"),
+    embedXml: form.get("embedXml"),
   })
   response.writeHead(200, { "content-type": "image/png" })
-  response.end(PNG)
+  response.end(Buffer.concat([PNG, Buffer.from(form.get("pageId") || "all-pages")]))
 })
 await new Promise((resolve) => exportServer.listen(0, "127.0.0.1", resolve))
 const exportAddress = exportServer.address()
@@ -121,6 +124,14 @@ try {
   assert.match(systemOutput.system.join("\n"), /shouldOpenBrowser=true/)
   assert.match(systemOutput.system.join("\n"), /不能只提示用户稍后继续/)
   assert.match(systemOutput.system.join("\n"), /禁止先改后问/)
+  assert.match(systemOutput.system.join("\n"), /SVG、xmlsvg、html2/)
+  assert.match(systemOutput.system.join("\n"), /browser\.open_url 自动打开/)
+  const generatedAgentPrompt = await fs.readFile(
+    path.resolve("generated/drawio-expert/.opencode/agents/drawio-expert.md"),
+    "utf8",
+  )
+  assert.match(generatedAgentPrompt, /禁止声称运行时不支持/)
+  assert.match(generatedAgentPrompt, /逐个page_id/)
   const createResult = JSON.parse(await plugin.tool.drawio_create.execute({
     file: "architecture.drawio",
     title: "Integrated test",
@@ -1138,6 +1149,84 @@ try {
   assert.equal(staleGateFinalize.pendingAnnotations[0].requiresConfirmation, true)
   assert.equal(staleGateFinalize.pendingAnnotations[0].freshness, "stale")
 
+  // Invalid annotations must be rejected with 400 before anything is
+  // persisted or broadcast: unknown page, unknown cell, node/edge kind
+  // mismatch, and edge endpoint mismatch.
+  const guardState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
+  const guardEdge = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    operations: [{ type: "add-edge", id: "guard-edge", source: "node", target: "neighbor", label: "Guard" }],
+    dry_run: false,
+    base_revision: guardState.revision,
+  }, context))
+  assert.equal(guardEdge.diff.summary.added, 1)
+  const invalidPage = await fetch(annotationsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "页面不存在",
+      scope: "selection_only",
+      pageId: "missing-page",
+      cells: [{ id: "node", kind: "node", label: "Agent" }],
+    }),
+  })
+  assert.equal(invalidPage.status, 400)
+  assert.match((await invalidPage.json()).error, /page "missing-page" not found/)
+  const invalidCell = await fetch(annotationsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "图元不存在",
+      scope: "selection_only",
+      pageId,
+      pageName,
+      cells: [{ id: "missing-cell", kind: "node", label: "Missing" }],
+    }),
+  })
+  assert.equal(invalidCell.status, 400)
+  assert.match((await invalidCell.json()).error, /cell "missing-cell" not found/)
+  const invalidKind = await fetch(annotationsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "类型不匹配",
+      scope: "selection_only",
+      pageId,
+      pageName,
+      cells: [{ id: "node", kind: "edge", label: "Agent" }],
+    }),
+  })
+  assert.equal(invalidKind.status, 400)
+  assert.match((await invalidKind.json()).error, /is not an edge/)
+  const endpointMismatch = await fetch(annotationsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "端点不匹配",
+      scope: "selection_only",
+      pageId,
+      pageName,
+      cells: [{ id: "guard-edge", kind: "edge", label: "Guard", source: "neighbor", target: "node" }],
+    }),
+  })
+  assert.equal(endpointMismatch.status, 400)
+  assert.match((await endpointMismatch.json()).error, /source mismatch/)
+  const validEdge = await fetch(annotationsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "合法连线注释",
+      scope: "selection_only",
+      pageId,
+      pageName,
+      cells: [{ id: "guard-edge", kind: "edge", label: "Guard", source: "node", target: "neighbor" }],
+    }),
+  })
+  assert.equal(validEdge.status, 201)
+  const validEdgeAnnotation = await validEdge.json()
+  assert.equal(validEdgeAnnotation.ok, true)
+  assert.ok(validEdgeAnnotation.annotation.region)
+
   await fs.writeFile(path.join(workspace, "other.drawio"), XML, "utf8")
   const originalEventsUrl = new URL(annotationFinalize.openUrl)
   originalEventsUrl.pathname = "/api/events"
@@ -1261,6 +1350,284 @@ try {
     /requested page ID "不存在的页面" was not found/,
   )
 
+  await fs.writeFile(path.join(workspace, "multi-page.drawio"), XML, "utf8")
+  const multiPageRequestStart = exportRequests.length
+  const multiPagePng = JSON.parse(await plugin.tool.drawio_export.execute({
+    input_path: "multi-page.drawio",
+    output_path: "exports/multi-page.png",
+    format: "png",
+    all_pages: true,
+    scale: 1,
+    border: 0,
+    background: "#ffffff",
+    embed_xml: false,
+    overwrite: false,
+  }, unicodeContext))
+  assert.equal(multiPagePng.success, true)
+  assert.equal(multiPagePng.all_pages, true)
+  assert.equal(multiPagePng.page_count, 2)
+  assert.deepEqual(
+    multiPagePng.outputs.map((output) => [output.page_index, output.page_id, output.page_name]),
+    [[1, "p1", "Page-1"], [2, "p2", "Page-2"]],
+  )
+  assert.deepEqual(
+    multiPagePng.outputs.map((output) => output.output_path),
+    [
+      "exports/multi-page.page-1-page-1.png",
+      "exports/multi-page.page-2-page-2.png",
+    ],
+  )
+  const multiPageRequests = exportRequests.slice(multiPageRequestStart)
+  assert.deepEqual(multiPageRequests.map((request) => request.pageId), ["p1", "p2"])
+  assert.deepEqual(multiPageRequests.map((request) => request.allPages), [null, null])
+  const firstPagePng = await fs.readFile(path.join(workspace, multiPagePng.outputs[0].output_path))
+  const secondPagePng = await fs.readFile(path.join(workspace, multiPagePng.outputs[1].output_path))
+  assert.notDeepEqual(firstPagePng, secondPagePng)
+  await assert.rejects(
+    fs.access(path.join(workspace, "exports", "multi-page.png")),
+    /ENOENT/,
+  )
+
+  const multiPageXmlPng = JSON.parse(await plugin.tool.drawio_export.execute({
+    input_path: "multi-page.drawio",
+    output_path: "exports/editable.editable.png",
+    format: "xmlpng",
+    all_pages: true,
+    scale: 1,
+    border: 0,
+    background: "#ffffff",
+    embed_xml: false,
+    overwrite: false,
+  }, unicodeContext))
+  assert.equal(multiPageXmlPng.page_count, 2)
+  assert.deepEqual(
+    multiPageXmlPng.outputs.map((output) => output.output_path),
+    [
+      "exports/editable.page-1-page-1.editable.png",
+      "exports/editable.page-2-page-2.editable.png",
+    ],
+  )
+  assert.deepEqual(exportRequests.slice(-2).map((request) => request.embedXml), ["1", "1"])
+
+  const editorExportRequestStart = exportRequests.length
+  const svgEditorRequired = JSON.parse(await plugin.tool.drawio_export.execute({
+    input_path: "multi-page.drawio",
+    output_path: "exports/multi-page.svg",
+    format: "svg",
+    all_pages: false,
+    scale: 1,
+    border: 0,
+    background: "#ffffff",
+    embed_xml: false,
+    overwrite: false,
+  }, unicodeContext))
+  assert.equal(svgEditorRequired.status, "editor_required")
+  assert.match(svgEditorRequired.openUrl, /\/editor\?/)
+  assert.match(svgEditorRequired.browserAction, /browser\.open_url/)
+  assert.equal(
+    exportRequests.slice(editorExportRequestStart).every((request) => request.format === "png"),
+    true,
+    "SVG itself must use the built-in browser Bridge instead of the HTTP Export Server",
+  )
+  const svgEventsUrl = new URL(svgEditorRequired.openUrl)
+  svgEventsUrl.pathname = "/api/events"
+  const svgEventsResponse = await fetch(svgEventsUrl)
+  assert.equal(svgEventsResponse.status, 200)
+  const svgEventsReader = svgEventsResponse.body.getReader()
+  const svgReadyChunk = await svgEventsReader.read()
+  assert.equal(svgReadyChunk.done, false)
+  assert.equal(new TextDecoder().decode(svgReadyChunk.value), ": connected\n\n")
+  const svgExportPromise = plugin.tool.drawio_export.execute({
+    input_path: "multi-page.drawio",
+    output_path: "exports/multi-page.svg",
+    format: "svg",
+    all_pages: false,
+    scale: 1,
+    border: 0,
+    background: "#ffffff",
+    embed_xml: false,
+    overwrite: false,
+  }, unicodeContext)
+  const decoder = new TextDecoder()
+  let svgEventBuffer = ""
+  async function nextEditorExportCommand() {
+    while (true) {
+      const frame = svgEventBuffer.match(/event: editor-command\ndata: ([^\n]+)\n\n/)
+      if (frame) {
+        svgEventBuffer = svgEventBuffer.slice(frame.index + frame[0].length)
+        return JSON.parse(frame[1])
+      }
+      const eventChunk = await svgEventsReader.read()
+      assert.equal(eventChunk.done, false)
+      svgEventBuffer += decoder.decode(eventChunk.value, { stream: true })
+    }
+  }
+  async function submitEditorExport(command, artifact, contentType) {
+    const response = await fetch(svgExportUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        requestId: command.requestId,
+        data: `data:${contentType};base64,${Buffer.from(artifact).toString("base64")}`,
+      }),
+    })
+    assert.equal(response.status, 200)
+    return response.json()
+  }
+  const svgExportCommand = await nextEditorExportCommand()
+  assert.equal(svgExportCommand.action, "export")
+  assert.equal(svgExportCommand.format, "svg")
+  const svgArtifact = '<svg xmlns="http://www.w3.org/2000/svg"><text>Bridge SVG</text></svg>'
+  const svgExportUrl = new URL(svgEditorRequired.openUrl)
+  svgExportUrl.pathname = "/api/editor-export"
+  await submitEditorExport(svgExportCommand, svgArtifact, "image/svg+xml")
+  const svgExported = JSON.parse(await svgExportPromise)
+  assert.equal(svgExported.success, true)
+  assert.equal(svgExported.channel, "editor")
+  assert.equal(svgExported.output_path, "exports/multi-page.svg")
+  assert.equal(await fs.readFile(path.join(workspace, "exports", "multi-page.svg"), "utf8"), svgArtifact)
+
+  const pageSvgPromise = plugin.tool.drawio_export.execute({
+    input_path: "multi-page.drawio",
+    output_path: "exports/page-two.svg",
+    format: "svg",
+    page_id: "p2",
+    all_pages: false,
+    scale: 1,
+    border: 0,
+    background: "#ffffff",
+    embed_xml: false,
+    overwrite: false,
+  }, unicodeContext)
+  const pageSvgCommand = await nextEditorExportCommand()
+  assert.equal(pageSvgCommand.pageId, "p2")
+  assert.equal(pageSvgCommand.allPages, false)
+  assert.match(pageSvgCommand.xml, /Page-2/)
+  const pageSvgArtifact = '<svg xmlns="http://www.w3.org/2000/svg"><text>Page-2</text></svg>'
+  await submitEditorExport(pageSvgCommand, pageSvgArtifact, "image/svg+xml")
+  const pageSvg = JSON.parse(await pageSvgPromise)
+  assert.equal(pageSvg.page_id, "p2")
+  assert.equal(pageSvg.page_name, "Page-2")
+  assert.equal(await fs.readFile(path.join(workspace, "exports", "page-two.svg"), "utf8"), pageSvgArtifact)
+
+  const allSvgPromise = plugin.tool.drawio_export.execute({
+    input_path: "multi-page.drawio",
+    output_path: "exports/all-pages.svg",
+    format: "svg",
+    all_pages: true,
+    scale: 1,
+    border: 0,
+    background: "#ffffff",
+    embed_xml: false,
+    overwrite: false,
+  }, unicodeContext)
+  const allSvgCommand1 = await nextEditorExportCommand()
+  assert.equal(allSvgCommand1.pageId, "p1")
+  await submitEditorExport(
+    allSvgCommand1,
+    '<svg xmlns="http://www.w3.org/2000/svg"><text>Page-1</text></svg>',
+    "image/svg+xml",
+  )
+  const allSvgCommand2 = await nextEditorExportCommand()
+  assert.equal(allSvgCommand2.pageId, "p2")
+  await submitEditorExport(
+    allSvgCommand2,
+    '<svg xmlns="http://www.w3.org/2000/svg"><text>Page-2</text></svg>',
+    "image/svg+xml",
+  )
+  const allSvg = JSON.parse(await allSvgPromise)
+  assert.equal(allSvg.all_pages, true)
+  assert.equal(allSvg.page_count, 2)
+  assert.deepEqual(allSvg.outputs.map((output) => output.page_id), ["p1", "p2"])
+  assert.deepEqual(
+    allSvg.outputs.map((output) => output.output_path),
+    ["exports/all-pages.page-1-page-1.svg", "exports/all-pages.page-2-page-2.svg"],
+  )
+
+  const allXmlSvgPromise = plugin.tool.drawio_export.execute({
+    input_path: "multi-page.drawio",
+    output_path: "exports/all-editable.editable.svg",
+    format: "xmlsvg",
+    all_pages: true,
+    scale: 1,
+    border: 0,
+    background: "#ffffff",
+    embed_xml: false,
+    overwrite: false,
+  }, unicodeContext)
+  const allXmlSvgCommand1 = await nextEditorExportCommand()
+  assert.equal(allXmlSvgCommand1.format, "xmlsvg")
+  assert.equal(allXmlSvgCommand1.pageId, "p1")
+  await submitEditorExport(
+    allXmlSvgCommand1,
+    '<svg xmlns="http://www.w3.org/2000/svg" content="editable-p1"><text>Page-1</text></svg>',
+    "image/svg+xml",
+  )
+  const allXmlSvgCommand2 = await nextEditorExportCommand()
+  assert.equal(allXmlSvgCommand2.format, "xmlsvg")
+  assert.equal(allXmlSvgCommand2.pageId, "p2")
+  await submitEditorExport(
+    allXmlSvgCommand2,
+    '<svg xmlns="http://www.w3.org/2000/svg" content="editable-p2"><text>Page-2</text></svg>',
+    "image/svg+xml",
+  )
+  const allXmlSvg = JSON.parse(await allXmlSvgPromise)
+  assert.equal(allXmlSvg.page_count, 2)
+  assert.deepEqual(
+    allXmlSvg.outputs.map((output) => output.output_path),
+    [
+      "exports/all-editable.page-1-page-1.editable.svg",
+      "exports/all-editable.page-2-page-2.editable.svg",
+    ],
+  )
+
+  const allHtmlPromise = plugin.tool.drawio_export.execute({
+    input_path: "multi-page.drawio",
+    output_path: "exports/all-pages.html",
+    format: "html2",
+    all_pages: true,
+    scale: 1,
+    border: 0,
+    background: "#ffffff",
+    embed_xml: false,
+    overwrite: false,
+  }, unicodeContext)
+  const allHtmlCommand = await nextEditorExportCommand()
+  assert.equal(allHtmlCommand.format, "html2")
+  assert.equal(allHtmlCommand.allPages, true)
+  assert.match(allHtmlCommand.xml, /Page-1/)
+  assert.match(allHtmlCommand.xml, /Page-2/)
+  const allHtmlArtifact = '<!doctype html><html><body>Page-1 Page-2</body></html>'
+  await submitEditorExport(allHtmlCommand, allHtmlArtifact, "text/html")
+  const allHtml = JSON.parse(await allHtmlPromise)
+  assert.equal(allHtml.all_pages, true)
+  assert.equal(allHtml.page_count, 2)
+  assert.equal(allHtml.contains_all_pages, true)
+  assert.equal(allHtml.output_path, "exports/all-pages.html")
+
+  const pageHtmlPromise = plugin.tool.drawio_export.execute({
+    input_path: "multi-page.drawio",
+    output_path: "exports/page-two.html",
+    format: "html2",
+    page_id: "p2",
+    all_pages: false,
+    scale: 1,
+    border: 0,
+    background: "#ffffff",
+    embed_xml: false,
+    overwrite: false,
+  }, unicodeContext)
+  const pageHtmlCommand = await nextEditorExportCommand()
+  assert.equal(pageHtmlCommand.pageId, "p2")
+  assert.match(pageHtmlCommand.xml, /Page-2/)
+  assert.doesNotMatch(pageHtmlCommand.xml, /Page-1/)
+  const pageHtmlArtifact = '<!doctype html><html><body>Page-2</body></html>'
+  await submitEditorExport(pageHtmlCommand, pageHtmlArtifact, "text/html")
+  const pageHtml = JSON.parse(await pageHtmlPromise)
+  assert.equal(pageHtml.page_id, "p2")
+  assert.equal(pageHtml.page_name, "Page-2")
+  await svgEventsReader.cancel()
+
   console.log(JSON.stringify({
     ok: true,
     openUrl: true,
@@ -1268,6 +1635,12 @@ try {
     manualChanges: true,
     manualChangesRemainEditable: true,
     serializedRevisionWrites: true,
+    multiPageRasterExport: true,
+    svgEditorBridgeRouting: true,
+    editorPageIdExport: true,
+    editorMultiPageExport: true,
+    editorMultiPageEditableSvgExport: true,
+    html2MultiPageExport: true,
     automaticNonOverlappingMerge: true,
     sameCellNonOverlappingFieldMerge: true,
     mixedConflictPreservesNonConflictingChanges: true,
@@ -1289,6 +1662,7 @@ try {
     annotationStalenessDetection: true,
     annotationFreshAutoClosure: true,
     annotationStaleConfirmationClosure: true,
+    annotationInputValidation: true,
     annotationPageBinding: true,
     annotationFinalizationGate: true,
     annotationScopeEnforcement: true,

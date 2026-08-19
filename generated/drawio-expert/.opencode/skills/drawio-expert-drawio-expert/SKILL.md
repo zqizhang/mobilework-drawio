@@ -13,7 +13,7 @@ description: Draw.io 绘图专家 中 Draw.io 绘图专家 的角色工作指引
 - 按图表类型、规模和样式要求选择原生XML、稳定ID工具或数据驱动脚本。
 - 创建、读取、比较和最小范围修改压缩或非压缩Draw.io文件。
 - 执行结构校验、稳定ID差异检查、布局质量评分和视觉预览闭环。
-- 通过专家包内TypeScript运行时调用Docker HTTP Export Server导出PNG、JPEG或PDF，不要求用户安装Python、uv或npm。
+- 通过专家包内TypeScript运行时调用Docker Export Server导出PNG、JPEG、PDF和可编辑PNG，并在需要时自动打开内置浏览器、通过Bridge导出SVG、可编辑SVG和HTML，不要求用户安装Python、uv或npm。
 - 通过drawio_open和revision协议读取用户最新保存版本，并在该版本上继续完成Agent修改。
 
 ## 角色方法
@@ -39,9 +39,10 @@ description: Draw.io 绘图专家 中 Draw.io 绘图专家 的角色工作指引
 - 增量修改和自动优化先dry-run，正式写入产生可恢复备份。
 - 不得出现无法解释的稳定ID新增、删除或语义修改。
 - 默认质量阈值为90；节点不得重叠，连线不得穿过非端点节点，连线标签不得与节点、容器标题或其他连线标签重叠。
-- 导出的PNG、JPEG或PDF必须非空且文件头有效；失败不得报告为成功。
-- 每次创建或修改成功后必须产生同名PNG，并通过MobileWork现有browser.open_url打开drawio_finalize返回的openUrl。
-- 不得调用Draw.io Desktop，也不得声称支持Draw.io到SVG转换。
+- 七种导出格式必须非空且类型有效；PNG、JPEG、可编辑PNG、SVG和可编辑SVG的all_pages=true必须返回与页面数一致的outputs，PDF和HTML必须返回一个多页文件；失败或缺页不得报告为成功。
+- 不得把SVG或可编辑SVG的all_pages请求描述为运行时不支持，也不得用逐个page_id作为默认绕过方案；必须以drawio_export的实际返回结果为准。
+- 每次创建或修改成功后必须产生同名PNG；仅当drawio_finalize返回shouldOpenBrowser=true时才通过MobileWork现有browser.open_url打开openUrl。
+- 不得调用Draw.io Desktop；SVG、可编辑SVG和HTML必须通过内置浏览器编辑器与Bridge导出，不得错误发送给Docker Export Server。
 - 人工编辑后的Agent写入必须基于紧邻写入前读取到的最新revision；人工编辑可以按当前任务要求继续修改，但不得因使用旧快照而丢失最新内容；禁止自动补齐base_revision，冲突时执行重新读取、在新基线上修改并重试。
 - 批注按图表文件持久化而非绑定对话session；正式写入必须携带drawio_authorize_annotation_change为当前session返回的一次性token。
 - 批注的持久化状态为open、resolved或ignored；stale是动态freshness。resolved或ignored后，所有session中的旧授权立即失效，只有用户重新打开后才能再次处理。

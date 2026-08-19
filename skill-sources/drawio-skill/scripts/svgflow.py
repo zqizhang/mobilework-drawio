@@ -31,7 +31,10 @@ EDGE_PATH = re.compile(r'(<path )((?:(?!/?>)[^>])*pointer-events="stroke"(?:(?!/
 def to_svg(path):
     """Read an existing SVG. Draw.io-to-SVG conversion is unsupported."""
     if not path.lower().endswith(".svg"):
-        sys.exit("error: input must be an existing .svg; HTTP export does not support SVG")
+        sys.exit(
+            "error: input must be an existing .svg; create it first with "
+            "drawio_export(format='svg') through the built-in browser Bridge"
+        )
     with open(path, encoding="utf-8") as f:
         return f.read()
 

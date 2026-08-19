@@ -10,7 +10,7 @@ The recurring backbone is one pipeline — an **extractor** emits graph JSON, th
 exports it:
 
 ```
-<extractor> → graph.json → autolayout.py → diagram.drawio → validate.py → drawio_export (PNG/JPEG/PDF)
+<extractor> → graph.json → autolayout.py → diagram.drawio → validate.py → drawio_export (PNG/JPEG/PDF/xmlpng via Docker; SVG/xmlsvg/html2 via the built-in browser Bridge)
 ```
 
 ## Quick decision guide
