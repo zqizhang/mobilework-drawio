@@ -36,7 +36,7 @@ description: Draw.io 绘图专家 中 Draw.io 绘图专家 的角色工作指引
 
 - 所有文件访问保持在选定工作区内。
 - 创建或修改后的文件必须通过drawio_validate。
-- 增量修改和自动优化先dry-run，正式写入产生可恢复备份。
+- 已绑定图表的增量修改、自动优化和完整XML候选都先生成同画布临时预览；预览XML不得写入源文件，正式候选必须与获批预览哈希一致，并产生可恢复备份。
 - 不得出现无法解释的稳定ID新增、删除或语义修改。
 - 默认质量阈值为90；节点不得重叠，连线不得穿过非端点节点，连线标签不得与节点、容器标题或其他连线标签重叠。
 - 七种导出格式必须非空且类型有效；PNG、JPEG、可编辑PNG、SVG和可编辑SVG的all_pages=true必须返回与页面数一致的outputs，PDF和HTML必须返回一个多页文件；失败或缺页不得报告为成功。
@@ -44,7 +44,7 @@ description: Draw.io 绘图专家 中 Draw.io 绘图专家 的角色工作指引
 - 每次创建或修改成功后必须产生同名PNG；仅当drawio_finalize返回shouldOpenBrowser=true时才通过MobileWork现有browser.open_url打开openUrl。
 - 不得调用Draw.io Desktop；SVG、可编辑SVG和HTML必须通过内置浏览器编辑器与Bridge导出，不得错误发送给Docker Export Server。
 - 人工编辑后的Agent写入必须基于紧邻写入前读取到的最新revision；人工编辑可以按当前任务要求继续修改，但不得因使用旧快照而丢失最新内容；禁止自动补齐base_revision，冲突时执行重新读取、在新基线上修改并重试。
-- 批注按图表文件持久化而非绑定对话session；正式写入必须携带drawio_authorize_annotation_change为当前session返回的一次性token。
+- 批注按图表文件持久化而非绑定对话session；正式写入必须携带drawio_authorize_annotation_change为当前session返回的一次性token和关联preview ID，运行时核对候选哈希。
 - 批注的持久化状态为open、resolved或ignored；stale是动态freshness。resolved或ignored后，所有session中的旧授权立即失效，只有用户重新打开后才能再次处理。
 - diagram_wide仅允许修改当前图表的全部页面，稳定ID使用pageId:cellId；运行时仍拒绝未披露ID、其它文件、过期revision或跨session token。
 - drawio_polish处理活动批注时必须先dry-run，并取得diagram_wide审批后才能正式写入。

@@ -5,7 +5,40 @@ import os from "node:os"
 import path from "node:path"
 import { Script } from "node:vm"
 
-import { DrawioExpertPlugin } from "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js"
+const runtimeModule = process.env.DRAWIO_TEST_SOURCE === "1"
+  ? "../runtime/drawio-runtime.ts"
+  : "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js"
+const { DrawioExpertPlugin } = await import(runtimeModule)
+
+function createSseFrameReader(reader, timeoutMs = 2000) {
+  const decoder = new TextDecoder()
+  let buffered = ""
+  return async function readSseFrame() {
+    while (!buffered.includes("\n\n")) {
+      let timer
+      const result = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("timed out waiting for SSE frame")), timeoutMs)
+        }),
+      ]).finally(() => clearTimeout(timer))
+      if (result.done) throw new Error("SSE stream ended before a complete frame")
+      buffered += decoder.decode(result.value, { stream: true })
+    }
+    const boundary = buffered.indexOf("\n\n") + 2
+    const frame = buffered.slice(0, boundary)
+    buffered = buffered.slice(boundary)
+    return frame
+  }
+}
+
+async function nextMatchingSseFrame(readFrame, pattern, limit = 20) {
+  for (let index = 0; index < limit; index += 1) {
+    const frame = await readFrame()
+    if (pattern.test(frame)) return frame
+  }
+  throw new Error(`did not receive matching SSE frame: ${pattern}`)
+}
 
 const DRAWIO_ENVIRONMENT_KEYS = [
   "DRAWIO_WEB_URL",
@@ -115,6 +148,8 @@ try {
   assert.equal(typeof plugin.tool.drawio_health_check.execute, "function")
   assert.equal(typeof plugin.tool.drawio_finalize.execute, "function")
   assert.equal(typeof plugin.tool.drawio_authorize_annotation_change.execute, "function")
+  assert.equal(typeof plugin.tool.drawio_authorize_preview.execute, "function")
+  assert.equal(typeof plugin.tool.drawio_preview_state.execute, "function")
   const systemOutput = { system: [] }
   await plugin["experimental.chat.system.transform"]({}, systemOutput)
   assert.match(systemOutput.system.join("\n"), /人工编辑不是只读内容/)
@@ -219,6 +254,13 @@ try {
   assert.match(editorPage, /允许调整周边布局/)
   assert.match(editorPage, /允许修改整个图表/)
   assert.match(editorPage, /所有页面、节点、连线和布局/)
+  assert.match(editorPage, /Agent 修改预览/)
+  assert.match(editorPage, /id="patch-preview-exit"/)
+  assert.match(editorPage, /id="patch-preview-before"/)
+  assert.match(editorPage, /id="patch-preview-after"/)
+  assert.match(editorPage, /id="patch-preview-details"/)
+  assert.match(editorPage, /const cancelUrl = new URL\(CONFIG\.patchPreviewUrl\)/)
+  assert.doesNotMatch(editorPage, /CONFIG\.patchPreviewUrl \+ "\/"/)
   assert.match(editorPage, /id="history-btn"/, "editor page must include the history entry")
   assert.match(editorPage, /版本历史/, "editor page must include the history modal")
   assert.match(editorPage, /将图表恢复为 v/, "editor page must include the restore confirmation text")
@@ -281,15 +323,34 @@ try {
   assert.equal(stale.current.revision, 1)
   assert.equal(stale.manualChanges.available, true)
 
+  await assert.rejects(
+    plugin.tool.drawio_update_state.execute({
+      base_revision: 1,
+      xml: manualXml.replace("MobileWork Manual", "No Preview"),
+    }, context),
+    /preview_id is required/,
+  )
   const concurrent = await Promise.all([
-    plugin.tool.drawio_update_state.execute({
-      base_revision: 1,
-      xml: manualXml.replace("MobileWork Manual", "Agent A"),
-    }, context).then(JSON.parse),
-    plugin.tool.drawio_update_state.execute({
-      base_revision: 1,
-      xml: manualXml.replace("MobileWork Manual", "Agent B"),
-    }, context).then(JSON.parse),
+    fetch(apiUrl, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        xml: manualXml.replace("MobileWork Manual", "Agent A"),
+        baseRevision: 1,
+        source: "editor",
+        clientId: "concurrent-a",
+      }),
+    }).then((response) => response.json()),
+    fetch(apiUrl, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        xml: manualXml.replace("MobileWork Manual", "Agent B"),
+        baseRevision: 1,
+        source: "editor",
+        clientId: "concurrent-b",
+      }),
+    }).then((response) => response.json()),
   ])
   assert.equal(concurrent.filter((result) => result.ok).length, 1)
   assert.equal(concurrent.filter((result) => result.error === "revision_conflict").length, 1)
@@ -490,13 +551,21 @@ try {
   // the annotated cell. Explicit work runs before activating an annotation's
   // guarded write flow; the annotation must remain fresh and executable.
   const beforeExplicitTask = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
-  const explicitTask = JSON.parse(await plugin.tool.drawio_patch.execute({
+  const explicitTaskPreview = JSON.parse(await plugin.tool.drawio_patch.execute({
     file: "architecture.drawio",
     operations: [{ type: "add-node", id: "explicit-task-node", label: "Explicit Task" }],
-    dry_run: false,
+    dry_run: true,
     base_revision: beforeExplicitTask.revision,
   }, context))
-  assert.equal(explicitTask.diff.summary.added, 1)
+  assert.equal(explicitTaskPreview.diff.summary.added, 1)
+  const explicitPreviewRequests = []
+  const explicitTask = JSON.parse(await plugin.tool.drawio_authorize_preview.execute({
+    file: "architecture.drawio",
+    preview_id: explicitTaskPreview.preview.id,
+    plan: "新增 Explicit Task 节点",
+  }, { ...context, async ask(input) { explicitPreviewRequests.push(input) } }))
+  assert.equal(explicitTask.applied, true)
+  assert.equal(explicitPreviewRequests[0].permission, "drawio_authorize_preview")
 
   const freshAfterExplicitTask = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
     file: "architecture.drawio",
@@ -539,6 +608,28 @@ try {
     base_revision: beforePatch.revision,
   }, context))
   assert.equal(dryRun.dryRun, true)
+  assert.equal(dryRun.preview.status, "pending")
+  assert.equal(dryRun.preview.baseRevision, beforePatch.revision)
+  assert.equal(dryRun.preview.summary.changed, 1)
+  const previewUrl = new URL(finalize.openUrl)
+  previewUrl.pathname = "/api/preview"
+  const visiblePreview = await fetch(previewUrl).then((response) => response.json())
+  assert.equal(visiblePreview.preview.id, dryRun.preview.id)
+  assert.match(visiblePreview.preview.xml, /__ai_preview_/)
+  assert.match(visiblePreview.preview.xml, /#f59e0b/)
+  assert.doesNotMatch(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /__ai_preview_/)
+  const previewArtifactSave = await fetch(apiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      xml: visiblePreview.preview.xml,
+      baseRevision: beforePatch.revision,
+      source: "editor",
+      clientId: "preview-artifact-test",
+    }),
+  })
+  assert.equal(previewArtifactSave.status, 409)
+  assert.equal((await previewArtifactSave.json()).error, "preview_artifact")
   await assert.rejects(
     plugin.tool.drawio_patch.execute({
       file: "architecture.drawio",
@@ -566,10 +657,12 @@ try {
   assert.equal(authorization.ok, true)
   assert.equal(authorization.baseRevision, beforePatch.revision)
   assert.equal(authorization.requestedScope, "selection_only")
+  assert.equal(authorization.previewId, dryRun.preview.id)
   assert.equal(approvalRequests.length, 1)
   assert.equal(approvalRequests[0].permission, "drawio_authorize_annotation_change")
   assert.deepEqual(approvalRequests[0].metadata.proposedChangedIds, ["node"])
   assert.equal(approvalRequests[0].metadata.plan, "仅把选中节点 node 改名为 Draw.io")
+  assert.equal(approvalRequests[0].metadata.previewId, dryRun.preview.id)
   assert.match(approvalRequests[0].patterns[0], /annotation:.*:revision-/)
   await assert.rejects(
     plugin.tool.drawio_patch.execute({
@@ -591,6 +684,8 @@ try {
     approval_token: authorization.approvalToken,
   }, context))
   assert.equal(patchResult.diff.summary.changed, 1)
+  assert.doesNotMatch(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /__ai_preview_/)
+  assert.equal((await fetch(previewUrl).then((response) => response.json())).preview, null)
   await assert.rejects(
     plugin.tool.drawio_patch.execute({
       file: "architecture.drawio",
@@ -624,6 +719,142 @@ try {
     status: "open",
   }, context))
   assert.equal(openAfterResolve.count, 0)
+
+  const previewEventsUrl = new URL(openResult.openUrl)
+  previewEventsUrl.pathname = "/api/events"
+  const previewEventsResponse = await fetch(previewEventsUrl)
+  assert.equal(previewEventsResponse.status, 200)
+  const previewEventsReader = previewEventsResponse.body.getReader()
+  const nextPreviewEvent = createSseFrameReader(previewEventsReader)
+  assert.match(await nextPreviewEvent(), /^: connected/)
+
+  const generalPreviewState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
+  const generalPreviewDryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    operations: [{ type: "update-node", id: "neighbor", label: "Neighbor Preview" }],
+    dry_run: true,
+    base_revision: generalPreviewState.revision,
+  }, context))
+  const createdPreviewEvent = await nextMatchingSseFrame(nextPreviewEvent, /"kind":"created"/)
+  assert.match(createdPreviewEvent, /^event: preview\ndata: /)
+  const previewApprovalRequests = []
+  const previewContext = {
+    ...context,
+    async ask(input) { previewApprovalRequests.push(input) },
+  }
+  const generalPreviewAuthorization = JSON.parse(await plugin.tool.drawio_authorize_preview.execute({
+    file: "architecture.drawio",
+    preview_id: generalPreviewDryRun.preview.id,
+    plan: "将 Neighbor 节点改名为 Neighbor Preview",
+  }, previewContext))
+  assert.equal(previewApprovalRequests.length, 1)
+  assert.equal(previewApprovalRequests[0].permission, "drawio_authorize_preview")
+  assert.equal(generalPreviewAuthorization.applied, true)
+  assert.equal(generalPreviewAuthorization.preview.status, "applied")
+  assert.equal(generalPreviewAuthorization.revision, generalPreviewState.revision + 1)
+  assert.match(await nextMatchingSseFrame(nextPreviewEvent, /"kind":"authorized"/), /^event: preview/)
+  assert.match(await nextMatchingSseFrame(nextPreviewEvent, /"kind":"applied"/), /^event: preview/)
+  assert.match(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /Neighbor Preview/)
+  assert.equal((await fetch(previewUrl).then((response) => response.json())).preview, null)
+
+  const cancelPreviewDryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    operations: [{ type: "update-node", id: "neighbor", label: "Cancelled Candidate" }],
+    dry_run: true,
+    base_revision: generalPreviewAuthorization.revision,
+  }, context))
+  assert.match(await nextMatchingSseFrame(nextPreviewEvent, /^event: diagram\\ndata: /), /^event: diagram/)
+  assert.match(await nextMatchingSseFrame(nextPreviewEvent, /"kind":"created"/), /^event: preview/)
+  const cancelPreviewUrl = new URL(previewUrl)
+  cancelPreviewUrl.pathname = `/api/preview/${encodeURIComponent(cancelPreviewDryRun.preview.id)}`
+  const cancelledPreview = await fetch(cancelPreviewUrl, { method: "DELETE" }).then((response) => response.json())
+  assert.equal(cancelledPreview.preview.status, "cancelled")
+  assert.match(await nextMatchingSseFrame(nextPreviewEvent, /"kind":"cancelled"/), /^event: preview/)
+  await previewEventsReader.cancel()
+  assert.doesNotMatch(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /Cancelled Candidate/)
+
+  const styleState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
+  const styleDryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    operations: [
+      {
+        type: "update-node",
+        id: "node",
+        style_updates: { font_size: 26, fill_color: "#123456", font_color: "#ffffff" },
+      },
+      {
+        type: "add-edge",
+        id: "preview-edge",
+        source: "node",
+        target: "neighbor",
+        style_updates: { stroke_color: "#7c3aed", stroke_width: 3 },
+      },
+    ],
+    dry_run: true,
+    base_revision: styleState.revision,
+  }, context))
+  const nodeStyleChange = styleDryRun.diff.changed.find((entry) => entry.cellId === "node")
+  assert.deepEqual(
+    nodeStyleChange.styleChanges.map((entry) => entry.property),
+    ["fillColor", "fontColor", "fontSize"],
+  )
+  assert.equal(nodeStyleChange.styleChanges.find((entry) => entry.property === "fontSize").after, "26")
+  await assert.rejects(
+    plugin.tool.drawio_patch.execute({
+      file: "architecture.drawio",
+      operations: [{
+        type: "update-node",
+        id: "node",
+        style_updates: { fill_color: "#fff;editable=1" },
+      }],
+      dry_run: true,
+      base_revision: styleState.revision,
+    }, context),
+    /unsafe Draw\.io style delimiter/,
+  )
+  const styleVisiblePreview = await fetch(previewUrl).then((response) => response.json())
+  assert.equal(typeof styleVisiblePreview.preview.beforePreviewXml, "string")
+  assert.equal(typeof styleVisiblePreview.preview.afterPreviewXml, "string")
+  const candidateEdgeTag = styleVisiblePreview.preview.afterPreviewXml
+    .match(/<mxCell[^>]*id="preview-edge"[^>]*>/)?.[0]
+  assert.match(candidateEdgeTag, /strokeColor=#7c3aed/)
+  assert.doesNotMatch(candidateEdgeTag, /strokeColor=#22c55e/)
+
+  const fullXmlCandidate = styleState.xml
+    .replace("<mxGraphModel>", '<mxGraphModel background="#ddeeff">')
+    .replace('id="node"', 'id="node" style="fontSize=26;fillColor=#123456;fontColor=#ffffff;"')
+  const fullXmlPreview = JSON.parse(await plugin.tool.drawio_preview_state.execute({
+    base_revision: styleState.revision,
+    xml: fullXmlCandidate,
+  }, context))
+  assert.equal(fullXmlPreview.ok, true)
+  assert.equal(fullXmlPreview.diff.pageChanges[0].property, "background")
+  assert.equal(fullXmlPreview.diff.pageChanges[0].after, "#ddeeff")
+  assert.equal(fullXmlPreview.diff.changed[0].styleChanges.length, 3)
+  assert.deepEqual(fullXmlPreview.affectedPageIds, ["p1"])
+  const fullXmlVisiblePreview = await fetch(previewUrl).then((response) => response.json())
+  assert.doesNotMatch(fullXmlVisiblePreview.preview.beforePreviewXml, /background="#ddeeff"/)
+  assert.match(fullXmlVisiblePreview.preview.afterPreviewXml, /background="#ddeeff"/)
+  const undecoratedPreviewSave = await fetch(apiUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      xml: fullXmlCandidate,
+      baseRevision: styleState.revision,
+      source: "editor",
+      clientId: "undecorated-preview-test",
+    }),
+  })
+  assert.equal(undecoratedPreviewSave.status, 409)
+  assert.equal((await undecoratedPreviewSave.json()).error, "preview_candidate")
+  const fullXmlApplied = JSON.parse(await plugin.tool.drawio_authorize_preview.execute({
+    file: "architecture.drawio",
+    preview_id: fullXmlPreview.preview.id,
+    plan: "将节点字体调大并修改填充色，同时调整第一页背景色",
+  }, previewContext))
+  assert.equal(fullXmlApplied.applied, true)
+  assert.match(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /fontSize=26/)
+  assert.doesNotMatch(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /preview-edge/)
 
   // Reopen a resolved annotation via the UI-toggle server path (PATCH status=open):
   // the state must revert, result/resolvedAt must clear, and no stale approval survives.
@@ -822,15 +1053,25 @@ try {
     id: globalAnn.annotation.id,
   }, secondContext)
   const secondState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, secondContext))
+  const globalDryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    page: "p2",
+    operations: [{ type: "update-node", id: "remote", label: "Global Remote" }],
+    dry_run: true,
+    base_revision: secondState.revision,
+  }, secondContext))
+  assert.equal(globalDryRun.preview.status, "pending")
   const globalAuthorization = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
     file: "architecture.drawio",
     id: globalAnn.annotation.id,
     plan: "修改第二页的 remote 节点",
     proposed_changed_ids: ["p2:remote"],
     requested_scope: "diagram_wide",
+    preview_id: globalDryRun.preview.id,
   }, secondContext))
   assert.equal(secondApprovalRequests.length, 1)
   assert.equal(secondApprovalRequests[0].metadata.file, "architecture.drawio")
+  assert.equal(globalAuthorization.previewId, globalDryRun.preview.id)
   assert.equal(globalAuthorization.allowedExistingIds.includes("p2:remote"), true)
 
   await plugin.tool.drawio_get_annotation.execute({
@@ -1153,13 +1394,19 @@ try {
   // persisted or broadcast: unknown page, unknown cell, node/edge kind
   // mismatch, and edge endpoint mismatch.
   const guardState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
-  const guardEdge = JSON.parse(await plugin.tool.drawio_patch.execute({
+  const guardEdgePreview = JSON.parse(await plugin.tool.drawio_patch.execute({
     file: "architecture.drawio",
     operations: [{ type: "add-edge", id: "guard-edge", source: "node", target: "neighbor", label: "Guard" }],
-    dry_run: false,
+    dry_run: true,
     base_revision: guardState.revision,
   }, context))
-  assert.equal(guardEdge.diff.summary.added, 1)
+  assert.equal(guardEdgePreview.diff.summary.added, 1)
+  const guardEdge = JSON.parse(await plugin.tool.drawio_authorize_preview.execute({
+    file: "architecture.drawio",
+    preview_id: guardEdgePreview.preview.id,
+    plan: "新增 Guard 连线",
+  }, { ...context, async ask() {} }))
+  assert.equal(guardEdge.applied, true)
   const invalidPage = await fetch(annotationsUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -1670,6 +1917,12 @@ try {
     annotationSessionBoundApproval: true,
     annotationDiagramWidePolish: true,
     annotationPreWriteApproval: true,
+    patchPreviewCanvas: true,
+    patchPreviewArtifactGuard: true,
+    patchPreviewExactCandidateApproval: true,
+    patchPreviewCancelWithoutWrite: true,
+    patchPreviewBrowserActions: true,
+    patchPreviewOneClickApply: true,
     unicodePageIdExport: true,
   }, null, 2))
 } finally {

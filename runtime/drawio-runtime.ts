@@ -46,6 +46,9 @@ type ParsedPage = {
   id: string
   name: string
   compressed: boolean
+  properties: {
+    background: string
+  }
   cells: ParsedCell[]
 }
 
@@ -75,6 +78,19 @@ type PatchOperation = {
   width?: number
   height?: number
   cascade?: boolean
+  style_updates?: PatchStyleUpdates
+}
+
+type PatchStyleUpdates = {
+  font_size?: number
+  font_family?: string
+  font_color?: string
+  fill_color?: string
+  stroke_color?: string
+  stroke_width?: number
+  opacity?: number
+  rounded?: boolean
+  dashed?: boolean
 }
 
 type QualityIssue = {
@@ -120,6 +136,9 @@ const BRIDGE_TOKEN_TTL_MS = 12 * 60 * 60 * 1000
 // asks the agent to open the page via MobileWork's built-in browser.
 const EDITOR_EXPORT_CONNECT_GRACE_MS = 3000
 const SESSION_HISTORY_LIMIT = 20
+const PATCH_PREVIEW_TTL_MS = 30 * 60 * 1000
+const PATCH_PREVIEW_RETENTION_MS = 2 * 60 * 60 * 1000
+const PATCH_PREVIEW_ID_PREFIX = "__ai_preview_"
 // User-visible persistent history settings. The in-memory `session.history`
 // window above is a short-lived per-revision conflict window; this store is a
 // separate durable checkpoint repository that survives runtime restarts.
@@ -360,6 +379,14 @@ function parseGraphModel(modelXml: string): ParsedCell[] {
     }))
 }
 
+function graphModelProperties(modelXml: string): ParsedPage["properties"] {
+  const document = parser.parse(modelXml) as Record<string, unknown>
+  const graph = document.mxGraphModel as Record<string, unknown> | undefined
+  return {
+    background: attribute(graph?.["@_background"]) || "",
+  }
+}
+
 function parseDrawio(xml: string): ParsedPage[] {
   const validation = XMLValidator.validate(xml)
   if (validation !== true) {
@@ -372,6 +399,7 @@ function parseDrawio(xml: string): ParsedPage[] {
       id: "page-1",
       name: "Page-1",
       compressed: false,
+      properties: graphModelProperties(xml),
       cells: parseGraphModel(xml),
     }]
   }
@@ -395,17 +423,20 @@ function parseDrawio(xml: string): ParsedPage[] {
         id: pageId,
         name: pageName,
         compressed: false,
+        properties: graphModelProperties(modelXml),
         cells: parseGraphModel(modelXml),
       }
     }
 
     const payload = attribute(diagram["#text"])
     if (!payload?.trim()) throw new Error(`page ${pageName} has no diagram data`)
+    const modelXml = decodeDiagramPayload(payload)
     return {
       id: pageId,
       name: pageName,
       compressed: true,
-      cells: parseGraphModel(decodeDiagramPayload(payload)),
+      properties: graphModelProperties(modelXml),
+      cells: parseGraphModel(modelXml),
     }
   })
 }
@@ -536,6 +567,62 @@ function nextPatchPosition(cells: Record<string, unknown>[]): { x: number; y: nu
   return { x: 80, y: maxBottom + 60 }
 }
 
+const PATCH_STYLE_KEYS: Record<keyof PatchStyleUpdates, string> = {
+  font_size: "fontSize",
+  font_family: "fontFamily",
+  font_color: "fontColor",
+  fill_color: "fillColor",
+  stroke_color: "strokeColor",
+  stroke_width: "strokeWidth",
+  opacity: "opacity",
+  rounded: "rounded",
+  dashed: "dashed",
+}
+
+function parseStyleEntries(style: string | undefined): Array<[string, string]> {
+  return (style || "")
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const separator = entry.indexOf("=")
+      return separator < 0
+        ? [entry, ""]
+        : [entry.slice(0, separator), entry.slice(separator + 1)]
+    })
+}
+
+function normalizedStyle(style: string | undefined): Record<string, string> {
+  return Object.fromEntries(parseStyleEntries(style).toSorted(([left], [right]) => left.localeCompare(right)))
+}
+
+function patchStyle(style: string | undefined, updates: PatchStyleUpdates | undefined): string {
+  if (!updates) return style || ""
+  const entries = parseStyleEntries(style)
+  const values = new Map(entries)
+  for (const [inputKey, styleKey] of Object.entries(PATCH_STYLE_KEYS) as Array<[keyof PatchStyleUpdates, string]>) {
+    const value = updates[inputKey]
+    if (value === undefined) continue
+    if (typeof value === "string" && (!value.trim() || /[;=\r\n]/.test(value))) {
+      throw new Error(`style_updates.${inputKey} contains an unsafe Draw.io style delimiter`)
+    }
+    values.set(styleKey, typeof value === "boolean" ? (value ? "1" : "0") : String(value))
+  }
+  const emitted = new Set<string>()
+  const result: string[] = []
+  for (const [key] of entries) {
+    if (emitted.has(key)) continue
+    emitted.add(key)
+    const value = values.get(key) || ""
+    result.push(`${key}${value === "" ? "" : `=${value}`}`)
+  }
+  for (const [key, value] of values) {
+    if (emitted.has(key)) continue
+    result.push(`${key}${value === "" ? "" : `=${value}`}`)
+  }
+  return result.length > 0 ? `${result.join(";")};` : ""
+}
+
 function applyPatchOperations(page: EditablePage, operations: PatchOperation[]): string[] {
   const cells = editableCells(page)
   const changed: string[] = []
@@ -554,7 +641,7 @@ function applyPatchOperations(page: EditablePage, operations: PatchOperation[]):
       cells.push({
         "@_id": operation.id,
         "@_value": operation.label,
-        "@_style": nodeStyle(operation.kind),
+        "@_style": patchStyle(nodeStyle(operation.kind), operation.style_updates),
         "@_vertex": "1",
         "@_parent": "1",
         mxGeometry: {
@@ -580,7 +667,7 @@ function applyPatchOperations(page: EditablePage, operations: PatchOperation[]):
       cells.push({
         "@_id": operation.id,
         "@_value": operation.label || "",
-        "@_style": EDGE_BASE_STYLE,
+        "@_style": patchStyle(EDGE_BASE_STYLE, operation.style_updates),
         "@_edge": "1",
         "@_parent": "1",
         "@_source": operation.source,
@@ -597,6 +684,9 @@ function applyPatchOperations(page: EditablePage, operations: PatchOperation[]):
       if (!rawCellIsVertex(existing)) throw new Error(`${operation.id} is not a node`)
       if (operation.label !== undefined) existing["@_value"] = operation.label
       if (operation.kind !== undefined) existing["@_style"] = nodeStyle(operation.kind)
+      if (operation.style_updates !== undefined) {
+        existing["@_style"] = patchStyle(attribute(existing["@_style"]), operation.style_updates)
+      }
       const geometry = rawGeometry(existing)
       if (operation.x !== undefined) geometry["@_x"] = operation.x
       if (operation.y !== undefined) geometry["@_y"] = operation.y
@@ -623,6 +713,9 @@ function applyPatchOperations(page: EditablePage, operations: PatchOperation[]):
         existing["@_target"] = operation.target
       }
       if (operation.label !== undefined) existing["@_value"] = operation.label
+      if (operation.style_updates !== undefined) {
+        existing["@_style"] = patchStyle(attribute(existing["@_style"]), operation.style_updates)
+      }
       changed.push(operation.id)
       continue
     }
@@ -674,7 +767,7 @@ function comparableCell(cell: ParsedCell) {
     parent: cell.parent || "",
     source: cell.source || "",
     target: cell.target || "",
-    style: cell.style || "",
+    style: normalizedStyle(cell.style),
     geometry: cell.geometry || {},
   }
 }
@@ -686,8 +779,22 @@ function diffParsedPages(beforePages: ParsedPage[], afterPages: ParsedPage[]) {
   const removed: Array<{ key: string; cell: ParsedCell }> = []
   const changed: Array<{
     key: string
+    pageId: string
+    cellId: string
+    kind: "node" | "edge"
+    changedFields: string[]
+    styleChanges: Array<{ property: string; before: string | null; after: string | null }>
+    geometryChanges: Array<{ property: string; before: unknown; after: unknown }>
+    labelChange: { before: string; after: string } | null
     before: ReturnType<typeof comparableCell>
     after: ReturnType<typeof comparableCell>
+  }> = []
+  const pageChanges: Array<{
+    pageId: string
+    pageName: string
+    property: string
+    before: string | null
+    after: string | null
   }> = []
 
   for (const [key, cell] of after) {
@@ -698,21 +805,92 @@ function diffParsedPages(beforePages: ParsedPage[], afterPages: ParsedPage[]) {
     const beforeCell = comparableCell(before.get(key)!)
     const afterCell = comparableCell(cell)
     if (JSON.stringify(beforeCell) !== JSON.stringify(afterCell)) {
-      changed.push({ key, before: beforeCell, after: afterCell })
+      const changedFields = (Object.keys(afterCell) as Array<keyof typeof afterCell>)
+        .filter((field) => JSON.stringify(beforeCell[field]) !== JSON.stringify(afterCell[field]))
+      const styleProperties = new Set([...Object.keys(beforeCell.style), ...Object.keys(afterCell.style)])
+      const styleChanges = [...styleProperties]
+        .filter((property) => beforeCell.style[property] !== afterCell.style[property])
+        .sort()
+        .map((property) => ({
+          property,
+          before: beforeCell.style[property] ?? null,
+          after: afterCell.style[property] ?? null,
+        }))
+      const geometryProperties = new Set([
+        ...Object.keys(beforeCell.geometry),
+        ...Object.keys(afterCell.geometry),
+      ])
+      const geometryChanges = [...geometryProperties]
+        .filter((property) => JSON.stringify(
+          (beforeCell.geometry as Record<string, unknown>)[property],
+        ) !== JSON.stringify((afterCell.geometry as Record<string, unknown>)[property]))
+        .sort()
+        .map((property) => ({
+          property,
+          before: (beforeCell.geometry as Record<string, unknown>)[property] ?? null,
+          after: (afterCell.geometry as Record<string, unknown>)[property] ?? null,
+        }))
+      const pageId = key.slice(0, Math.max(0, key.length - cell.id.length - 1))
+      changed.push({
+        key,
+        pageId,
+        cellId: cell.id,
+        kind: cell.edge ? "edge" : "node",
+        changedFields,
+        styleChanges,
+        geometryChanges,
+        labelChange: beforeCell.label !== afterCell.label
+          ? { before: beforeCell.label, after: afterCell.label }
+          : null,
+        before: beforeCell,
+        after: afterCell,
+      })
     }
   }
   for (const [key, cell] of before) {
     if (!after.has(key)) removed.push({ key, cell })
   }
 
+  const beforePageMap = new Map(beforePages.map((page) => [page.id, page]))
+  const afterPageMap = new Map(afterPages.map((page) => [page.id, page]))
+  for (const pageId of new Set([...beforePageMap.keys(), ...afterPageMap.keys()])) {
+    const beforePage = beforePageMap.get(pageId)
+    const afterPage = afterPageMap.get(pageId)
+    const pageName = afterPage?.name || beforePage?.name || pageId
+    if (!beforePage || !afterPage) {
+      pageChanges.push({
+        pageId,
+        pageName,
+        property: "page",
+        before: beforePage ? "present" : null,
+        after: afterPage ? "present" : null,
+      })
+      continue
+    }
+    if (beforePage.name !== afterPage.name) {
+      pageChanges.push({ pageId, pageName, property: "name", before: beforePage.name, after: afterPage.name })
+    }
+    if (beforePage.properties.background !== afterPage.properties.background) {
+      pageChanges.push({
+        pageId,
+        pageName,
+        property: "background",
+        before: beforePage.properties.background || null,
+        after: afterPage.properties.background || null,
+      })
+    }
+  }
+
   return {
     added,
     removed,
     changed,
+    pageChanges,
     summary: {
       added: added.length,
       removed: removed.length,
       changed: changed.length,
+      pagesChanged: new Set(pageChanges.map((entry) => entry.pageId)).size,
       unchanged: [...after.keys()].filter(
         (key) => before.has(key)
           && JSON.stringify(comparableCell(before.get(key)!))
@@ -3194,6 +3372,7 @@ type IntegratedSession = {
   history: IntegratedSessionHistory[]
   backupFile: string | null
   activeAnnotationId: string | null
+  activePreviewId: string | null
   annotationAuthorizations: Map<string, AnnotationAuthorization>
   historyWarning: string | null
 }
@@ -3276,6 +3455,36 @@ type AnnotationAuthorization = {
   baseRevision: number
   approvedAt: string
   consumedAt: string | null
+  previewId: string | null
+}
+
+type PatchPreviewStatus = "pending" | "authorized" | "cancelled" | "applied" | "stale"
+
+type PatchPreview = {
+  id: string
+  sessionId: string
+  diagramKey: string
+  file: string
+  pageId: string
+  baseRevision: number
+  baseFileHash: string
+  candidateXml: string
+  candidateHash: string
+  beforePreviewXml: string
+  afterPreviewXml: string
+  previewXml: string
+  changedIds: string[]
+  changedQualifiedIds: string[]
+  affectedPageIds: string[]
+  diff: ReturnType<typeof diffParsedPages>
+  status: PatchPreviewStatus
+  statusReason: string | null
+  approvalToken: string | null
+  approvedAt: string | null
+  consumedAt: string | null
+  createdAt: string
+  expiresAt: number
+  terminalAt: number | null
 }
 
 type AnnotationTask = {
@@ -3345,6 +3554,7 @@ type IntegratedBridgeState = {
   previewInFlight: Map<string, Promise<Buffer>>
   previewActive: number
   previewWaiters: Array<() => void>
+  patchPreviews: Map<string, PatchPreview>
 }
 
 const integratedBridgeGlobal = globalThis as typeof globalThis & {
@@ -3370,6 +3580,7 @@ function getIntegratedBridgeState(): IntegratedBridgeState {
       previewInFlight: new Map(),
       previewActive: 0,
       previewWaiters: [],
+      patchPreviews: new Map(),
     }
   }
   integratedBridgeGlobal.__drawioIntegratedBridge.writeQueues ||= new Map()
@@ -3381,6 +3592,7 @@ function getIntegratedBridgeState(): IntegratedBridgeState {
   integratedBridgeGlobal.__drawioIntegratedBridge.previewInFlight ||= new Map()
   integratedBridgeGlobal.__drawioIntegratedBridge.previewActive ||= 0
   integratedBridgeGlobal.__drawioIntegratedBridge.previewWaiters ||= []
+  integratedBridgeGlobal.__drawioIntegratedBridge.patchPreviews ||= new Map()
   return integratedBridgeGlobal.__drawioIntegratedBridge
 }
 
@@ -3468,6 +3680,7 @@ async function refreshIntegratedSession(session: IntegratedSession) {
   session.fileHash = diskHash
   session.updatedBy = "external"
   session.updatedAt = new Date().toISOString()
+  finishPatchPreviewsForCommit(session.file, null)
   broadcastIntegratedRevision(session)
   await createHistorySnapshot(session, { source: "external", xml: diskXml, sessionRevision: session.revision })
   return session
@@ -3500,7 +3713,7 @@ async function integratedCommit(
   baseRevision: number,
   source: "editor" | "agent",
   clientId: string | null = null,
-  options: { autoMerge?: boolean } = {},
+  options: { autoMerge?: boolean; appliedPreviewId?: string | null } = {},
 ) {
   const state = getIntegratedBridgeState()
   const queueKey = path.resolve(session.file).toLowerCase()
@@ -3581,6 +3794,7 @@ async function integratedCommit(
     session.fileHash = integratedHash(candidateXml)
     session.updatedBy = source
     session.updatedAt = new Date().toISOString()
+    finishPatchPreviewsForCommit(session.file, options.appliedPreviewId || null)
     broadcastIntegratedRevision(session, clientId)
     if (source === "agent") {
       // A history-record failure must never roll back or fail the actual save.
@@ -4308,6 +4522,7 @@ async function restoreHistorySnapshot(
     session.fileHash = integratedHash(snapshotXml)
     session.updatedBy = "restore"
     session.updatedAt = new Date().toISOString()
+    finishPatchPreviewsForCommit(session.file, null)
 
     // 4. Invalidate unconsumed annotation authorizations and the active task.
     //    The in-memory invalidation happens first; a sidecar file write failure
@@ -4378,6 +4593,11 @@ async function invalidateAnnotationAuthorizations(session: IntegratedSession): P
   const diagramKey = integratedDiagramKey(session.file)
   for (const candidate of getIntegratedBridgeState().sessions.values()) {
     if (integratedDiagramKey(candidate.file) !== diagramKey) continue
+    for (const authorization of candidate.annotationAuthorizations.values()) {
+      if (!authorization.previewId) continue
+      const preview = getIntegratedBridgeState().patchPreviews.get(authorization.previewId)
+      if (preview) cancelPatchPreview(candidate, preview, "关联的标注审批已失效")
+    }
     candidate.annotationAuthorizations.clear()
     candidate.activeAnnotationId = null
   }
@@ -4431,6 +4651,414 @@ async function loadStoredAnnotations(session: IntegratedSession): Promise<void> 
     const task = normalizeAnnotationTask(entry, session)
     if (task) map.set(task.id, task)
   }
+}
+
+function patchPreviewPayload(preview: PatchPreview, includeXml = false) {
+  return {
+    id: preview.id,
+    file: preview.file,
+    pageId: preview.pageId,
+    baseRevision: preview.baseRevision,
+    candidateHash: preview.candidateHash,
+    changedIds: preview.changedIds,
+    changedQualifiedIds: preview.changedQualifiedIds,
+    affectedPageIds: preview.affectedPageIds,
+    diff: preview.diff,
+    summary: preview.diff.summary,
+    status: preview.status,
+    statusReason: preview.statusReason,
+    approvedAt: preview.approvedAt,
+    consumedAt: preview.consumedAt,
+    createdAt: preview.createdAt,
+    expiresAt: new Date(preview.expiresAt).toISOString(),
+    ...(includeXml ? {
+      xml: preview.afterPreviewXml,
+      beforePreviewXml: preview.beforePreviewXml,
+      afterPreviewXml: preview.afterPreviewXml,
+    } : {}),
+  }
+}
+
+function broadcastPatchPreview(preview: PatchPreview, kind: string): void {
+  const session = getIntegratedBridgeState().sessions.get(preview.sessionId)
+  if (!session || integratedDiagramKey(session.file) !== preview.diagramKey) return
+  const frame = `event: preview\ndata: ${JSON.stringify({
+    kind,
+    preview: patchPreviewPayload(preview),
+  })}\n\n`
+  for (const client of getIntegratedBridgeState().eventClients.get(preview.sessionId) || []) {
+    if (client.diagramKey === preview.diagramKey) client.response.write(frame)
+  }
+}
+
+function prunePatchPreviews(now = Date.now()): void {
+  const state = getIntegratedBridgeState()
+  for (const [id, preview] of state.patchPreviews) {
+    const terminalAt = preview.terminalAt
+    if (terminalAt !== null && terminalAt + PATCH_PREVIEW_RETENTION_MS <= now) {
+      state.patchPreviews.delete(id)
+    }
+  }
+}
+
+function currentPatchPreview(session: IntegratedSession): PatchPreview | null {
+  prunePatchPreviews()
+  if (!session.activePreviewId) return null
+  const preview = getIntegratedBridgeState().patchPreviews.get(session.activePreviewId)
+  if (!preview || preview.sessionId !== session.sessionId
+    || preview.diagramKey !== integratedDiagramKey(session.file)) {
+    session.activePreviewId = null
+    return null
+  }
+  if ((preview.status === "pending" || preview.status === "authorized")
+    && preview.expiresAt <= Date.now()) {
+    preview.status = "stale"
+    preview.statusReason = "预览已过期，请基于最新图表重新生成"
+    preview.approvalToken = null
+    preview.terminalAt = Date.now()
+    session.activePreviewId = null
+    broadcastPatchPreview(preview, "stale")
+  } else if ((preview.status === "pending" || preview.status === "authorized")
+    && (preview.baseRevision !== session.revision || preview.baseFileHash !== session.fileHash)) {
+    preview.status = "stale"
+    preview.statusReason = `图表已从 revision ${preview.baseRevision} 更新到 ${session.revision}`
+    preview.approvalToken = null
+    preview.terminalAt = Date.now()
+    session.activePreviewId = null
+    broadcastPatchPreview(preview, "stale")
+  }
+  return preview
+}
+
+function cancelPatchPreview(session: IntegratedSession, preview: PatchPreview, reason: string): void {
+  if (preview.status === "applied" || preview.status === "cancelled") return
+  preview.status = "cancelled"
+  preview.statusReason = reason
+  preview.approvalToken = null
+  preview.terminalAt = Date.now()
+  if (session.activePreviewId === preview.id) session.activePreviewId = null
+  broadcastPatchPreview(preview, "cancelled")
+}
+
+function createPatchPreview(
+  session: IntegratedSession,
+  beforeXml: string,
+  candidateXml: string,
+  pageId: string,
+  changedIds: string[],
+  diff: ReturnType<typeof diffParsedPages>,
+): PatchPreview {
+  if (beforeXml.includes(PATCH_PREVIEW_ID_PREFIX) || candidateXml.includes(PATCH_PREVIEW_ID_PREFIX)) {
+    throw new Error("formal Draw.io XML must not contain reserved preview artifacts")
+  }
+  const previous = currentPatchPreview(session)
+  if (previous && (previous.status === "pending" || previous.status === "authorized")) {
+    cancelPatchPreview(session, previous, "已生成新的修改预览")
+  }
+  const id = `prv_${randomBytes(9).toString("base64url")}`
+  const createdAt = new Date().toISOString()
+  const changedQualifiedIds = [...new Set([
+    ...diff.added.map((entry) => entry.key),
+    ...diff.removed.map((entry) => entry.key),
+    ...diff.changed.map((entry) => entry.key),
+    ...diff.pageChanges.map((entry) => `${entry.pageId}:@page`),
+  ])]
+  const affectedPageIds = [...new Set([
+    ...diff.added.map((entry) => previewPageIdFromKey(entry.key, entry.cell.id)),
+    ...diff.removed.map((entry) => previewPageIdFromKey(entry.key, entry.cell.id)),
+    ...diff.changed.map((entry) => entry.pageId),
+    ...diff.pageChanges.map((entry) => entry.pageId),
+  ])].filter(Boolean)
+  const afterPreviewXml = decoratePatchPreviewXml(beforeXml, candidateXml, diff, id)
+  const preview: PatchPreview = {
+    id,
+    sessionId: session.sessionId,
+    diagramKey: integratedDiagramKey(session.file),
+    file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
+    pageId,
+    baseRevision: session.revision,
+    baseFileHash: session.fileHash,
+    candidateXml,
+    candidateHash: integratedHash(candidateXml),
+    beforePreviewXml: beforeXml,
+    afterPreviewXml,
+    previewXml: afterPreviewXml,
+    changedIds: [...new Set(changedIds.length > 0
+      ? changedIds
+      : [
+          ...diff.added.map((entry) => entry.cell.id),
+          ...diff.removed.map((entry) => entry.cell.id),
+          ...diff.changed.map((entry) => entry.cellId),
+          ...diff.pageChanges.map(() => "@page"),
+        ])],
+    changedQualifiedIds,
+    affectedPageIds,
+    diff,
+    status: "pending",
+    statusReason: null,
+    approvalToken: null,
+    approvedAt: null,
+    consumedAt: null,
+    createdAt,
+    expiresAt: Date.now() + PATCH_PREVIEW_TTL_MS,
+    terminalAt: null,
+  }
+  getIntegratedBridgeState().patchPreviews.set(id, preview)
+  session.activePreviewId = id
+  broadcastPatchPreview(preview, "created")
+  return preview
+}
+
+function authorizePatchPreview(
+  session: IntegratedSession,
+  preview: PatchPreview,
+  approvalToken: string,
+): void {
+  const current = currentPatchPreview(session)
+  if (!current || current.id !== preview.id) throw new Error("patch preview is no longer active")
+  if (preview.status !== "pending") {
+    throw new Error(`patch preview is ${preview.status}; generate a fresh dry-run preview`)
+  }
+  preview.status = "authorized"
+  preview.statusReason = null
+  preview.approvalToken = approvalToken
+  preview.approvedAt = new Date().toISOString()
+  broadcastPatchPreview(preview, "authorized")
+}
+
+function validatePatchPreviewWrite(
+  session: IntegratedSession,
+  previewId: string | undefined,
+  approvalToken: string | undefined,
+  baseRevision: number,
+  candidateXml: string,
+): PatchPreview {
+  if (!previewId) {
+    throw new Error("preview_id is required for an active-session write; create a dry-run preview first")
+  }
+  const preview = getIntegratedBridgeState().patchPreviews.get(previewId)
+  if (!preview || preview.sessionId !== session.sessionId
+    || preview.diagramKey !== integratedDiagramKey(session.file)) {
+    throw new Error("patch preview not found for this session and diagram")
+  }
+  currentPatchPreview(session)
+  if (preview.status !== "authorized") {
+    throw new Error(`patch preview is ${preview.status}; approve the visible preview before writing`)
+  }
+  if (!approvalToken || preview.approvalToken !== approvalToken) {
+    throw new Error("patch preview approval token is missing or invalid")
+  }
+  if (preview.consumedAt) throw new Error("patch preview approval token has already been used")
+  if (preview.baseRevision !== baseRevision || preview.baseRevision !== session.revision) {
+    throw new Error("patch preview revision no longer matches the active diagram")
+  }
+  if (preview.candidateHash !== integratedHash(candidateXml)) {
+    throw new Error("formal write does not match the candidate XML shown in the preview")
+  }
+  return preview
+}
+
+function finishPatchPreviewsForCommit(file: string, appliedPreviewId: string | null): void {
+  const state = getIntegratedBridgeState()
+  const diagramKey = integratedDiagramKey(file)
+  const now = Date.now()
+  for (const preview of state.patchPreviews.values()) {
+    if (preview.diagramKey !== diagramKey
+      || (preview.status !== "pending" && preview.status !== "authorized")) continue
+    const session = state.sessions.get(preview.sessionId)
+    if (preview.id === appliedPreviewId) {
+      preview.status = "applied"
+      preview.statusReason = null
+      preview.consumedAt = new Date(now).toISOString()
+      preview.terminalAt = now
+      if (session?.activePreviewId === preview.id) session.activePreviewId = null
+      broadcastPatchPreview(preview, "applied")
+    } else {
+      preview.status = "stale"
+      preview.statusReason = "图表已被其它修改更新，请重新生成预览"
+      preview.approvalToken = null
+      preview.terminalAt = now
+      if (session?.activePreviewId === preview.id) session.activePreviewId = null
+      broadcastPatchPreview(preview, "stale")
+    }
+  }
+}
+
+function appendPreviewStyle(style: string | undefined, additions: string): string {
+  const base = style?.trim() || ""
+  return `${base}${base && !base.endsWith(";") ? ";" : ""}${additions}`
+}
+
+function previewPageIdFromKey(key: string, cellId: string): string {
+  return key.slice(0, Math.max(0, key.length - cellId.length - 1))
+}
+
+function previewOverlayCell(
+  id: string,
+  parent: string,
+  rectangle: Rectangle,
+  color: string,
+  label = "",
+  ghost = false,
+): Record<string, unknown> {
+  const padding = ghost ? 0 : 6
+  return {
+    "@_id": id,
+    "@_value": label,
+    "@_style": [
+      "rounded=1", "whiteSpace=wrap", "html=1",
+      `fillColor=${ghost ? color : "none"}`, `strokeColor=${color}`,
+      `strokeWidth=${ghost ? 3 : 4}`, "dashed=1", `opacity=${ghost ? 28 : 80}`,
+      `fontColor=${color}`, "fontStyle=1", "movable=0", "resizable=0", "editable=0",
+      "deletable=0", "connectable=0", "pointerEvents=0", "shadow=0",
+    ].join(";") + ";",
+    "@_vertex": "1",
+    "@_parent": parent,
+    mxGeometry: {
+      "@_x": String(rectangle.x - padding),
+      "@_y": String(rectangle.y - padding),
+      "@_width": String(Math.max(1, rectangle.width + padding * 2)),
+      "@_height": String(Math.max(1, rectangle.height + padding * 2)),
+      "@_as": "geometry",
+    },
+  }
+}
+
+function previewOverlayEdge(
+  raw: Record<string, unknown>,
+  id: string,
+  parent: string,
+  color: string,
+  opacity = 85,
+): Record<string, unknown> {
+  const clone = JSON.parse(JSON.stringify(raw)) as Record<string, unknown>
+  clone["@_id"] = id
+  clone["@_parent"] = parent
+  clone["@_value"] = ""
+  clone["@_style"] = appendPreviewStyle(attribute(clone["@_style"]),
+    `strokeColor=${color};strokeWidth=4;opacity=${opacity};dashed=1;movable=0;editable=0;deletable=0;pointerEvents=0;`)
+  return clone
+}
+
+function decoratePatchPreviewXml(
+  beforeXml: string,
+  candidateXml: string,
+  diff: ReturnType<typeof diffParsedPages>,
+  previewId: string,
+): string {
+  const beforePages = parseDrawio(beforeXml)
+  const afterPages = parseDrawio(candidateXml)
+  const editableBefore = parseEditableDrawio(beforeXml)
+  const editableAfter = parseEditableDrawio(candidateXml)
+  const beforeByPage = new Map(beforePages.map((page) => [page.id, page]))
+  const afterByPage = new Map(afterPages.map((page) => [page.id, page]))
+  const editableBeforeByPage = new Map(editableBefore.pages.map((page) => [page.id, page]))
+  const editableAfterByPage = new Map(editableAfter.pages.map((page) => [page.id, page]))
+  const changedKeys = new Map(diff.changed.map((entry) => [entry.key, entry]))
+  const addedKeys = new Set(diff.added.map((entry) => entry.key))
+  const removedKeys = new Set(diff.removed.map((entry) => entry.key))
+  let overlayIndex = 0
+
+  for (const [pageId, editablePage] of editableAfterByPage) {
+    const beforePage = beforeByPage.get(pageId)
+    const afterPage = afterByPage.get(pageId)
+    if (!afterPage) continue
+    const pageHasChanges = diff.added.some((entry) => previewPageIdFromKey(entry.key, entry.cell.id) === pageId)
+      || diff.removed.some((entry) => previewPageIdFromKey(entry.key, entry.cell.id) === pageId)
+      || diff.changed.some((entry) => entry.key.startsWith(`${pageId}:`))
+    if (!pageHasChanges) continue
+
+    const cells = editableCells(editablePage)
+    const layerId = `${PATCH_PREVIEW_ID_PREFIX}layer_${previewId}_${overlayIndex++}`
+    cells.push({ "@_id": layerId, "@_value": "AI 修改预览（临时）", "@_parent": "0" })
+    const rawAfterById = new Map(cells.map((cell) => [rawCellId(cell), cell]))
+    const afterContext = createGeometryContext(afterPage.cells)
+    const beforeContext = beforePage ? createGeometryContext(beforePage.cells) : null
+    const beforeCellsById = new Map((beforePage?.cells || []).map((cell) => [cell.id, cell]))
+    const afterCellsById = new Map(afterPage.cells.map((cell) => [cell.id, cell]))
+
+    for (const cell of afterPage.cells) {
+      if (!cell.vertex && !cell.edge) continue
+      const key = `${pageId}:${cell.id}`
+      const raw = rawAfterById.get(cell.id)
+      if (addedKeys.has(key)) {
+        if (cell.vertex) {
+          const rectangle = vertexRectangle(cell, afterContext)
+          if (rectangle) cells.push(previewOverlayCell(
+            `${PATCH_PREVIEW_ID_PREFIX}added_${previewId}_${overlayIndex++}`, layerId, rectangle, "#22c55e",
+          ))
+        } else if (raw) {
+          cells.push(previewOverlayEdge(
+            raw,
+            `${PATCH_PREVIEW_ID_PREFIX}added_edge_${previewId}_${overlayIndex++}`,
+            layerId,
+            "#22c55e",
+          ))
+        }
+        continue
+      }
+      const changed = changedKeys.get(key)
+      if (!changed) continue
+      if (cell.vertex) {
+        const rectangle = vertexRectangle(cell, afterContext)
+        if (rectangle) cells.push(previewOverlayCell(
+          `${PATCH_PREVIEW_ID_PREFIX}changed_${previewId}_${overlayIndex++}`, layerId, rectangle, "#f59e0b",
+        ))
+        const beforeCell = beforeCellsById.get(cell.id)
+        if (beforeCell && beforeContext
+          && JSON.stringify(changed.before.geometry) !== JSON.stringify(changed.after.geometry)) {
+          const oldRectangle = vertexRectangle(beforeCell, beforeContext)
+          if (oldRectangle) cells.push(previewOverlayCell(
+            `${PATCH_PREVIEW_ID_PREFIX}old_${previewId}_${overlayIndex++}`,
+            layerId, oldRectangle, "#ef4444", "原位置", true,
+          ))
+        }
+      } else if (raw) {
+        cells.push(previewOverlayEdge(
+          raw,
+          `${PATCH_PREVIEW_ID_PREFIX}changed_edge_${previewId}_${overlayIndex++}`,
+          layerId,
+          "#3b82f6",
+        ))
+      }
+    }
+
+    if (beforePage && beforeContext) {
+      const beforeEditablePage = editableBeforeByPage.get(pageId)
+      const rawBeforeById = new Map(
+        beforeEditablePage ? editableCells(beforeEditablePage).map((cell) => [rawCellId(cell), cell]) : [],
+      )
+      for (const cell of beforePage.cells) {
+        const key = `${pageId}:${cell.id}`
+        if (!removedKeys.has(key)) continue
+        if (cell.vertex) {
+          const rectangle = vertexRectangle(cell, beforeContext)
+          if (rectangle) cells.push(previewOverlayCell(
+            `${PATCH_PREVIEW_ID_PREFIX}removed_${previewId}_${overlayIndex++}`,
+            layerId, rectangle, "#ef4444", `删除：${cell.label?.trim() || cell.id}`, true,
+          ))
+          continue
+        }
+        if (cell.edge && cell.source && cell.target
+          && afterCellsById.has(cell.source) && afterCellsById.has(cell.target)) {
+          const source = rawBeforeById.get(cell.id)
+          if (!source) continue
+          const clone = JSON.parse(JSON.stringify(source)) as Record<string, unknown>
+          clone["@_id"] = `${PATCH_PREVIEW_ID_PREFIX}removed_edge_${previewId}_${overlayIndex++}`
+          clone["@_parent"] = layerId
+          clone["@_value"] = cell.label ? `删除：${cell.label}` : ""
+          clone["@_style"] = appendPreviewStyle(attribute(clone["@_style"]),
+            "strokeColor=#ef4444;strokeWidth=4;opacity=45;dashed=1;movable=0;editable=0;deletable=0;")
+          cells.push(clone)
+        }
+      }
+    }
+  }
+
+  const previewXml = serializeEditableDrawio(editableAfter)
+  const report = validationReport(parseDrawio(previewXml))
+  if (!report.valid) throw new Error(`generated preview XML is invalid: ${JSON.stringify(report.errors)}`)
+  return previewXml
 }
 
 async function persistStoredAnnotations(session: IntegratedSession): Promise<void> {
@@ -4850,7 +5478,10 @@ function validateAnnotationXmlScope(
 ): string[] {
   const diff = diffParsedPages(before, after)
   const pagePrefix = `${guard.task.pageId}:`
-  const changedKeys = [...diff.added, ...diff.removed, ...diff.changed].map((entry) => entry.key)
+  const changedKeys = [
+    ...[...diff.added, ...diff.removed, ...diff.changed].map((entry) => entry.key),
+    ...diff.pageChanges.map((entry) => `${entry.pageId}:@page`),
+  ]
   const changedIds = guard.authorization.scope === "diagram_wide"
     ? changedKeys
     : changedKeys.map((key) => key.startsWith(pagePrefix) ? key.slice(pagePrefix.length) : key)
@@ -5055,6 +5686,11 @@ function clearAnnotationSessionState(session: IntegratedSession, annotationId: s
   const diagramKey = integratedDiagramKey(session.file)
   for (const candidate of getIntegratedBridgeState().sessions.values()) {
     if (integratedDiagramKey(candidate.file) !== diagramKey) continue
+    const authorization = candidate.annotationAuthorizations.get(annotationId)
+    if (authorization?.previewId) {
+      const preview = getIntegratedBridgeState().patchPreviews.get(authorization.previewId)
+      if (preview) cancelPatchPreview(candidate, preview, "关联的标注任务已结束")
+    }
     candidate.annotationAuthorizations.delete(annotationId)
     if (candidate.activeAnnotationId === annotationId) candidate.activeAnnotationId = null
   }
@@ -5082,6 +5718,9 @@ function buildIntegratedEditorPage(options: {
   const historyUrl = new URL("/api/history", options.bridgeUrl)
   historyUrl.searchParams.set("sessionId", options.session.sessionId)
   historyUrl.searchParams.set("token", options.token)
+  const patchPreviewUrl = new URL("/api/preview", options.bridgeUrl)
+  patchPreviewUrl.searchParams.set("sessionId", options.session.sessionId)
+  patchPreviewUrl.searchParams.set("token", options.token)
   const editorExportUrl = new URL("/api/editor-export", options.bridgeUrl)
   editorExportUrl.searchParams.set("sessionId", options.session.sessionId)
   editorExportUrl.searchParams.set("token", options.token)
@@ -5093,6 +5732,7 @@ function buildIntegratedEditorPage(options: {
     eventsUrl: eventsUrl.toString(),
     annotationsUrl: annotationsUrl.toString(),
     historyUrl: historyUrl.toString(),
+    patchPreviewUrl: patchPreviewUrl.toString(),
     editorExportUrl: editorExportUrl.toString(),
   })
 
@@ -5109,6 +5749,28 @@ return `<!doctype html>
       border-radius: 8px; background: rgba(15, 23, 42, .88); color: white; opacity: 0;
       pointer-events: none; transition: opacity .15s; }
     #status.visible { opacity: 1; }
+    #patch-preview-bar { position: fixed; z-index: 11; top: 10px; left: 50%; transform: translateX(-50%);
+      display: none; align-items: center; gap: 10px; max-width: 94vw; padding: 9px 13px;
+      border: 1px solid #d97706; border-radius: 10px; background: rgba(255,251,235,.97);
+      color: #92400e; box-shadow: 0 4px 16px rgba(15,23,42,.18); }
+    #patch-preview-bar.visible { display: flex; }
+    #patch-preview-bar .legend { display: flex; gap: 8px; white-space: nowrap; font-size: 11px; }
+    #patch-preview-bar .swatch { display: inline-block; width: 10px; height: 10px; margin-right: 3px;
+      border-radius: 2px; vertical-align: -1px; }
+    #patch-preview-bar button { border: 1px solid #d97706; border-radius: 6px; background: #fff;
+      color: #92400e; padding: 4px 9px; cursor: pointer; }
+    #patch-preview-bar button.active { background: #d97706; color: #fff; }
+    #patch-preview-details { position: fixed; z-index: 10; display: none; top: 64px; right: 14px;
+      width: min(390px, calc(100vw - 28px)); max-height: 54vh; overflow: auto; padding: 11px 12px;
+      border: 1px solid #d97706; border-radius: 10px; background: rgba(255,255,255,.97);
+      color: #334155; box-shadow: 0 4px 16px rgba(15,23,42,.16); font-size: 12px; }
+    #patch-preview-details.visible { display: block; }
+    #patch-preview-details .change { padding: 7px 0; border-bottom: 1px solid #e2e8f0; }
+    #patch-preview-details .change:last-child { border-bottom: 0; }
+    #patch-preview-details .property { display: grid; grid-template-columns: 94px 1fr 18px 1fr;
+      align-items: center; gap: 5px; margin-top: 4px; }
+    #patch-preview-details .value { overflow-wrap: anywhere; color: #475569; }
+    #patch-preview-details .color { width: 14px; height: 14px; border: 1px solid #94a3b8; border-radius: 3px; }
     #fab-group { position: fixed; z-index: 3; right: 14px; bottom: 14px; display: flex;
       align-items: center; gap: 8px; }
     #history-btn, #ann-btn { display: flex; align-items: center; gap: 6px; padding: 8px 12px;
@@ -5302,6 +5964,8 @@ return `<!doctype html>
     #ann-form .actions .primary:disabled { opacity: .5; cursor: not-allowed; }
     @media (prefers-color-scheme: dark) {
       body { background: #0f172a; }
+      #patch-preview-bar { background: rgba(69,26,3,.96); color: #fde68a; }
+      #patch-preview-bar button { background: #78350f; color: #fef3c7; }
       #history-btn, #ann-btn, #ann-drawer { background: #1e293b; color: #e2e8f0; border-color: #334155; }
       #history-btn:hover, #ann-btn:hover, #ann-drawer header button { background: #243049; }
       #ann-filters { background: #172033; border-color: #334155; }
@@ -5352,6 +6016,20 @@ return `<!doctype html>
 <body>
   <iframe id="editor" title="Draw.io editor"></iframe>
   <div id="status" role="status"></div>
+  <div id="patch-preview-bar" role="status">
+    <strong id="patch-preview-summary">Agent 修改预览</strong>
+    <span class="legend">
+      <span><i class="swatch" style="background:#22c55e"></i>新增</span>
+      <span><i class="swatch" style="background:#f59e0b"></i>修改</span>
+      <span><i class="swatch" style="background:#ef4444"></i>删除/原位置</span>
+      <span><i class="swatch" style="background:#3b82f6"></i>连线</span>
+    </span>
+    <button type="button" id="patch-preview-before">修改前</button>
+    <button type="button" id="patch-preview-after" class="active">修改后</button>
+    <span id="patch-preview-guidance">只读预览，不会写入源文件</span>
+    <button type="button" id="patch-preview-exit">退出预览</button>
+  </div>
+  <div id="patch-preview-details" aria-live="polite"></div>
   <div id="conflict-banner" role="alert">
     <span id="conflict-message">图表刚发生变化，当前画布暂未保存，请确认最新版本。</span>
     <button type="button" id="conflict-retry" style="display:none">重试加载</button>
@@ -5488,7 +6166,7 @@ return `<!doctype html>
       let exportWorkerLoaded = false;
       let pendingSelection = null;
       let awaitingSelection = false;
-      let editorMode = "editing"; // editing | restoring | loading-restored-xml | conflict
+      let editorMode = "editing"; // editing | preview-loading | previewing | preview-exiting | restoring | loading-restored-xml | conflict
       let historyOpen = false;
       let selectedSnapshot = null;
       let confirmSnapshot = null;
@@ -5497,6 +6175,9 @@ return `<!doctype html>
       let pendingRestore = null; // { xml } kept so a load timeout can retry the same target
       let pendingConflict = null; // { xml, latest, merge } kept until the user chooses
       let restoreLoadTimer = null;
+      let activePatchPreview = null;
+      let previewTargetXml = null;
+      let previewExitXml = null;
 
       const historyBtn = document.getElementById("history-btn");
       const annBtn = document.getElementById("ann-btn");
@@ -5519,6 +6200,12 @@ return `<!doctype html>
       const histNote = document.getElementById("hist-note");
       const histConfirm = document.getElementById("history-confirm");
       const restoreOverlay = document.getElementById("restore-overlay");
+      const patchPreviewBar = document.getElementById("patch-preview-bar");
+      const patchPreviewSummary = document.getElementById("patch-preview-summary");
+      const patchPreviewGuidance = document.getElementById("patch-preview-guidance");
+      const patchPreviewBefore = document.getElementById("patch-preview-before");
+      const patchPreviewAfter = document.getElementById("patch-preview-after");
+      const patchPreviewDetails = document.getElementById("patch-preview-details");
 
       function selectedAnnotationScope() {
         return document.querySelector('input[name="ann-scope"]:checked')?.value || "selection_only";
@@ -5617,6 +6304,11 @@ return `<!doctype html>
       }
 
       function requestEditorExport(command) {
+        if (editorMode === "preview-loading" || editorMode === "previewing" || editorMode === "preview-exiting") {
+          showStatus("只读修改预览期间不能从当前画布导出", 4000);
+          void reportEditorExportError(command.requestId, "patch preview is active");
+          return;
+        }
         if (pendingExport) {
           showStatus("已有一次导出正在进行，请稍候", 3000);
           void reportEditorExportError(command.requestId, "another export is already running on this page");
@@ -5641,6 +6333,219 @@ return `<!doctype html>
         const response = await fetch(CONFIG.apiUrl, { cache: "no-store" });
         if (!response.ok) throw new Error("读取图表失败（HTTP " + response.status + "）");
         return response.json();
+      }
+
+      async function readPatchPreview() {
+        const response = await fetch(CONFIG.patchPreviewUrl, { cache: "no-store" });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "读取修改预览失败");
+        return result.preview || null;
+      }
+
+      function patchPreviewVisible(preview) {
+        return preview && (preview.status === "pending" || preview.status === "authorized")
+          && typeof preview.xml === "string";
+      }
+
+      function setPatchPreviewControlsDisabled(disabled) {
+        historyBtn.disabled = disabled;
+        annBtn.disabled = disabled;
+      }
+
+      function patchPreviewValue(value) {
+        return value === null || value === undefined || value === "" ? "（未设置）" : String(value);
+      }
+
+      function appendPatchPreviewProperty(container, property, before, after) {
+        const row = document.createElement("div");
+        row.className = "property";
+        const name = document.createElement("strong");
+        name.textContent = property;
+        const beforeValue = document.createElement("span");
+        beforeValue.className = "value";
+        beforeValue.textContent = patchPreviewValue(before);
+        const arrow = document.createElement("span");
+        arrow.textContent = "→";
+        const afterValue = document.createElement("span");
+        afterValue.className = "value";
+        afterValue.textContent = patchPreviewValue(after);
+        row.append(name, beforeValue, arrow, afterValue);
+        if (/color|background/i.test(property)) {
+          for (const [value, target] of [[before, beforeValue], [after, afterValue]]) {
+            if (!value) continue;
+            const swatch = document.createElement("i");
+            swatch.className = "color";
+            swatch.style.backgroundColor = String(value);
+            target.prepend(swatch, " ");
+          }
+        }
+        container.appendChild(row);
+      }
+
+      function renderPatchPreviewDetails(preview) {
+        patchPreviewDetails.replaceChildren();
+        const diff = preview?.diff || {};
+        for (const change of diff.changed || []) {
+          const section = document.createElement("div");
+          section.className = "change";
+          const title = document.createElement("strong");
+          title.textContent = (change.kind === "edge" ? "连线 " : "图元 ")
+            + (change.cellId || change.key || "");
+          section.appendChild(title);
+          if (change.labelChange) {
+            appendPatchPreviewProperty(section, "label", change.labelChange.before, change.labelChange.after);
+          }
+          for (const style of change.styleChanges || []) {
+            appendPatchPreviewProperty(section, style.property, style.before, style.after);
+          }
+          for (const geometry of change.geometryChanges || []) {
+            appendPatchPreviewProperty(section, geometry.property, geometry.before, geometry.after);
+          }
+          patchPreviewDetails.appendChild(section);
+        }
+        for (const change of diff.pageChanges || []) {
+          const section = document.createElement("div");
+          section.className = "change";
+          const title = document.createElement("strong");
+          title.textContent = "页面 " + (change.pageName || change.pageId);
+          section.appendChild(title);
+          appendPatchPreviewProperty(section, change.property, change.before, change.after);
+          patchPreviewDetails.appendChild(section);
+        }
+        patchPreviewDetails.classList.toggle("visible", patchPreviewDetails.childElementCount > 0);
+      }
+
+      function updatePatchPreviewViewButtons(view) {
+        patchPreviewBefore.classList.toggle("active", view === "before");
+        patchPreviewAfter.classList.toggle("active", view === "after");
+      }
+
+      function setPatchPreviewView(view) {
+        if (!activePatchPreview || !editorReady) return;
+        const xml = view === "before"
+          ? activePatchPreview.beforePreviewXml
+          : activePatchPreview.afterPreviewXml || activePatchPreview.xml;
+        if (typeof xml !== "string" || !xml) return;
+        previewTargetXml = xml;
+        editorMode = "preview-loading";
+        updatePatchPreviewViewButtons(view);
+        sendEditor({ action: "load", xml, autosave: 0, diffSync: false,
+          title: CONFIG.file + (view === "before" ? " · 修改前" : " · Agent 修改后") });
+      }
+
+      async function showPatchPreview(preview) {
+        if (!patchPreviewVisible(preview) || !editorReady) return;
+        if (activePatchPreview?.id === preview.id
+          && (editorMode === "preview-loading" || editorMode === "previewing")) {
+          activePatchPreview = preview;
+          patchPreviewGuidance.textContent = preview.status === "authorized"
+            ? "已批准，正在提交精确候选"
+            : "请核对画布后在 OpenCode 审批弹窗中确认";
+          return;
+        }
+        await saveChain;
+        if (editorMode !== "editing") {
+          showStatus("修改预览已就绪；请先完成当前恢复或冲突处理", 5000);
+          return;
+        }
+        const latest = await readLatest();
+        if (latest.revision !== preview.baseRevision) {
+          showStatus("修改预览基线已变化，等待 Agent 重新生成", 4200);
+          return;
+        }
+        if (lastEditorXml && current?.xml && !historyXmlEquals(lastEditorXml, current.xml)) {
+          showStatus("检测到尚未同步的人工编辑，暂不覆盖当前画布", 5000);
+          return;
+        }
+        current = latest;
+        canvasRevision = latest.revision;
+        activePatchPreview = preview;
+        previewTargetXml = preview.xml;
+        previewExitXml = null;
+        editorMode = "preview-loading";
+        updatePatchPreviewViewButtons("after");
+        renderPatchPreviewDetails(preview);
+        closeDrawer();
+        closeHistory();
+        setPatchPreviewControlsDisabled(true);
+        const summary = preview.summary || {};
+        patchPreviewSummary.textContent = "新增 " + (summary.added || 0)
+          + " · 修改 " + (summary.changed || 0)
+          + " · 删除 " + (summary.removed || 0)
+          + " · revision " + preview.baseRevision;
+        patchPreviewGuidance.textContent = preview.status === "authorized"
+          ? "已批准，正在提交精确候选"
+          : "请核对画布后在 OpenCode 审批弹窗中确认";
+        patchPreviewBar.classList.add("visible");
+        sendEditor({ action: "load", xml: preview.xml, autosave: 0, diffSync: false,
+          title: CONFIG.file + " · Agent 修改预览" });
+      }
+
+      async function leavePatchPreview(reloadLatest = true) {
+        if (!reloadLatest) {
+          activePatchPreview = null;
+          previewTargetXml = null;
+          previewExitXml = null;
+          editorMode = "editing";
+          patchPreviewBar.classList.remove("visible");
+          patchPreviewDetails.classList.remove("visible");
+          setPatchPreviewControlsDisabled(false);
+          return;
+        }
+        const latest = await readLatest();
+        current = latest;
+        canvasRevision = latest.revision;
+        previewTargetXml = null;
+        previewExitXml = latest.xml;
+        editorMode = "preview-exiting";
+        sendEditor({ action: "load", xml: latest.xml, autosave: 1, diffSync: true, title: CONFIG.file });
+      }
+
+      function confirmPatchPreviewLoad(xml) {
+        if (editorMode === "preview-loading" && previewTargetXml
+          && historyXmlEquals(xml, previewTargetXml)) {
+          previewTargetXml = null;
+          editorMode = "previewing";
+          showStatus("已加载只读修改预览", 1800);
+          return true;
+        }
+        if (editorMode === "preview-exiting" && previewExitXml
+          && historyXmlEquals(xml, previewExitXml)) {
+          lastEditorXml = previewExitXml;
+          previewExitXml = null;
+          activePatchPreview = null;
+          editorMode = "editing";
+          patchPreviewBar.classList.remove("visible");
+          patchPreviewDetails.classList.remove("visible");
+          setPatchPreviewControlsDisabled(false);
+          showStatus("已返回正式图表", 1800);
+          return true;
+        }
+        return false;
+      }
+
+      async function refreshPatchPreview() {
+        const preview = await readPatchPreview();
+        if (patchPreviewVisible(preview)) {
+          await showPatchPreview(preview);
+          return;
+        }
+        if (editorMode === "preview-loading" || editorMode === "previewing") {
+          await leavePatchPreview(true);
+        }
+        if (preview?.statusReason) showStatus(preview.statusReason, 4200);
+      }
+
+      async function cancelVisiblePatchPreview() {
+        if (!activePatchPreview) return;
+        const cancelUrl = new URL(CONFIG.patchPreviewUrl);
+        cancelUrl.pathname = cancelUrl.pathname.endsWith("/")
+          ? cancelUrl.pathname + encodeURIComponent(activePatchPreview.id)
+          : cancelUrl.pathname + "/" + encodeURIComponent(activePatchPreview.id);
+        const response = await fetch(cancelUrl.toString(), { method: "DELETE" });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "取消预览失败");
+        await leavePatchPreview(true);
       }
 
       async function writeState(xml, baseRevision) {
@@ -5668,6 +6573,7 @@ return `<!doctype html>
 
       function queueSave(xml) {
         saveChain = saveChain.then(async () => {
+          if (editorMode === "preview-loading" || editorMode === "previewing" || editorMode === "preview-exiting") return;
           if (editorMode === "restoring" || editorMode === "loading-restored-xml") return;
           if (editorMode === "conflict") {
             if (pendingConflict && typeof xml === "string") pendingConflict.xml = xml;
@@ -6026,7 +6932,7 @@ return `<!doctype html>
       }
 
       async function openHistory() {
-        if (editorMode === "restoring" || editorMode === "loading-restored-xml") return;
+        if (editorMode !== "editing") return;
         closeDrawer();
         historyOpen = true;
         histModal.classList.add("open");
@@ -6333,7 +7239,7 @@ return `<!doctype html>
       }
 
       function openDrawer() {
-        if (editorMode === "restoring" || editorMode === "loading-restored-xml") return;
+        if (editorMode !== "editing") return;
         closeHistory();
         annDrawer.classList.add("open");
         annDrawer.setAttribute("aria-hidden", "false");
@@ -6347,6 +7253,10 @@ return `<!doctype html>
       }
 
       function startAnnotation() {
+        if (editorMode !== "editing") {
+          showStatus("请先退出修改预览或完成当前冲突处理", 3600);
+          return;
+        }
         awaitingSelection = true;
         pendingSelection = null;
         annForm.classList.add("visible");
@@ -6528,6 +7438,11 @@ return `<!doctype html>
         const nextStatus = target.getAttribute("data-status");
         if (id && nextStatus) void updateAnnotationStatus(id, nextStatus, target);
       });
+      document.getElementById("patch-preview-exit").addEventListener("click", () => {
+        void cancelVisiblePatchPreview().catch(error => showStatus(error.message || "取消预览失败", 5000));
+      });
+      patchPreviewBefore.addEventListener("click", () => setPatchPreviewView("before"));
+      patchPreviewAfter.addEventListener("click", () => setPatchPreviewView("after"));
 
       historyBtn.addEventListener("click", () => void openHistory());
       document.getElementById("hist-close").addEventListener("click", closeHistory);
@@ -6625,6 +7540,7 @@ return `<!doctype html>
             lastEditorXml = current.xml;
             sendEditor({ action: "load", xml: current.xml, autosave: 1, diffSync: true, title: CONFIG.file });
             void refreshAnnotations();
+            void refreshPatchPreview();
             if (pendingExport) setTimeout(dispatchExport, 250);
           } catch (error) { showStatus(error.message || "读取失败", 5000); }
         } else if (message.event === "export" && message.format === "json" && awaitingSelection) {
@@ -6636,6 +7552,7 @@ return `<!doctype html>
           // Draw.io acknowledges action:"load" with event:"load". Only the
           // exact restore target may release the save guard; a delayed initial
           // load acknowledgement must not confirm a different document.
+          confirmPatchPreviewLoad(message.xml);
           confirmRestoreTargetLoaded(message.xml);
         } else if ((message.event === "autosave" || message.event === "save") && typeof message.xml === "string") {
           lastEditorXml = message.xml;
@@ -6663,6 +7580,9 @@ return `<!doctype html>
       });
       events.addEventListener("annotation", () => {
         void refreshAnnotations();
+      });
+      events.addEventListener("preview", () => {
+        void refreshPatchPreview().catch(error => showStatus(error.message || "刷新修改预览失败", 5000));
       });
       events.addEventListener("history", event => {
         if (!historyOpen) return;
@@ -6751,6 +7671,28 @@ async function handleIntegratedBridgeRequest(
       integratedJsonResponse(response, 400, { ok: false, error: "baseRevision must be an integer" })
       return
     }
+    if (xml.includes(PATCH_PREVIEW_ID_PREFIX)) {
+      integratedJsonResponse(response, 409, {
+        ok: false,
+        error: "preview_artifact",
+        message: "临时修改预览不能保存到正式 Draw.io 文件",
+      })
+      return
+    }
+    const activePreview = currentPatchPreview(session)
+    if (
+      body.source === "editor"
+      && activePreview
+      && (integratedHash(xml) === activePreview.candidateHash
+        || integratedHash(xml) === integratedHash(activePreview.afterPreviewXml))
+    ) {
+      integratedJsonResponse(response, 409, {
+        ok: false,
+        error: "preview_candidate",
+        message: "只读修改预览候选不能通过编辑器保存，必须先完成写前审批",
+      })
+      return
+    }
     const result = await integratedCommit(
       session,
       xml,
@@ -6805,6 +7747,30 @@ async function handleIntegratedBridgeRequest(
       clients.delete(client)
       if (clients.size === 0) state.eventClients.delete(session.sessionId)
     })
+    return
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/preview") {
+    await refreshIntegratedSession(session)
+    const preview = currentPatchPreview(session)
+    integratedJsonResponse(response, 200, {
+      ok: true,
+      preview: preview ? patchPreviewPayload(preview, true) : null,
+    })
+    return
+  }
+
+  const patchPreviewIdMatch = requestUrl.pathname.match(/^\/api\/preview\/([^/]+)$/)
+  const patchPreviewId = patchPreviewIdMatch ? decodeURIComponent(patchPreviewIdMatch[1]) : null
+  if (patchPreviewId && request.method === "DELETE") {
+    const preview = state.patchPreviews.get(patchPreviewId)
+    if (!preview || preview.sessionId !== session.sessionId
+      || preview.diagramKey !== integratedDiagramKey(session.file)) {
+      integratedJsonResponse(response, 404, { ok: false, error: "patch preview not found" })
+      return
+    }
+    cancelPatchPreview(session, preview, "用户退出了修改预览")
+    integratedJsonResponse(response, 200, { ok: true, preview: patchPreviewPayload(preview) })
     return
   }
 
@@ -7406,12 +8372,14 @@ async function bindIntegratedSession(
       }],
       backupFile: null,
       activeAnnotationId: null,
+      activePreviewId: null,
       annotationAuthorizations: new Map(),
       historyWarning: null,
     }
   state.sessions.set(context.sessionID, session)
   session.bindingId ??= randomBytes(16).toString("base64url")
   session.activeAnnotationId ??= null
+  session.activePreviewId ??= null
   session.annotationAuthorizations ??= new Map()
   await loadStoredAnnotations(session)
   await bindHistoryCheckpoint(session)
@@ -7442,6 +8410,18 @@ const edgeSchema = tool.schema.object({
   label: tool.schema.string().optional().describe("Visible edge label"),
 })
 
+const patchStyleUpdatesSchema = tool.schema.object({
+  font_size: tool.schema.number().positive().max(200).optional(),
+  font_family: tool.schema.string().min(1).max(120).optional(),
+  font_color: tool.schema.string().min(1).max(80).optional(),
+  fill_color: tool.schema.string().min(1).max(80).optional(),
+  stroke_color: tool.schema.string().min(1).max(80).optional(),
+  stroke_width: tool.schema.number().min(0).max(50).optional(),
+  opacity: tool.schema.number().min(0).max(100).optional(),
+  rounded: tool.schema.boolean().optional(),
+  dashed: tool.schema.boolean().optional(),
+})
+
 const patchOperationSchema = tool.schema.object({
   type: tool.schema.enum([
     "add-node",
@@ -7462,6 +8442,9 @@ const patchOperationSchema = tool.schema.object({
   y: tool.schema.number().optional(),
   width: tool.schema.number().positive().optional(),
   height: tool.schema.number().positive().optional(),
+  style_updates: patchStyleUpdatesSchema
+    .optional()
+    .describe("Whitelisted visual property updates that preserve unrelated style keys"),
   cascade: tool.schema
     .boolean()
     .optional()
@@ -7474,6 +8457,7 @@ const DRAWIO_RUNTIME_GUIDANCE = `## Draw.io 文件写入与交付
 每次修改前必须立即调用 drawio_get_state，并把返回的最新 XML 作为修改基线。人工编辑不是只读内容，可以按当前任务要求继续调整。
 提交时必须携带该次读取返回的准确 base_revision；revision_conflict 后重新读取，在新 XML 上重新执行所需变更并重试，禁止重发旧 XML。
 禁止用普通 write、edit 或脚本直接覆盖已绑定的 .drawio 文件，因为这会绕过 revision 检查并可能用旧快照丢失最新内容。
+对已绑定文件执行 drawio_patch 或 drawio_polish 时，先以 dry_run=true 生成同画布修改预览；字体、填充色、文字色、边框色等常用属性使用 drawio_patch.style_updates。只有完整 XML 才能表达的页面背景或高级样式先调用 drawio_preview_state，禁止直接调用 drawio_update_state 绕过预览。预览提供修改前/修改后切换和属性级前后值；绿色表示新增、黄色表示修改、红色表示删除或原位置、蓝色表示变更连线。普通修改调用 drawio_authorize_preview；用户在审批弹窗点击允许后，该工具会立即校验并提交画布中展示的精确候选，Agent 不得等待用户再发文字确认，也不得重复调用正式 patch/polish。注释修改继续调用 drawio_authorize_annotation_change，并把 dry-run 返回的 preview_id 与精确稳定 ID 清单一起纳入范围审批。
 本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。调用前必须先调用 drawio_list_annotations(status='pending') 探测未完成注释；存在 requiresConfirmation=false 的注释时 drawio_finalize 会拒绝执行，必须先逐条处理并 drawio_resolve_annotation 后再重试，不得跳过。只有返回 shouldOpenBrowser=true 时才将 openUrl 交给 MobileWork 现有 browser.open_url 打开；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
 drawio_export 支持 PNG、JPEG、PDF、xmlpng、SVG、xmlsvg 和 html2。SVG、xmlsvg、html2 由内置浏览器编辑器渲染并通过 Bridge 写回工作区；返回 editor_required 时必须立即调用 browser.open_url 自动打开其 openUrl，等待编辑器连接后用完全相同的参数重试，禁止把该状态解释为不支持格式或要求用户手工导出。PNG、JPEG、xmlpng、SVG、xmlsvg 使用 all_pages=true 时逐页生成文件并返回 outputs[]，必须核对 page_count 与 outputs 数量一致；PDF 和 html2 的 all_pages=true 各返回一个包含全部页面的多页单文件，html2 还需核对 contains_all_pages=true。
 
@@ -7481,7 +8465,7 @@ drawio_export 支持 PNG、JPEG、PDF、xmlpng、SVG、xmlsvg 和 html2。SVG、
 
 用户在内置浏览器中框选图元并提交注释后，每条注释是一条按图表文件持久化的独立任务，不绑定创建它的对话 session；任务记录稳定 ID、页面、区域范围、修改说明、允许范围和提交时的图表基线。
 注释的持久化 status 为 open/resolved/ignored；freshness=stale 表示图元已变化但任务仍未完成。执行 stale 注释前必须先询问用户；fresh 注释可直接进入计划和审批流程。resolved 和 ignored 都是终态，Agent 必须跳过，只有用户重新打开后才能处理。
-处理注释时必须先读取最新状态并 dry-run，向用户说明计划、完整稳定 ID 清单和范围，再调用 drawio_authorize_annotation_change。该工具必须由 OpenCode 以 ask 权限弹窗在写入前批准；批准后才可把当前 session 的一次性 token 传给正式 drawio_patch/drawio_update_state。非全图范围由运行时强制使用注释绑定的 pageId；diagram_wide 覆盖当前图表全部页面并使用 pageId:cellId。禁止先改后问。
+处理注释时必须先读取最新状态并 dry-run，让候选结果显示在同一 Draw.io 画布中；向用户说明计划、完整稳定 ID 清单和范围后，携带 preview_id 调用 drawio_authorize_annotation_change。该工具必须由 OpenCode 以 ask 权限弹窗在写入前批准；批准后才可把当前 session 的一次性 token 传给正式 drawio_patch/drawio_update_state，且写入 XML 必须与已展示候选完全一致。非全图范围由运行时强制使用注释绑定的 pageId；diagram_wide 覆盖当前图表全部页面并使用 pageId:cellId。禁止先改后问。
 不得修改授权范围外内容。确需越界时，在 authorization 的 escalation_reason 中先说明不可避免的原因并申请更宽范围；未获批准不得写入。drawio_polish 会重排整页，存在活动注释时只有取得 diagram_wide 审批后才能正式运行。
 用户本轮另有明确任务时先完成该任务，然后在同一轮重新探测注释；最终回复前仍存在 requiresConfirmation=false 的 open 注释时必须继续处理，不能只提示用户稍后继续。
 注释任务的检查与处理流程由 drawio-session-editing 技能负责编排，详见该 SKILL.md。`
@@ -7896,7 +8880,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
 
     drawio_patch: tool({
       description:
-        "Apply semantic node and edge operations to an existing Draw.io file. Pass annotation_id when executing an annotation so its bound page is enforced. Preserves unrelated cells and creates a recoverable backup unless dry_run is true.",
+        "Apply semantic node and edge operations, including whitelisted font, color, stroke, opacity and shape-style updates, to an existing Draw.io file. Pass annotation_id when executing an annotation so its bound page is enforced. Preserves unrelated cells and creates a recoverable backup unless dry_run is true.",
       args: {
         file: tool.schema.string().describe("Workspace-relative .drawio or .xml file"),
         page: tool.schema
@@ -7925,6 +8909,14 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           .string()
           .optional()
           .describe("One-time token returned after drawio_authorize_annotation_change is approved"),
+        preview_id: tool.schema
+          .string()
+          .optional()
+          .describe("Preview id returned by the immediately preceding active-session dry-run"),
+        preview_approval_token: tool.schema
+          .string()
+          .optional()
+          .describe("One-time token returned by drawio_authorize_preview; annotation approval_token also authorizes its linked preview"),
       },
       async execute(args, context) {
         const target = resolveWorkspacePath(context, args.file)
@@ -7983,17 +8975,37 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         const diff = diffParsedPages(beforePages, afterPages)
 
         if (args.dry_run) {
+          const preview = activeSession
+            ? createPatchPreview(activeSession, beforeXml, afterXml, page.id, changedIds, diff)
+            : null
           return JSON.stringify({
             file: args.file,
             dryRun: true,
             changedIds,
             diff,
+            preview: preview ? patchPreviewPayload(preview) : null,
+            previewGuidance: preview
+              ? "The exact candidate is visible in the bound Draw.io canvas. Review it before authorization."
+              : "Bind the file with drawio_open or drawio_finalize to receive an interactive canvas preview.",
             ...report,
           }, null, 2)
         }
 
         if (activeSession) {
-          const commit = await integratedCommit(activeSession, afterXml, args.base_revision!, "agent")
+          const previewId = args.preview_id
+            || annotationGuard?.authorization.previewId
+            || activeSession.activePreviewId
+            || undefined
+          const preview = validatePatchPreviewWrite(
+            activeSession,
+            previewId,
+            args.preview_approval_token || args.approval_token,
+            args.base_revision!,
+            afterXml,
+          )
+          const commit = await integratedCommit(activeSession, afterXml, args.base_revision!, "agent", null, {
+            appliedPreviewId: preview.id,
+          })
           if (commit.conflict) {
             return JSON.stringify({
               file: args.file,
@@ -8069,6 +9081,11 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           .string()
           .optional()
           .describe("One-time diagram_wide token returned by drawio_authorize_annotation_change"),
+        preview_id: tool.schema.string().optional().describe("Preview id returned by the dry-run"),
+        preview_approval_token: tool.schema
+          .string()
+          .optional()
+          .describe("One-time token returned by drawio_authorize_preview"),
       },
       async execute(args, context) {
         const target = resolveWorkspacePath(context, args.file)
@@ -8113,9 +9130,13 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           afterQuality,
         }
         if (args.dry_run) {
+          const preview = activeSession
+            ? createPatchPreview(activeSession, beforeXml, afterXml, page.id, changedIds, diff)
+            : null
           return JSON.stringify({
             ...result,
             backup: null,
+            preview: preview ? patchPreviewPayload(preview) : null,
           }, null, 2)
         }
         if (!afterQuality.pass) {
@@ -8127,7 +9148,20 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
 
         let writeResult: { backup: string | null }
         if (activeSession) {
-          const commit = await integratedCommit(activeSession, afterXml, args.base_revision!, "agent")
+          const previewId = args.preview_id
+            || annotationGuard?.authorization.previewId
+            || activeSession.activePreviewId
+            || undefined
+          const preview = validatePatchPreviewWrite(
+            activeSession,
+            previewId,
+            args.preview_approval_token || args.approval_token,
+            args.base_revision!,
+            afterXml,
+          )
+          const commit = await integratedCommit(activeSession, afterXml, args.base_revision!, "agent", null, {
+            appliedPreviewId: preview.id,
+          })
           if (commit.conflict) {
             return JSON.stringify({
               ...result,
@@ -8202,9 +9236,87 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
+    drawio_preview_state: tool({
+      description:
+        "Preview an exact complete-XML candidate in the active Draw.io canvas without writing it. Use when semantic drawio_patch operations cannot express the requested change, including page backgrounds or advanced styles.",
+      args: {
+        base_revision: tool.schema
+          .number()
+          .int()
+          .min(0)
+          .describe("Exact revision returned by the immediately preceding drawio_get_state call"),
+        xml: tool.schema.string().min(1).describe("Complete candidate Draw.io XML"),
+        annotation_id: tool.schema
+          .string()
+          .optional()
+          .describe("Open annotation task this candidate is intended to address"),
+      },
+      async execute(args, context) {
+        const session = getIntegratedBridgeState().sessions.get(context.sessionID)
+        if (!session) throw new Error("No active Draw.io session. Call drawio_open first.")
+        await refreshIntegratedSession(session)
+        if (args.base_revision !== session.revision) {
+          return JSON.stringify({
+            ok: false,
+            error: "revision_conflict",
+            current: integratedDocumentPayload(session),
+            manualChanges: integratedManualChanges(session, args.base_revision),
+          }, null, 2)
+        }
+        if (args.annotation_id) {
+          const annotation = getDiagramAnnotations(session).get(args.annotation_id)
+          if (!annotation) throw new Error(`annotation not found: ${args.annotation_id}`)
+          if (annotation.status !== "open") {
+            throw new Error(`annotation is ${annotation.status} and must be reopened before previewing`)
+          }
+        }
+        if (args.xml.includes(PATCH_PREVIEW_ID_PREFIX)) {
+          throw new Error("formal Draw.io XML must not contain reserved preview artifacts")
+        }
+        const afterPages = parseDrawio(args.xml)
+        const report = validationReport(afterPages)
+        if (!report.valid) {
+          return JSON.stringify({ ok: false, error: "invalid_drawio_xml", validation: report }, null, 2)
+        }
+        const beforePages = parseDrawio(session.xml)
+        const diff = diffParsedPages(beforePages, afterPages)
+        const changeCount = diff.summary.added + diff.summary.removed + diff.summary.changed
+          + diff.pageChanges.length
+        if (changeCount === 0) throw new Error("candidate XML is identical to the active diagram")
+        const firstAffectedPageId = diff.changed[0]?.pageId
+          || (diff.added[0] ? previewPageIdFromKey(diff.added[0].key, diff.added[0].cell.id) : undefined)
+          || (diff.removed[0] ? previewPageIdFromKey(diff.removed[0].key, diff.removed[0].cell.id) : undefined)
+          || diff.pageChanges[0]?.pageId
+          || afterPages[0]?.id
+          || beforePages[0]?.id
+          || "page-1"
+        const preview = createPatchPreview(
+          session,
+          session.xml,
+          args.xml,
+          firstAffectedPageId,
+          [],
+          diff,
+        )
+        return JSON.stringify({
+          ok: true,
+          dryRun: true,
+          file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
+          changedIds: preview.changedIds,
+          changedQualifiedIds: preview.changedQualifiedIds,
+          affectedPageIds: preview.affectedPageIds,
+          diff,
+          preview: patchPreviewPayload(preview),
+          validation: report,
+          previewGuidance:
+            "The exact complete-XML candidate is visible in the bound Draw.io canvas. Compare Before and After, inspect the property list, then authorize the preview.",
+        }, null, 2)
+      },
+    }),
+
     drawio_update_state: tool({
       description:
-        "Replace the active session's complete Draw.io XML using the exact revision from an immediately preceding drawio_get_state call. A stale revision is rejected.",
+        "Apply the exact complete-XML candidate from an approved drawio_preview_state preview. The candidate hash and base revision must match; a stale revision is rejected.",
       args: {
         base_revision: tool.schema.number().int().min(0),
         xml: tool.schema.string().min(1),
@@ -8216,11 +9328,35 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           .string()
           .optional()
           .describe("One-time token returned after drawio_authorize_annotation_change is approved"),
+        preview_id: tool.schema
+          .string()
+          .optional()
+          .describe("Preview id from drawio_preview_state; annotation approval may supply its linked preview"),
+        preview_approval_token: tool.schema
+          .string()
+          .optional()
+          .describe("Preview approval token; annotation approval_token also authorizes its linked preview"),
       },
       async execute(args, context) {
         const session = getIntegratedBridgeState().sessions.get(context.sessionID)
         if (!session) throw new Error("No active Draw.io session. Call drawio_open first.")
         await refreshIntegratedSession(session)
+        if (args.base_revision !== session.revision) {
+          return JSON.stringify({
+            ok: false,
+            error: "revision_conflict",
+            current: integratedDocumentPayload(session),
+            manualChanges: integratedManualChanges(session, args.base_revision),
+          }, null, 2)
+        }
+        if (integratedHash(args.xml) === session.fileHash) {
+          return JSON.stringify({
+            ok: true,
+            ...integratedDocumentPayload(session),
+            validation: validationReport(parseDrawio(session.xml)),
+            noOp: true,
+          }, null, 2)
+        }
         const annotationGuard = requireAnnotationAuthorization(
           session,
           args.annotation_id,
@@ -8233,7 +9369,17 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
             parseDrawio(args.xml),
           )
         }
-        const result = await integratedCommit(session, args.xml, args.base_revision, "agent")
+        const previewId = args.preview_id || annotationGuard?.authorization.previewId || undefined
+        const preview = validatePatchPreviewWrite(
+          session,
+          previewId,
+          args.preview_approval_token || args.approval_token,
+          args.base_revision,
+          args.xml,
+        )
+        const result = await integratedCommit(session, args.xml, args.base_revision, "agent", null, {
+          appliedPreviewId: preview.id,
+        })
         if (result.conflict) {
           return JSON.stringify({
             ok: false,
@@ -8481,8 +9627,102 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           guidance: task.status !== "open"
             ? `This annotation is ${task.status} and terminal. Do not process it unless the user reopens it in the annotation panel.`
             : annotationState.requiresConfirmation
-              ? "This annotation is stale but still open. Ask the user whether to execute it. After confirmation, call drawio_get_state, prepare a dry-run and exact changed-id plan, then call drawio_authorize_annotation_change. Wait for the OpenCode approval popup before passing annotation_id and its one-time token to drawio_patch/drawio_update_state; resolve only after the write succeeds."
-              : "Call drawio_get_state, prepare a dry-run and exact changed-id plan, then call drawio_authorize_annotation_change. Wait for the OpenCode approval popup before passing annotation_id and its one-time token to drawio_patch/drawio_update_state; resolve only after the write succeeds.",
+              ? "This annotation is stale but still open. Ask the user whether to execute it. After confirmation, call drawio_get_state, generate a dry-run canvas preview and exact changed-id plan, then call drawio_authorize_annotation_change with the preview id. Wait for the OpenCode approval popup before applying the exact hash-matched candidate; resolve only after the write succeeds."
+              : "Call drawio_get_state, generate a dry-run canvas preview and exact changed-id plan, then call drawio_authorize_annotation_change with the preview id. After approval, apply the exact hash-matched candidate and resolve the annotation.",
+        }, null, 2)
+      },
+    }),
+
+    drawio_authorize_preview: tool({
+      description:
+        "Request approval for the exact candidate visible in the Draw.io canvas and apply it immediately when the user allows the popup. Use after drawio_patch/drawio_polish dry-run or drawio_preview_state, and only for changes that are not driven by an annotation task.",
+      args: {
+        file: tool.schema.string().optional().describe("Workspace-relative diagram file; defaults to the active file"),
+        preview_id: tool.schema.string().describe("Preview id returned by drawio_patch/drawio_polish dry-run or drawio_preview_state"),
+        plan: tool.schema.string().min(1).describe("Concise explanation of the visible candidate change"),
+      },
+      async execute(args, context) {
+        const session = annotationSessionFor(context, args.file)
+        if (!session) throw new Error("No active Draw.io session. Call drawio_open first.")
+        await refreshIntegratedSession(session)
+        if (activeAnnotationTask(session)) {
+          throw new Error(
+            "an annotation task is active; authorize its scoped preview with drawio_authorize_annotation_change instead",
+          )
+        }
+        const preview = getIntegratedBridgeState().patchPreviews.get(args.preview_id)
+        if (!preview || preview.sessionId !== session.sessionId
+          || preview.diagramKey !== integratedDiagramKey(session.file)) {
+          throw new Error("patch preview not found for this session and diagram")
+        }
+        currentPatchPreview(session)
+        if (preview.status !== "pending") {
+          throw new Error(`patch preview is ${preview.status}; generate a fresh dry-run preview`)
+        }
+        const approvalPattern = [
+          "drawio-preview",
+          integratedHash(preview.diagramKey).slice(0, 12),
+          preview.id,
+          `revision-${preview.baseRevision}`,
+          preview.candidateHash.slice(0, 16),
+        ].join(":")
+        await context.ask({
+          permission: "drawio_authorize_preview",
+          patterns: [approvalPattern],
+          always: [approvalPattern],
+          metadata: {
+            file: preview.file,
+            previewId: preview.id,
+            plan: args.plan.trim(),
+            baseRevision: preview.baseRevision,
+            candidateHash: preview.candidateHash,
+            changedIds: preview.changedIds,
+            summary: preview.diff.summary,
+          },
+        })
+        await refreshIntegratedSession(session)
+        const approvalToken = randomBytes(24).toString("base64url")
+        authorizePatchPreview(session, preview, approvalToken)
+        validatePatchPreviewWrite(
+          session,
+          preview.id,
+          approvalToken,
+          preview.baseRevision,
+          preview.candidateXml,
+        )
+        const applied = await integratedCommit(
+          session,
+          preview.candidateXml,
+          preview.baseRevision,
+          "agent",
+          null,
+          { appliedPreviewId: preview.id },
+        )
+        if (applied.conflict) {
+          currentPatchPreview(session)
+          return JSON.stringify({
+            ok: false,
+            applied: false,
+            error: "revision_conflict",
+            current: integratedDocumentPayload(applied.current),
+            manualChanges: applied.manualChanges,
+          }, null, 2)
+        }
+        if (applied.invalid) {
+          throw new Error(`approved preview failed validation: ${JSON.stringify(applied.report.errors)}`)
+        }
+        return JSON.stringify({
+          ok: true,
+          applied: true,
+          file: path.relative(session.workspace, session.file).split(path.sep).join("/"),
+          revision: applied.document.revision,
+          backup: applied.document.backupFile
+            ? path.relative(session.workspace, applied.document.backupFile).split(path.sep).join("/")
+            : null,
+          validation: applied.validation,
+          preview: patchPreviewPayload(preview),
+          guidance:
+            "The approved preview was applied immediately. Do not call drawio_patch or drawio_polish again for this candidate; finalize the diagram if an updated export is required.",
         }, null, 2)
       },
     }),
@@ -8508,6 +9748,10 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           .string()
           .optional()
           .describe("Required when requesting a scope wider than the user originally selected"),
+        preview_id: tool.schema
+          .string()
+          .optional()
+          .describe("Preview id returned by the immediately preceding drawio_patch dry-run; defaults to the active preview"),
       },
       async execute(args, context) {
         const session = annotationSessionFor(context, args.file)
@@ -8531,6 +9775,29 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           throw new Error("proposed_changed_ids must contain at least one stable id")
         }
         const scope = annotationScopeContext(session, task, requestedScope)
+        const preview = args.preview_id
+          ? getIntegratedBridgeState().patchPreviews.get(args.preview_id)
+          : currentPatchPreview(session)
+        if (preview) {
+          if (preview.sessionId !== session.sessionId
+            || preview.diagramKey !== integratedDiagramKey(session.file)) {
+            throw new Error("patch preview belongs to a different session or diagram")
+          }
+          currentPatchPreview(session)
+          if (preview.status !== "pending") {
+            throw new Error(`patch preview is ${preview.status}; generate a fresh dry-run preview`)
+          }
+          const previewChangedIds = requestedScope === "diagram_wide"
+            ? new Set(preview.changedQualifiedIds)
+            : new Set(preview.changedIds)
+          const proposedForPreview = new Set(proposedChangedIds)
+          if (
+            previewChangedIds.size !== proposedForPreview.size
+            || [...previewChangedIds].some((id) => !proposedForPreview.has(id))
+          ) {
+            throw new Error("proposed_changed_ids must exactly match the stable IDs shown in the active preview")
+          }
+        }
         const diagramFile = path.relative(session.workspace, session.file).split(path.sep).join("/")
         const approvalPattern = [
           "annotation",
@@ -8555,8 +9822,11 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
             originalScopeLabel: annotationScopeLabel(task.scope),
             escalationReason,
             baseRevision: session.revision,
+            previewId: preview?.id || null,
+            candidateHash: preview?.candidateHash || null,
           },
         })
+        await refreshIntegratedSession(session)
         const now = new Date().toISOString()
         const authorization: AnnotationAuthorization = {
           token: randomBytes(24).toString("base64url"),
@@ -8569,8 +9839,10 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           baseRevision: session.revision,
           approvedAt: now,
           consumedAt: null,
+          previewId: preview?.id || null,
         }
         session.annotationAuthorizations.set(task.id, authorization)
+        if (preview) authorizePatchPreview(session, preview, authorization.token)
         task.updatedAt = now
         session.activeAnnotationId = task.id
         await persistStoredAnnotations(session)
@@ -8579,6 +9851,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           ok: true,
           annotationId: task.id,
           approvalToken: authorization.token,
+          previewId: preview?.id || null,
           baseRevision: authorization.baseRevision,
           requestedScope,
           requestedScopeLabel: annotationScopeLabel(requestedScope),

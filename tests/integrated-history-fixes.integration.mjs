@@ -101,9 +101,14 @@ async function makeSession(plugin, sessionId, file, xml) {
 async function agentCommit(plugin, ctx, openResult, file, label) {
   const diagram = await getDiagram(openResult)
   const xml = BASE_XML.replace('value="MobileWork"', `value="${label}"`)
-  const result = JSON.parse(await plugin.tool.drawio_update_state.execute({
+  const preview = JSON.parse(await plugin.tool.drawio_preview_state.execute({
     base_revision: diagram.revision,
     xml,
+  }, ctx))
+  const result = JSON.parse(await plugin.tool.drawio_authorize_preview.execute({
+    file,
+    preview_id: preview.preview.id,
+    plan: `history fix checkpoint ${label}`,
   }, ctx))
   assert.equal(result.ok, true)
   return result

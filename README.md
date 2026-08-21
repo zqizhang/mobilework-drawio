@@ -18,6 +18,7 @@
 - 通过自托管的 `jgraph/drawio` + `jgraph/export-server` 导出 PNG、JPEG、PDF 和可编辑 PNG；通过内置浏览器编辑器导出 SVG、可编辑 SVG 和 HTML。
 - 创建或修改结束后自动导出同名 PNG，并在 MobileWork / OpenWork 内置浏览器中打开。
 - 用户在浏览器保存后，将最新 XML 和 revision 作为 Agent 下一次修改的基线。
+- 已绑定图表的增量修改和自动布局会先在同一 Draw.io 画布加载临时只读差异预览：绿色标识新增、黄色标识修改、红色标识删除或移动前位置、蓝色标识变更连线；退出预览不会写入源文件，正式提交必须匹配预览候选哈希与基线 revision。
 - 用户可对选区提交按图表文件持久化的注释，并选择“只修改选区”“允许调整关联连线”“允许调整周边布局”或“允许修改整个图表”；全图范围会额外确认，Agent正式写入前仍必须通过OpenCode审批弹窗取得当前session的一次性授权。
 - 通过 revision 冲突检查避免旧快照覆盖最新内容；人工编辑本身仍可按当前任务要求继续调整。
 - 检查节点重叠、边穿节点、边交叉、嵌套容器坐标、边标签碰撞、空标签和缺少跳线等质量问题。
@@ -223,6 +224,29 @@ Copy-Item `
 
 revision 协议防止的是旧版本误覆盖，不会把用户手动编辑的图元变成只读内容。
 Agent 或外部写入产生新 revision 时，浏览器会提示但不会强制刷新当前画布，避免覆盖尚未触发 autosave 的人工编辑；已有编辑器连接时，Agent 也不得通过重复打开 URL 刷新页面。浏览器随后保存旧 revision 时会按页面、稳定图元 ID 和图元字段做三方合并：不同图元或同一图元的不同字段自动合并；同一字段修改冲突时，弹窗逐字段对比“我的未保存版本”和“AI 已保存版本”。无论选择哪一方，双方所有非冲突修改都会保留。保存请求期间若用户继续输入，合并响应不会强制刷新这部分新编辑。Agent 工具写入仍保持显式的 `revision_conflict` 读取、合并、重试流程。
+
+## 修改前画布差异预览
+
+对已通过 `drawio_open` 或 `drawio_finalize` 绑定的文件，`drawio_patch(dry_run=true)`、
+`drawio_polish(dry_run=true)` 和 `drawio_preview_state(base_revision, xml)` 会生成临时候选版本并推送到同一个 Draw.io 画布。常见字体、填充色、文字色、边框色、透明度等修改可通过
+`drawio_patch.operations[].style_updates` 表达；页面背景或其它高级样式使用完整 XML 预览。预览 XML
+只保存在运行时内存中，正式 `.drawio` 文件不会包含 `__ai_preview_*` 图层或高亮样式。
+
+- 绿色：新增节点或连线；
+- 黄色：修改后的节点；
+- 红色：删除图元或节点移动前的位置；
+- 蓝色：发生变化的连线。
+
+预览栏可在“修改前”和“修改后”之间切换，并列出字体大小、字体颜色、填充色、线条颜色、几何尺寸和
+页面背景等属性的前后值；颜色属性同时显示色块。连线高亮使用独立叠加连线，不会覆盖候选版本真正的线条颜色。
+
+普通修改通过 `drawio_authorize_preview` 请求 OpenCode 写前审批；用户点击允许后，该工具会在同一次
+调用中校验 preview ID、候选 XML 哈希和 `base_revision`，并立即提交画布中看到的候选版本，不需要
+用户再发一条“同意执行”，Agent 也不得重复调用正式 `drawio_patch`/`drawio_polish`。完整 XML 的正式写入
+必须来自 `drawio_preview_state` 生成并批准的精确候选，不能直接调用 `drawio_update_state` 绕过预览。注释任务继续使用
+`drawio_authorize_annotation_change`，并可绑定当前预览。用户退出预览、预览超过 30 分钟或图表
+revision 发生变化后，预览都会失效，必须重新 dry-run。预览状态下编辑器会停用保存和导出，Bridge
+也会拒绝任何含预览专用图元的 XML，避免临时标记污染源文件。
 
 ## 质量检查
 

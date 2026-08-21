@@ -98,6 +98,17 @@ try {
     file: "architecture.drawio",
   }, context))
   assert.equal(openResult.ok, true)
+  const applyAgentXml = async (xml, baseRevision) => {
+    const preview = JSON.parse(await plugin.tool.drawio_preview_state.execute({
+      base_revision: baseRevision,
+      xml,
+    }, context))
+    return JSON.parse(await plugin.tool.drawio_authorize_preview.execute({
+      file: "architecture.drawio",
+      preview_id: preview.preview.id,
+      plan: "history integration agent checkpoint",
+    }, context))
+  }
 
   // ---- P0-H: initial bind creates the v1 initial snapshot ----
   let history = await getHistory(openResult)
@@ -133,10 +144,7 @@ try {
 
   // ---- agent commits create an immediate checkpoint ----
   const agentXml = BASE_XML.replace('value="MobileWork"', 'value="Agent Step"')
-  const agentResult = JSON.parse(await plugin.tool.drawio_update_state.execute({
-    base_revision: history.currentRevision,
-    xml: agentXml,
-  }, context))
+  const agentResult = await applyAgentXml(agentXml, history.currentRevision)
   assert.equal(agentResult.ok, true)
   history = await getHistory(openResult)
   assert.equal(history.entries.filter((entry) => entry.source === "agent").length, 1)
@@ -163,10 +171,7 @@ try {
   for (let i = 0; i < 25; i += 1) {
     const state = await getDiagram(openResult)
     const stepXml = BASE_XML.replace('value="MobileWork"', `value="Step ${i}"`)
-    const result = JSON.parse(await plugin.tool.drawio_update_state.execute({
-      base_revision: state.revision,
-      xml: stepXml,
-    }, context))
+    const result = await applyAgentXml(stepXml, state.revision)
     assert.equal(result.ok, true)
   }
   history = await getHistory(openResult)
