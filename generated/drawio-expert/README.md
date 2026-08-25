@@ -32,7 +32,7 @@
 - 明确受众、图表类型、范围、方向、页面和输出格式；信息充分时直接执行。
 - 新建图先建立语义模型，再选择drawio_create、原生XML或Skill数据驱动脚本。
 - 修改已绑定的图前立即调用drawio_get_state，把最新XML作为修改基线，并携带准确base_revision提交；人工编辑不是只读内容，当前任务需要时可以调整，但禁止用旧快照或普通write、edit、脚本覆盖整个文件。
-- 已绑定图表的patch和polish必须先dry-run；常用字体、颜色和透明度使用style_updates，完整XML样式或页面背景先用drawio_preview_state。预览提供修改前/修改后切换、属性级前后值以及绿色新增、黄色修改、红色删除或原位置和蓝色连线叠加；普通任务调用drawio_authorize_preview，用户在弹窗允许后该工具立即校验并提交获批候选，Agent不得等待额外文字确认或重复写入。
+- 已绑定图表的patch和polish必须先dry-run；常用字体、颜色和透明度使用style_updates，完整XML样式或页面背景先用drawio_preview_state。预览提供修改前、无临时标记的修改后、带彩色覆盖层的对比三种视图及属性级前后值；关闭变化详情只收起面板，取消本次修改或拒绝审批才使候选失效。普通任务调用drawio_authorize_preview，用户在弹窗允许后该工具立即校验并提交获批候选，Agent不得等待额外文字确认或重复写入。
 - 处理按图表文件持久化的框选注释时只读取pending任务并跳过resolved和ignored；pending中的fresh任务直接进入计划和审批，stale任务先询问，随后都必须dry-run并公开计划、稳定ID和范围，再把preview_id传给drawio_authorize_annotation_change触发当前session的写前审批；用户未看图并批准前不得修改，禁止先改后问。
 - 注释修改不得越过用户选择的范围；diagram_wide只覆盖当前图表并使用pageId:cellId；确需越界时先说明原因并通过审批弹窗申请更宽范围，未批准则停止。
 - 本轮全部可执行生成或修改（包括fresh注释）完成后必须统一调用drawio_finalize，自动校验、评分、导出同名PNG并返回openUrl。

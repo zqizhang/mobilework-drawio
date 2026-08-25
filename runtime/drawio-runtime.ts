@@ -3151,8 +3151,7 @@ type PatchPreview = {
   candidateXml: string
   candidateHash: string
   beforePreviewXml: string
-  afterPreviewXml: string
-  previewXml: string
+  comparePreviewXml: string
   changedIds: string[]
   changedQualifiedIds: string[]
   affectedPageIds: string[]
@@ -4352,9 +4351,12 @@ function patchPreviewPayload(preview: PatchPreview, includeXml = false) {
     createdAt: preview.createdAt,
     expiresAt: new Date(preview.expiresAt).toISOString(),
     ...(includeXml ? {
-      xml: preview.afterPreviewXml,
+      // xml remains the default compare view for older wrapper pages.
+      xml: preview.comparePreviewXml,
       beforePreviewXml: preview.beforePreviewXml,
-      afterPreviewXml: preview.afterPreviewXml,
+      afterPreviewXml: preview.candidateXml,
+      candidateXml: preview.candidateXml,
+      comparePreviewXml: preview.comparePreviewXml,
     } : {}),
   }
 }
@@ -4416,6 +4418,11 @@ function cancelPatchPreview(session: IntegratedSession, preview: PatchPreview, r
   preview.statusReason = reason
   preview.approvalToken = null
   preview.terminalAt = Date.now()
+  for (const [annotationId, authorization] of session.annotationAuthorizations) {
+    if (authorization.previewId === preview.id && !authorization.consumedAt) {
+      session.annotationAuthorizations.delete(annotationId)
+    }
+  }
   if (session.activePreviewId === preview.id) session.activePreviewId = null
   broadcastPatchPreview(preview, "cancelled")
 }
@@ -4449,7 +4456,7 @@ function createPatchPreview(
     ...diff.changed.map((entry) => entry.pageId),
     ...diff.pageChanges.map((entry) => entry.pageId),
   ])].filter(Boolean)
-  const afterPreviewXml = decoratePatchPreviewXml(beforeXml, candidateXml, diff, id)
+  const comparePreviewXml = decoratePatchPreviewXml(beforeXml, candidateXml, diff, id)
   const preview: PatchPreview = {
     id,
     sessionId: session.sessionId,
@@ -4461,8 +4468,7 @@ function createPatchPreview(
     candidateXml,
     candidateHash: integratedHash(candidateXml),
     beforePreviewXml: beforeXml,
-    afterPreviewXml,
-    previewXml: afterPreviewXml,
+    comparePreviewXml,
     changedIds: [...new Set(changedIds.length > 0
       ? changedIds
       : [
@@ -5440,11 +5446,21 @@ return `<!doctype html>
     #patch-preview-bar button { border: 1px solid #d97706; border-radius: 6px; background: #fff;
       color: #92400e; padding: 4px 9px; cursor: pointer; }
     #patch-preview-bar button.active { background: #d97706; color: #fff; }
+    #patch-preview-bar button.danger { border-color: #dc2626; color: #b91c1c; }
+    #patch-preview-bar button.danger:hover { background: #fef2f2; }
+    #patch-preview-bar button:disabled { opacity: .5; cursor: not-allowed; }
     #patch-preview-details { position: fixed; z-index: 10; display: none; top: 64px; right: 14px;
-      width: min(390px, calc(100vw - 28px)); max-height: 54vh; overflow: auto; padding: 11px 12px;
+      width: min(390px, calc(100vw - 28px)); max-height: 54vh; overflow: hidden;
       border: 1px solid #d97706; border-radius: 10px; background: rgba(255,255,255,.97);
       color: #334155; box-shadow: 0 4px 16px rgba(15,23,42,.16); font-size: 12px; }
     #patch-preview-details.visible { display: block; }
+    #patch-preview-details .details-head { position: sticky; top: 0; display: flex; align-items: center;
+      gap: 8px; padding: 9px 11px; border-bottom: 1px solid #e2e8f0; background: inherit; }
+    #patch-preview-details .details-head strong { flex: 1; }
+    #patch-preview-details .details-head button { width: 30px; height: 30px; border: 0;
+      border-radius: 6px; background: transparent; color: #64748b; cursor: pointer; font-size: 18px; }
+    #patch-preview-details .details-head button:hover { background: #f1f5f9; color: #0f172a; }
+    #patch-preview-details-body { max-height: calc(54vh - 49px); overflow: auto; padding: 2px 12px 11px; }
     #patch-preview-details .change { padding: 7px 0; border-bottom: 1px solid #e2e8f0; }
     #patch-preview-details .change:last-child { border-bottom: 0; }
     #patch-preview-details .property { display: grid; grid-template-columns: 94px 1fr 18px 1fr;
@@ -5704,12 +5720,23 @@ return `<!doctype html>
       <span><i class="swatch" style="background:#ef4444"></i>删除/原位置</span>
       <span><i class="swatch" style="background:#3b82f6"></i>连线</span>
     </span>
-    <button type="button" id="patch-preview-before">修改前</button>
-    <button type="button" id="patch-preview-after" class="active">修改后</button>
+    <div role="group" aria-label="预览显示方式">
+      <button type="button" id="patch-preview-before" aria-pressed="false">修改前</button>
+      <button type="button" id="patch-preview-after" aria-pressed="false">修改后</button>
+      <button type="button" id="patch-preview-compare" class="active" aria-pressed="true">对比</button>
+    </div>
+    <button type="button" id="patch-preview-details-toggle" aria-expanded="true"
+      aria-controls="patch-preview-details">变化详情 <span id="patch-preview-details-count">0</span></button>
     <span id="patch-preview-guidance">只读预览，不会写入源文件</span>
-    <button type="button" id="patch-preview-exit">退出预览</button>
+    <button type="button" id="patch-preview-cancel" class="danger">取消本次修改</button>
   </div>
-  <div id="patch-preview-details" aria-live="polite"></div>
+  <aside id="patch-preview-details" aria-live="polite" aria-label="修改变化详情">
+    <div class="details-head">
+      <strong>变化详情</strong>
+      <button type="button" id="patch-preview-details-close" aria-label="关闭变化详情">×</button>
+    </div>
+    <div id="patch-preview-details-body"></div>
+  </aside>
   <div id="conflict-banner" role="alert">
     <span id="conflict-message">图表刚发生变化，当前画布暂未保存，请确认最新版本。</span>
     <button type="button" id="conflict-retry" style="display:none">重试加载</button>
@@ -5858,6 +5885,8 @@ return `<!doctype html>
       let activePatchPreview = null;
       let previewTargetXml = null;
       let previewExitXml = null;
+      let patchPreviewView = "compare";
+      let patchPreviewDetailsExpanded = true;
 
       const historyBtn = document.getElementById("history-btn");
       const annBtn = document.getElementById("ann-btn");
@@ -5885,7 +5914,11 @@ return `<!doctype html>
       const patchPreviewGuidance = document.getElementById("patch-preview-guidance");
       const patchPreviewBefore = document.getElementById("patch-preview-before");
       const patchPreviewAfter = document.getElementById("patch-preview-after");
+      const patchPreviewCompare = document.getElementById("patch-preview-compare");
+      const patchPreviewDetailsToggle = document.getElementById("patch-preview-details-toggle");
+      const patchPreviewDetailsCount = document.getElementById("patch-preview-details-count");
       const patchPreviewDetails = document.getElementById("patch-preview-details");
+      const patchPreviewDetailsBody = document.getElementById("patch-preview-details-body");
 
       function selectedAnnotationScope() {
         return document.querySelector('input[name="ann-scope"]:checked')?.value || "selection_only";
@@ -6063,8 +6096,19 @@ return `<!doctype html>
       }
 
       function renderPatchPreviewDetails(preview) {
-        patchPreviewDetails.replaceChildren();
+        patchPreviewDetailsBody.replaceChildren();
         const diff = preview?.diff || {};
+        for (const [kind, entries] of [["新增", diff.added || []], ["删除", diff.removed || []]]) {
+          for (const change of entries) {
+            const section = document.createElement("div");
+            section.className = "change";
+            const title = document.createElement("strong");
+            title.textContent = kind + (change.cell?.edge ? "连线 " : "图元 ")
+              + (change.cell?.id || change.key || "");
+            section.appendChild(title);
+            patchPreviewDetailsBody.appendChild(section);
+          }
+        }
         for (const change of diff.changed || []) {
           const section = document.createElement("div");
           section.className = "change";
@@ -6081,7 +6125,7 @@ return `<!doctype html>
           for (const geometry of change.geometryChanges || []) {
             appendPatchPreviewProperty(section, geometry.property, geometry.before, geometry.after);
           }
-          patchPreviewDetails.appendChild(section);
+          patchPreviewDetailsBody.appendChild(section);
         }
         for (const change of diff.pageChanges || []) {
           const section = document.createElement("div");
@@ -6090,27 +6134,43 @@ return `<!doctype html>
           title.textContent = "页面 " + (change.pageName || change.pageId);
           section.appendChild(title);
           appendPatchPreviewProperty(section, change.property, change.before, change.after);
-          patchPreviewDetails.appendChild(section);
+          patchPreviewDetailsBody.appendChild(section);
         }
-        patchPreviewDetails.classList.toggle("visible", patchPreviewDetails.childElementCount > 0);
+        const count = patchPreviewDetailsBody.childElementCount;
+        patchPreviewDetailsCount.textContent = String(count);
+        patchPreviewDetailsToggle.disabled = count === 0;
+        setPatchPreviewDetailsExpanded(count > 0 && patchPreviewDetailsExpanded);
+      }
+
+      function setPatchPreviewDetailsExpanded(expanded) {
+        patchPreviewDetailsExpanded = expanded;
+        patchPreviewDetails.classList.toggle("visible", expanded);
+        patchPreviewDetailsToggle.setAttribute("aria-expanded", String(expanded));
       }
 
       function updatePatchPreviewViewButtons(view) {
         patchPreviewBefore.classList.toggle("active", view === "before");
         patchPreviewAfter.classList.toggle("active", view === "after");
+        patchPreviewCompare.classList.toggle("active", view === "compare");
+        patchPreviewBefore.setAttribute("aria-pressed", String(view === "before"));
+        patchPreviewAfter.setAttribute("aria-pressed", String(view === "after"));
+        patchPreviewCompare.setAttribute("aria-pressed", String(view === "compare"));
       }
 
       function setPatchPreviewView(view) {
         if (!activePatchPreview || !editorReady) return;
         const xml = view === "before"
           ? activePatchPreview.beforePreviewXml
-          : activePatchPreview.afterPreviewXml || activePatchPreview.xml;
+          : view === "after"
+            ? activePatchPreview.candidateXml || activePatchPreview.afterPreviewXml
+            : activePatchPreview.comparePreviewXml || activePatchPreview.xml;
         if (typeof xml !== "string" || !xml) return;
+        patchPreviewView = view;
         previewTargetXml = xml;
         editorMode = "preview-loading";
         updatePatchPreviewViewButtons(view);
         sendEditor({ action: "load", xml, autosave: 0, diffSync: false,
-          title: CONFIG.file + (view === "before" ? " · 修改前" : " · Agent 修改后") });
+          title: CONFIG.file + ({ before: " · 修改前", after: " · 修改后", compare: " · 修改对比" }[view]) });
       }
 
       async function showPatchPreview(preview) {
@@ -6140,10 +6200,12 @@ return `<!doctype html>
         current = latest;
         canvasRevision = latest.revision;
         activePatchPreview = preview;
-        previewTargetXml = preview.xml;
+        patchPreviewView = "compare";
+        patchPreviewDetailsExpanded = true;
+        previewTargetXml = preview.comparePreviewXml || preview.xml;
         previewExitXml = null;
         editorMode = "preview-loading";
-        updatePatchPreviewViewButtons("after");
+        updatePatchPreviewViewButtons("compare");
         renderPatchPreviewDetails(preview);
         closeDrawer();
         closeHistory();
@@ -6157,8 +6219,8 @@ return `<!doctype html>
           ? "已批准，正在提交精确候选"
           : "请核对画布后在 OpenCode 审批弹窗中确认";
         patchPreviewBar.classList.add("visible");
-        sendEditor({ action: "load", xml: preview.xml, autosave: 0, diffSync: false,
-          title: CONFIG.file + " · Agent 修改预览" });
+        sendEditor({ action: "load", xml: previewTargetXml, autosave: 0, diffSync: false,
+          title: CONFIG.file + " · Agent 修改对比" });
       }
 
       async function leavePatchPreview(reloadLatest = true) {
@@ -6169,6 +6231,7 @@ return `<!doctype html>
           editorMode = "editing";
           patchPreviewBar.classList.remove("visible");
           patchPreviewDetails.classList.remove("visible");
+          patchPreviewDetailsToggle.setAttribute("aria-expanded", "false");
           setPatchPreviewControlsDisabled(false);
           return;
         }
@@ -6197,6 +6260,7 @@ return `<!doctype html>
           editorMode = "editing";
           patchPreviewBar.classList.remove("visible");
           patchPreviewDetails.classList.remove("visible");
+          patchPreviewDetailsToggle.setAttribute("aria-expanded", "false");
           setPatchPreviewControlsDisabled(false);
           showStatus("已返回正式图表", 1800);
           return true;
@@ -6218,13 +6282,17 @@ return `<!doctype html>
 
       async function cancelVisiblePatchPreview() {
         if (!activePatchPreview) return;
+        const confirmed = window.confirm(
+          "取消本次修改？\\n\\n取消后，本次候选及关联审批将失效，源 Draw.io 文件不会发生变化。",
+        );
+        if (!confirmed) return;
         const cancelUrl = new URL(CONFIG.patchPreviewUrl);
         cancelUrl.pathname = cancelUrl.pathname.endsWith("/")
           ? cancelUrl.pathname + encodeURIComponent(activePatchPreview.id)
           : cancelUrl.pathname + "/" + encodeURIComponent(activePatchPreview.id);
         const response = await fetch(cancelUrl.toString(), { method: "DELETE" });
         const result = await response.json();
-        if (!response.ok) throw new Error(result.error || "取消预览失败");
+        if (!response.ok) throw new Error(result.error || "取消候选失败");
         await leavePatchPreview(true);
       }
 
@@ -7118,11 +7186,26 @@ return `<!doctype html>
         const nextStatus = target.getAttribute("data-status");
         if (id && nextStatus) void updateAnnotationStatus(id, nextStatus, target);
       });
-      document.getElementById("patch-preview-exit").addEventListener("click", () => {
-        void cancelVisiblePatchPreview().catch(error => showStatus(error.message || "取消预览失败", 5000));
+      document.getElementById("patch-preview-cancel").addEventListener("click", () => {
+        void cancelVisiblePatchPreview().catch(error => showStatus(error.message || "取消候选失败", 5000));
       });
       patchPreviewBefore.addEventListener("click", () => setPatchPreviewView("before"));
       patchPreviewAfter.addEventListener("click", () => setPatchPreviewView("after"));
+      patchPreviewCompare.addEventListener("click", () => setPatchPreviewView("compare"));
+      patchPreviewDetailsToggle.addEventListener("click", () => {
+        if (!patchPreviewDetailsToggle.disabled) {
+          setPatchPreviewDetailsExpanded(!patchPreviewDetailsExpanded);
+        }
+      });
+      document.getElementById("patch-preview-details-close").addEventListener("click", () => {
+        setPatchPreviewDetailsExpanded(false);
+      });
+      document.addEventListener("keydown", event => {
+        if (event.key === "Escape" && patchPreviewDetailsExpanded
+          && (editorMode === "preview-loading" || editorMode === "previewing")) {
+          setPatchPreviewDetailsExpanded(false);
+        }
+      });
 
       historyBtn.addEventListener("click", () => void openHistory());
       document.getElementById("hist-close").addEventListener("click", closeHistory);
@@ -7364,7 +7447,7 @@ async function handleIntegratedBridgeRequest(
       body.source === "editor"
       && activePreview
       && (integratedHash(xml) === activePreview.candidateHash
-        || integratedHash(xml) === integratedHash(activePreview.afterPreviewXml))
+        || integratedHash(xml) === integratedHash(activePreview.comparePreviewXml))
     ) {
       integratedJsonResponse(response, 409, {
         ok: false,
@@ -7449,7 +7532,7 @@ async function handleIntegratedBridgeRequest(
       integratedJsonResponse(response, 404, { ok: false, error: "patch preview not found" })
       return
     }
-    cancelPatchPreview(session, preview, "用户退出了修改预览")
+    cancelPatchPreview(session, preview, "用户取消了本次候选修改")
     integratedJsonResponse(response, 200, { ok: true, preview: patchPreviewPayload(preview) })
     return
   }
@@ -8137,7 +8220,7 @@ const DRAWIO_RUNTIME_GUIDANCE = `## Draw.io 文件写入与交付
 每次修改前必须立即调用 drawio_get_state，并把返回的最新 XML 作为修改基线。人工编辑不是只读内容，可以按当前任务要求继续调整。
 提交时必须携带该次读取返回的准确 base_revision；revision_conflict 后重新读取，在新 XML 上重新执行所需变更并重试，禁止重发旧 XML。
 禁止用普通 write、edit 或脚本直接覆盖已绑定的 .drawio 文件，因为这会绕过 revision 检查并可能用旧快照丢失最新内容。
-对已绑定文件执行 drawio_patch 或 drawio_polish 时，先以 dry_run=true 生成同画布修改预览；字体、填充色、文字色、边框色等常用属性使用 drawio_patch.style_updates。只有完整 XML 才能表达的页面背景或高级样式先调用 drawio_preview_state，禁止直接调用 drawio_update_state 绕过预览。预览提供修改前/修改后切换和属性级前后值；绿色表示新增、黄色表示修改、红色表示删除或原位置、蓝色表示变更连线。普通修改调用 drawio_authorize_preview；用户在审批弹窗点击允许后，该工具会立即校验并提交画布中展示的精确候选，Agent 不得等待用户再发文字确认，也不得重复调用正式 patch/polish。注释修改继续调用 drawio_authorize_annotation_change，并把 dry-run 返回的 preview_id 与精确稳定 ID 清单一起纳入范围审批。
+对已绑定文件执行 drawio_patch 或 drawio_polish 时，先以 dry_run=true 生成同画布修改预览；字体、填充色、文字色、边框色等常用属性使用 drawio_patch.style_updates。只有完整 XML 才能表达的页面背景或高级样式先调用 drawio_preview_state，禁止直接调用 drawio_update_state 绕过预览。预览提供“修改前”（原始基线）、“修改后”（无临时标记的精确候选）和“对比”（候选加彩色覆盖层，默认）三种视图及属性级前后值；绿色表示新增、黄色表示修改、红色表示删除或原位置、蓝色表示变更连线。关闭变化详情只收起面板，不影响候选；“取消本次修改”、拒绝或关闭审批才会使候选失效。普通修改调用 drawio_authorize_preview；用户在审批弹窗点击允许后，该工具会立即校验并提交画布中展示的精确候选，Agent 不得等待用户再发文字确认，也不得重复调用正式 patch/polish。注释修改继续调用 drawio_authorize_annotation_change，并把 dry-run 返回的 preview_id 与精确稳定 ID 清单一起纳入范围审批。
 本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。调用前必须先调用 drawio_list_annotations(status='pending') 探测未完成注释；存在 requiresConfirmation=false 的注释时 drawio_finalize 会拒绝执行，必须先逐条处理并 drawio_resolve_annotation 后再重试，不得跳过。只有返回 shouldOpenBrowser=true 时才将 openUrl 交给 MobileWork 现有 browser.open_url 打开；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
 drawio_export 支持 PNG、JPEG、PDF、xmlpng、SVG、xmlsvg 和 html2。SVG、xmlsvg、html2 由内置浏览器编辑器渲染并通过 Bridge 写回工作区；返回 editor_required 时必须立即调用 browser.open_url 自动打开其 openUrl，等待编辑器连接后用完全相同的参数重试，禁止把该状态解释为不支持格式或要求用户手工导出。PNG、JPEG、xmlpng、SVG、xmlsvg 使用 all_pages=true 时逐页生成文件并返回 outputs[]，必须核对 page_count 与 outputs 数量一致；PDF 和 html2 的 all_pages=true 各返回一个包含全部页面的多页单文件，html2 还需核对 contains_all_pages=true。
 
@@ -9346,20 +9429,25 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           `revision-${preview.baseRevision}`,
           preview.candidateHash.slice(0, 16),
         ].join(":")
-        await context.ask({
-          permission: "drawio_authorize_preview",
-          patterns: [approvalPattern],
-          always: [approvalPattern],
-          metadata: {
-            file: preview.file,
-            previewId: preview.id,
-            plan: args.plan.trim(),
-            baseRevision: preview.baseRevision,
-            candidateHash: preview.candidateHash,
-            changedIds: preview.changedIds,
-            summary: preview.diff.summary,
-          },
-        })
+        try {
+          await context.ask({
+            permission: "drawio_authorize_preview",
+            patterns: [approvalPattern],
+            always: [approvalPattern],
+            metadata: {
+              file: preview.file,
+              previewId: preview.id,
+              plan: args.plan.trim(),
+              baseRevision: preview.baseRevision,
+              candidateHash: preview.candidateHash,
+              changedIds: preview.changedIds,
+              summary: preview.diff.summary,
+            },
+          })
+        } catch (error) {
+          cancelPatchPreview(session, preview, "用户拒绝或关闭了修改审批")
+          throw error
+        }
         await refreshIntegratedSession(session)
         const approvalToken = randomBytes(24).toString("base64url")
         authorizePatchPreview(session, preview, approvalToken)
@@ -9487,25 +9575,30 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           requestedScope,
           proposedChangedIds.toSorted().join(","),
         ].join(":")
-        await context.ask({
-          permission: "drawio_authorize_annotation_change",
-          patterns: [approvalPattern],
-          always: [approvalPattern],
-          metadata: {
-            annotationId: task.id,
-            file: diagramFile,
-            plan: args.plan.trim(),
-            proposedChangedIds,
-            requestedScope,
-            requestedScopeLabel: annotationScopeLabel(requestedScope),
-            originalScope: task.scope,
-            originalScopeLabel: annotationScopeLabel(task.scope),
-            escalationReason,
-            baseRevision: session.revision,
-            previewId: preview?.id || null,
-            candidateHash: preview?.candidateHash || null,
-          },
-        })
+        try {
+          await context.ask({
+            permission: "drawio_authorize_annotation_change",
+            patterns: [approvalPattern],
+            always: [approvalPattern],
+            metadata: {
+              annotationId: task.id,
+              file: diagramFile,
+              plan: args.plan.trim(),
+              proposedChangedIds,
+              requestedScope,
+              requestedScopeLabel: annotationScopeLabel(requestedScope),
+              originalScope: task.scope,
+              originalScopeLabel: annotationScopeLabel(task.scope),
+              escalationReason,
+              baseRevision: session.revision,
+              previewId: preview?.id || null,
+              candidateHash: preview?.candidateHash || null,
+            },
+          })
+        } catch (error) {
+          if (preview) cancelPatchPreview(session, preview, "用户拒绝或关闭了注释修改审批")
+          throw error
+        }
         await refreshIntegratedSession(session)
         const now = new Date().toISOString()
         const authorization: AnnotationAuthorization = {

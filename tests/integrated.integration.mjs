@@ -255,10 +255,18 @@ try {
   assert.match(editorPage, /允许修改整个图表/)
   assert.match(editorPage, /所有页面、节点、连线和布局/)
   assert.match(editorPage, /Agent 修改预览/)
-  assert.match(editorPage, /id="patch-preview-exit"/)
   assert.match(editorPage, /id="patch-preview-before"/)
   assert.match(editorPage, /id="patch-preview-after"/)
+  assert.match(editorPage, /id="patch-preview-compare"/)
+  assert.match(editorPage, /id="patch-preview-details-toggle"/)
+  assert.match(editorPage, /id="patch-preview-details-close"/)
+  assert.match(editorPage, /id="patch-preview-cancel"/)
+  assert.match(editorPage, /取消本次修改/)
+  assert.doesNotMatch(editorPage, /id="patch-preview-exit"/)
   assert.match(editorPage, /id="patch-preview-details"/)
+  assert.match(editorPage, /setPatchPreviewDetailsExpanded\(!patchPreviewDetailsExpanded\)/)
+  assert.match(editorPage, /view === "after"[\s\S]*activePatchPreview\.candidateXml/)
+  assert.match(editorPage, /view === "compare"[\s\S]*activePatchPreview\.comparePreviewXml/)
   assert.match(editorPage, /const cancelUrl = new URL\(CONFIG\.patchPreviewUrl\)/)
   assert.doesNotMatch(editorPage, /CONFIG\.patchPreviewUrl \+ "\/"/)
   assert.match(editorPage, /id="history-btn"/, "editor page must include the history entry")
@@ -770,8 +778,29 @@ try {
   const cancelledPreview = await fetch(cancelPreviewUrl, { method: "DELETE" }).then((response) => response.json())
   assert.equal(cancelledPreview.preview.status, "cancelled")
   assert.match(await nextMatchingSseFrame(nextPreviewEvent, /"kind":"cancelled"/), /^event: preview/)
-  await previewEventsReader.cancel()
   assert.doesNotMatch(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /Cancelled Candidate/)
+  assert.equal(JSON.parse(await plugin.tool.drawio_get_state.execute({}, context)).revision,
+    generalPreviewAuthorization.revision)
+
+  const rejectedPreviewDryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    operations: [{ type: "update-node", id: "neighbor", label: "Rejected Candidate" }],
+    dry_run: true,
+    base_revision: generalPreviewAuthorization.revision,
+  }, context))
+  assert.match(await nextMatchingSseFrame(nextPreviewEvent, /"kind":"created"/), /^event: preview/)
+  await assert.rejects(
+    plugin.tool.drawio_authorize_preview.execute({
+      file: "architecture.drawio",
+      preview_id: rejectedPreviewDryRun.preview.id,
+      plan: "拒绝这个候选",
+    }, { ...context, async ask() { throw new Error("permission denied") } }),
+    /permission denied/,
+  )
+  assert.match(await nextMatchingSseFrame(nextPreviewEvent, /"kind":"cancelled"/), /^event: preview/)
+  assert.equal((await fetch(previewUrl).then((response) => response.json())).preview, null)
+  assert.doesNotMatch(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /Rejected Candidate/)
+  await previewEventsReader.cancel()
 
   const styleState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
   const styleDryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
@@ -815,7 +844,11 @@ try {
   const styleVisiblePreview = await fetch(previewUrl).then((response) => response.json())
   assert.equal(typeof styleVisiblePreview.preview.beforePreviewXml, "string")
   assert.equal(typeof styleVisiblePreview.preview.afterPreviewXml, "string")
-  const candidateEdgeTag = styleVisiblePreview.preview.afterPreviewXml
+  assert.equal(styleVisiblePreview.preview.afterPreviewXml, styleVisiblePreview.preview.candidateXml)
+  assert.equal(typeof styleVisiblePreview.preview.comparePreviewXml, "string")
+  assert.doesNotMatch(styleVisiblePreview.preview.candidateXml, /__ai_preview_/)
+  assert.match(styleVisiblePreview.preview.comparePreviewXml, /__ai_preview_/)
+  const candidateEdgeTag = styleVisiblePreview.preview.candidateXml
     .match(/<mxCell[^>]*id="preview-edge"[^>]*>/)?.[0]
   assert.match(candidateEdgeTag, /strokeColor=#7c3aed/)
   assert.doesNotMatch(candidateEdgeTag, /strokeColor=#22c55e/)
@@ -834,7 +867,9 @@ try {
   assert.deepEqual(fullXmlPreview.affectedPageIds, ["p1"])
   const fullXmlVisiblePreview = await fetch(previewUrl).then((response) => response.json())
   assert.doesNotMatch(fullXmlVisiblePreview.preview.beforePreviewXml, /background="#ddeeff"/)
-  assert.match(fullXmlVisiblePreview.preview.afterPreviewXml, /background="#ddeeff"/)
+  assert.match(fullXmlVisiblePreview.preview.candidateXml, /background="#ddeeff"/)
+  assert.doesNotMatch(fullXmlVisiblePreview.preview.candidateXml, /__ai_preview_/)
+  assert.match(fullXmlVisiblePreview.preview.comparePreviewXml, /__ai_preview_/)
   const undecoratedPreviewSave = await fetch(apiUrl, {
     method: "PUT",
     headers: { "content-type": "application/json" },

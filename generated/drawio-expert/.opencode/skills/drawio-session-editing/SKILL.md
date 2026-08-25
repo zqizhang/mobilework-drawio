@@ -35,7 +35,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 - `drawio_get_state(since_revision=...)`：返回最新XML、revision及可选的稳定ID变化。
 - `drawio_preview_state(base_revision=..., xml=..., annotation_id?)`：为完整XML候选生成只读同画布预览，不写文件、不增加revision；返回属性级样式差异、页面背景差异、完整稳定ID和候选哈希。
 - `drawio_update_state(base_revision=..., xml=..., preview_id=..., ...)`：只提交已经预览并获批、哈希完全一致的完整XML候选；不能跳过`drawio_preview_state`。
-- `drawio_patch(dry_run=true)` / `drawio_polish(dry_run=true)`：除返回结构化diff外，还会把临时预览XML推送到同一画布；预览栏可切换修改前/修改后并查看属性前后值。绿色为新增、黄色为修改、红色为删除或原位置、蓝色为变更连线。预览不写入源文件，连线高亮也不会覆盖候选线条颜色。
+- `drawio_patch(dry_run=true)` / `drawio_polish(dry_run=true)`：除返回结构化diff外，还会把临时预览XML推送到同一画布；预览栏可切换“修改前”（原始基线）、“修改后”（无临时标记的精确候选）和“对比”（候选加彩色覆盖层，默认）并查看属性前后值。绿色为新增、黄色为修改、红色为删除或原位置、蓝色为变更连线。关闭变化详情只收起面板，不改变候选；“取消本次修改”、拒绝或关闭审批才会使候选失效，且不会修改源文件或解决注释任务。连线高亮也不会覆盖候选线条颜色。
 - `drawio_authorize_preview(preview_id, plan)`：无活动注释的普通修改在看图后调用；OpenCode弹窗允许后，运行时在同一次工具调用中校验候选哈希和revision并立即写入，返回`applied=true`与新revision。无需也不得要求用户再发文字确认。
 - 这些工具根据运行时上下文识别session，不需要用户手动传入session ID。
 - 浏览器保存发生409时，运行时会以稳定页面/图元ID进行保守三方合并；不重叠修改自动合并并落盘，但不强制刷新仍可能处于输入状态的画布；重叠修改则保留本地画布、逐字段展示差异，并让用户选择保留用户版或AI版的冲突字段。
