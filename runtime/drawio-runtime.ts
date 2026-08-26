@@ -5435,32 +5435,71 @@ return `<!doctype html>
       border-radius: 8px; background: rgba(15, 23, 42, .88); color: white; opacity: 0;
       pointer-events: none; transition: opacity .15s; }
     #status.visible { opacity: 1; }
-    #patch-preview-bar { position: fixed; z-index: 11; top: 10px; left: 50%; transform: translateX(-50%);
-      display: none; align-items: center; gap: 10px; max-width: 94vw; padding: 9px 13px;
-      border: 1px solid #d97706; border-radius: 10px; background: rgba(255,251,235,.97);
-      color: #92400e; box-shadow: 0 4px 16px rgba(15,23,42,.18); }
-    #patch-preview-bar.visible { display: flex; }
-    #patch-preview-bar .legend { display: flex; gap: 8px; white-space: nowrap; font-size: 11px; }
-    #patch-preview-bar .swatch { display: inline-block; width: 10px; height: 10px; margin-right: 3px;
-      border-radius: 2px; vertical-align: -1px; }
-    #patch-preview-bar button { border: 1px solid #d97706; border-radius: 6px; background: #fff;
-      color: #92400e; padding: 4px 9px; cursor: pointer; }
-    #patch-preview-bar button.active { background: #d97706; color: #fff; }
-    #patch-preview-bar button.danger { border-color: #dc2626; color: #b91c1c; }
-    #patch-preview-bar button.danger:hover { background: #fef2f2; }
-    #patch-preview-bar button:disabled { opacity: .5; cursor: not-allowed; }
-    #patch-preview-details { position: fixed; z-index: 10; display: none; top: 64px; right: 14px;
-      width: min(390px, calc(100vw - 28px)); max-height: 54vh; overflow: hidden;
-      border: 1px solid #d97706; border-radius: 10px; background: rgba(255,255,255,.97);
-      color: #334155; box-shadow: 0 4px 16px rgba(15,23,42,.16); font-size: 12px; }
+    #patch-preview-bar { --preview-accent: #d97706; --preview-ink: #172033; --preview-muted: #64748b;
+      position: fixed; z-index: 11; top: 12px; left: 50%; transform: translateX(-50%);
+      box-sizing: border-box; width: min(920px, calc(100vw - 24px)); display: none;
+      grid-template-columns: minmax(220px, 1fr) auto;
+      grid-template-areas: "overview actions" "meta meta"; align-items: center; gap: 9px 18px;
+      padding: 11px 14px 10px; border: 1px solid rgba(148,163,184,.54);
+      border-top: 3px solid var(--preview-accent); border-radius: 14px;
+      background: rgba(255,255,255,.96); color: var(--preview-ink);
+      box-shadow: 0 16px 40px rgba(15,23,42,.16), 0 2px 8px rgba(15,23,42,.08);
+      backdrop-filter: blur(16px); font-family: "Segoe UI Variable", "Microsoft YaHei UI", sans-serif; }
+    #patch-preview-bar.visible { display: grid; }
+    #patch-preview-bar .preview-overview { grid-area: overview; min-width: 0; display: flex;
+      align-items: center; gap: 10px; }
+    #patch-preview-bar .preview-eyebrow { flex: none; padding: 5px 7px; border-radius: 6px;
+      background: #fff7ed; color: #9a3412; font-size: 10px; font-weight: 750;
+      letter-spacing: .08em; line-height: 1; white-space: nowrap; }
+    #patch-preview-summary { min-width: 0; overflow: hidden; color: var(--preview-ink);
+      font-size: 13px; font-weight: 700; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+    #patch-preview-bar .preview-actions { grid-area: actions; display: flex; align-items: center;
+      justify-content: flex-end; gap: 8px; white-space: nowrap; }
+    #patch-preview-bar .segmented { display: inline-flex; flex: none; gap: 2px; padding: 3px;
+      border: 1px solid #dbe2ea; border-radius: 10px; background: #f1f5f9; }
+    #patch-preview-bar button { min-height: 32px; box-sizing: border-box; border: 1px solid transparent;
+      border-radius: 8px; background: transparent; color: #475569; padding: 5px 10px;
+      cursor: pointer; font: inherit; font-weight: 650; line-height: 1.2; white-space: nowrap;
+      transition: background-color .15s ease, border-color .15s ease, color .15s ease; }
+    #patch-preview-bar button:hover { background: #f8fafc; color: #0f172a; }
+    #patch-preview-bar button:focus-visible { outline: 3px solid rgba(37,99,235,.28); outline-offset: 2px; }
+    #patch-preview-bar .segmented button { min-width: 60px; }
+    #patch-preview-bar .segmented button.active { border-color: #cbd5e1; background: #fff;
+      color: #9a3412; box-shadow: 0 1px 3px rgba(15,23,42,.11); }
+    #patch-preview-details-toggle { display: inline-flex; align-items: center; gap: 6px;
+      border-color: #dbe2ea !important; background: #fff !important; color: #334155 !important; }
+    #patch-preview-details-count { min-width: 19px; height: 18px; padding: 0 5px; box-sizing: border-box;
+      display: inline-flex; align-items: center; justify-content: center; border-radius: 999px;
+      background: #e2e8f0; color: #475569; font-size: 10px; font-weight: 750; }
+    #patch-preview-bar button.danger { border-color: #fecaca; background: #fff; color: #b91c1c; }
+    #patch-preview-bar button.danger:hover { border-color: #fca5a5; background: #fef2f2; color: #991b1b; }
+    #patch-preview-bar button:disabled { opacity: .48; cursor: not-allowed; }
+    #patch-preview-bar .preview-meta { grid-area: meta; min-width: 0; display: flex;
+      align-items: center; gap: 14px; padding-top: 8px; border-top: 1px solid #e8edf3; }
+    #patch-preview-guidance { min-width: 0; display: flex; align-items: center; gap: 7px;
+      overflow: hidden; color: var(--preview-muted); font-size: 11px; text-overflow: ellipsis;
+      white-space: nowrap; }
+    #patch-preview-guidance::before { content: ""; flex: none; width: 7px; height: 7px;
+      border-radius: 50%; background: #f59e0b; box-shadow: 0 0 0 3px #ffedd5; }
+    #patch-preview-bar .legend { margin-left: auto; display: flex; flex-wrap: wrap;
+      align-items: center; gap: 5px 11px; color: #475569; font-size: 11px; }
+    #patch-preview-bar .legend span { display: inline-flex; align-items: center; white-space: nowrap; }
+    #patch-preview-bar .swatch { display: inline-block; width: 8px; height: 8px; margin-right: 5px;
+      border-radius: 50%; box-shadow: 0 0 0 1px rgba(15,23,42,.08); }
+    #patch-preview-details { position: absolute; z-index: 10; display: none; top: calc(100% + 8px); right: 0;
+      width: min(410px, calc(100vw - 24px)); max-height: min(58vh, 520px); overflow: hidden;
+      border: 1px solid #dbe2ea; border-radius: 12px; background: rgba(255,255,255,.98);
+      color: #334155; box-shadow: 0 18px 42px rgba(15,23,42,.18), 0 2px 8px rgba(15,23,42,.08);
+      font-size: 12px; }
     #patch-preview-details.visible { display: block; }
     #patch-preview-details .details-head { position: sticky; top: 0; display: flex; align-items: center;
-      gap: 8px; padding: 9px 11px; border-bottom: 1px solid #e2e8f0; background: inherit; }
+      gap: 8px; padding: 10px 12px; border-bottom: 1px solid #e2e8f0; background: inherit; }
     #patch-preview-details .details-head strong { flex: 1; }
     #patch-preview-details .details-head button { width: 30px; height: 30px; border: 0;
       border-radius: 6px; background: transparent; color: #64748b; cursor: pointer; font-size: 18px; }
     #patch-preview-details .details-head button:hover { background: #f1f5f9; color: #0f172a; }
-    #patch-preview-details-body { max-height: calc(54vh - 49px); overflow: auto; padding: 2px 12px 11px; }
+    #patch-preview-details-body { max-height: min(calc(58vh - 52px), 468px); overflow: auto;
+      padding: 3px 12px 11px; scrollbar-gutter: stable; }
     #patch-preview-details .change { padding: 7px 0; border-bottom: 1px solid #e2e8f0; }
     #patch-preview-details .change:last-child { border-bottom: 0; }
     #patch-preview-details .property { display: grid; grid-template-columns: 94px 1fr 18px 1fr;
@@ -5658,10 +5697,48 @@ return `<!doctype html>
       padding: 6px 12px; cursor: pointer; }
     #ann-form .actions .primary { border-color: #2563eb; background: #2563eb; color: #fff; }
     #ann-form .actions .primary:disabled { opacity: .5; cursor: not-allowed; }
+    @media (max-width: 760px) {
+      #patch-preview-bar { top: 8px; width: calc(100vw - 16px); grid-template-columns: 1fr;
+        grid-template-areas: "overview" "actions" "meta"; gap: 9px; padding: 10px 11px 9px; }
+      #patch-preview-bar .preview-actions { justify-content: stretch; }
+      #patch-preview-bar .segmented { flex: 1 1 auto; min-width: 0; }
+      #patch-preview-bar .segmented button { flex: 1 1 0; min-width: 0; }
+      #patch-preview-bar .preview-meta { align-items: flex-start; flex-wrap: wrap; gap: 7px 12px; }
+      #patch-preview-guidance { flex-basis: 100%; }
+      #patch-preview-bar .legend { margin-left: 0; }
+      #patch-preview-details { width: min(390px, 100%); }
+    }
+    @media (max-width: 440px) {
+      #patch-preview-bar .preview-actions { display: grid; grid-template-columns: 1fr auto; }
+      #patch-preview-bar .segmented { grid-column: 1 / -1; }
+      #patch-preview-details-toggle { justify-content: center; }
+      #patch-preview-summary { font-size: 12px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #patch-preview-bar button { transition: none; }
+    }
     @media (prefers-color-scheme: dark) {
       body { background: #0f172a; }
-      #patch-preview-bar { background: rgba(69,26,3,.96); color: #fde68a; }
-      #patch-preview-bar button { background: #78350f; color: #fef3c7; }
+      #patch-preview-bar { --preview-ink: #f8fafc; --preview-muted: #94a3b8;
+        border-color: #334155; border-top-color: #f59e0b; background: rgba(15,23,42,.96); }
+      #patch-preview-bar .preview-eyebrow { background: #431407; color: #fed7aa; }
+      #patch-preview-bar .segmented { border-color: #334155; background: #111827; }
+      #patch-preview-bar button { color: #cbd5e1; }
+      #patch-preview-bar button:hover { background: #243049; color: #f8fafc; }
+      #patch-preview-bar .segmented button.active { border-color: #475569; background: #334155; color: #fed7aa; }
+      #patch-preview-details-toggle { border-color: #475569 !important; background: #1e293b !important;
+        color: #e2e8f0 !important; }
+      #patch-preview-details-count { background: #334155; color: #cbd5e1; }
+      #patch-preview-bar button.danger { border-color: #7f1d1d; background: #1f1518; color: #fca5a5; }
+      #patch-preview-bar button.danger:hover { border-color: #b91c1c; background: #450a0a; color: #fecaca; }
+      #patch-preview-bar .preview-meta { border-color: #334155; }
+      #patch-preview-guidance::before { box-shadow: 0 0 0 3px #431407; }
+      #patch-preview-bar .legend { color: #cbd5e1; }
+      #patch-preview-details { border-color: #334155; background: rgba(15,23,42,.98); color: #e2e8f0; }
+      #patch-preview-details .details-head, #patch-preview-details .change { border-color: #334155; }
+      #patch-preview-details .details-head button { color: #94a3b8; }
+      #patch-preview-details .details-head button:hover { background: #243049; color: #f8fafc; }
+      #patch-preview-details .value { color: #cbd5e1; }
       #history-btn, #ann-btn, #ann-drawer { background: #1e293b; color: #e2e8f0; border-color: #334155; }
       #history-btn:hover, #ann-btn:hover, #ann-drawer header button { background: #243049; }
       #ann-filters { background: #172033; border-color: #334155; }
@@ -5712,31 +5789,38 @@ return `<!doctype html>
 <body>
   <iframe id="editor" title="Draw.io editor"></iframe>
   <div id="status" role="status"></div>
-  <div id="patch-preview-bar" role="status">
-    <strong id="patch-preview-summary">Agent 修改预览</strong>
-    <span class="legend">
-      <span><i class="swatch" style="background:#22c55e"></i>新增</span>
-      <span><i class="swatch" style="background:#f59e0b"></i>修改</span>
-      <span><i class="swatch" style="background:#ef4444"></i>删除/原位置</span>
-      <span><i class="swatch" style="background:#3b82f6"></i>连线</span>
-    </span>
-    <div role="group" aria-label="预览显示方式">
-      <button type="button" id="patch-preview-before" aria-pressed="false">修改前</button>
-      <button type="button" id="patch-preview-after" aria-pressed="false">修改后</button>
-      <button type="button" id="patch-preview-compare" class="active" aria-pressed="true">对比</button>
+  <div id="patch-preview-bar" role="region" aria-label="Agent 修改预览">
+    <div class="preview-overview">
+      <span class="preview-eyebrow">AGENT 预览</span>
+      <strong id="patch-preview-summary">正在准备修改摘要</strong>
     </div>
-    <button type="button" id="patch-preview-details-toggle" aria-expanded="true"
-      aria-controls="patch-preview-details">变化详情 <span id="patch-preview-details-count">0</span></button>
-    <span id="patch-preview-guidance">只读预览，不会写入源文件</span>
-    <button type="button" id="patch-preview-cancel" class="danger">取消本次修改</button>
+    <div class="preview-actions">
+      <div class="segmented" role="group" aria-label="预览显示方式">
+        <button type="button" id="patch-preview-before" aria-pressed="false">修改前</button>
+        <button type="button" id="patch-preview-after" aria-pressed="false">修改后</button>
+        <button type="button" id="patch-preview-compare" class="active" aria-pressed="true">对比</button>
+      </div>
+      <button type="button" id="patch-preview-details-toggle" aria-expanded="true"
+        aria-controls="patch-preview-details">变化详情 <span id="patch-preview-details-count">0</span></button>
+      <button type="button" id="patch-preview-cancel" class="danger">取消修改</button>
+    </div>
+    <div class="preview-meta">
+      <span id="patch-preview-guidance" role="status">只读预览，不会写入源文件</span>
+      <span class="legend" aria-label="对比颜色说明">
+        <span><i class="swatch" style="background:#22c55e"></i>新增</span>
+        <span><i class="swatch" style="background:#f59e0b"></i>修改</span>
+        <span><i class="swatch" style="background:#ef4444"></i>删除/原位置</span>
+        <span><i class="swatch" style="background:#3b82f6"></i>连线</span>
+      </span>
+    </div>
+    <aside id="patch-preview-details" aria-live="polite" aria-label="修改变化详情">
+      <div class="details-head">
+        <strong>变化详情</strong>
+        <button type="button" id="patch-preview-details-close" aria-label="关闭变化详情">×</button>
+      </div>
+      <div id="patch-preview-details-body"></div>
+    </aside>
   </div>
-  <aside id="patch-preview-details" aria-live="polite" aria-label="修改变化详情">
-    <div class="details-head">
-      <strong>变化详情</strong>
-      <button type="button" id="patch-preview-details-close" aria-label="关闭变化详情">×</button>
-    </div>
-    <div id="patch-preview-details-body"></div>
-  </aside>
   <div id="conflict-banner" role="alert">
     <span id="conflict-message">图表刚发生变化，当前画布暂未保存，请确认最新版本。</span>
     <button type="button" id="conflict-retry" style="display:none">重试加载</button>
@@ -6210,11 +6294,8 @@ return `<!doctype html>
         closeDrawer();
         closeHistory();
         setPatchPreviewControlsDisabled(true);
-        const summary = preview.summary || {};
-        patchPreviewSummary.textContent = "新增 " + (summary.added || 0)
-          + " · 修改 " + (summary.changed || 0)
-          + " · 删除 " + (summary.removed || 0)
-          + " · revision " + preview.baseRevision;
+        const totalChanges = patchPreviewDetailsBody.childElementCount;
+        patchPreviewSummary.textContent = totalChanges + " 项变化 · 基于版本 " + preview.baseRevision;
         patchPreviewGuidance.textContent = preview.status === "authorized"
           ? "已批准，正在提交精确候选"
           : "请核对画布后在 OpenCode 审批弹窗中确认";
