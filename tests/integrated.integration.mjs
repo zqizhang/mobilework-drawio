@@ -150,7 +150,11 @@ try {
   assert.equal(typeof plugin.tool.drawio_authorize_annotation_change.execute, "function")
   assert.equal(typeof plugin.tool.drawio_authorize_preview.execute, "function")
   assert.equal(typeof plugin.tool.drawio_preview_state.execute, "function")
-  const systemOutput = { system: [] }
+  const generatedAgentPrompt = await fs.readFile(
+    path.resolve("generated/drawio-expert/.opencode/agents/drawio-expert.md"),
+    "utf8",
+  )
+  const systemOutput = { system: [generatedAgentPrompt] }
   await plugin["experimental.chat.system.transform"]({}, systemOutput)
   assert.match(systemOutput.system.join("\n"), /人工编辑不是只读内容/)
   assert.match(systemOutput.system.join("\n"), /最新 XML 作为修改基线/)
@@ -161,10 +165,14 @@ try {
   assert.match(systemOutput.system.join("\n"), /禁止先改后问/)
   assert.match(systemOutput.system.join("\n"), /SVG、xmlsvg、html2/)
   assert.match(systemOutput.system.join("\n"), /browser\.open_url 自动打开/)
-  const generatedAgentPrompt = await fs.readFile(
-    path.resolve("generated/drawio-expert/.opencode/agents/drawio-expert.md"),
-    "utf8",
-  )
+  const generalAgentSystemOutput = { system: ["You are a general coding agent."] }
+  await plugin["experimental.chat.system.transform"]({}, generalAgentSystemOutput)
+  assert.deepEqual(generalAgentSystemOutput.system, ["You are a general coding agent."])
+
+  const auxiliarySystemOutput = { system: ["Generate a short title for this session."] }
+  await plugin["experimental.chat.system.transform"]({}, auxiliarySystemOutput)
+  assert.deepEqual(auxiliarySystemOutput.system, ["Generate a short title for this session."])
+
   assert.match(generatedAgentPrompt, /禁止声称运行时不支持/)
   assert.match(generatedAgentPrompt, /逐个page_id/)
   const createResult = JSON.parse(await plugin.tool.drawio_create.execute({

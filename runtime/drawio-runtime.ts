@@ -8314,6 +8314,12 @@ drawio_export 支持 PNG、JPEG、PDF、xmlpng、SVG、xmlsvg 和 html2。SVG、
 用户本轮另有明确任务时先完成该任务，然后在同一轮重新探测注释；最终回复前仍存在 requiresConfirmation=false 的 open 注释时必须继续处理，不能只提示用户稍后继续。
 注释任务的检查与处理流程由 drawio-session-editing 技能负责编排，详见该 SKILL.md。`
 
+const DRAWIO_EXPERT_AGENT_MARKER = "Agent ID 是 `drawio-expert`"
+
+function isDrawioExpertSystem(system: string[]): boolean {
+  return system.some((part) => part.includes(DRAWIO_EXPERT_AGENT_MARKER))
+}
+
 function candidateDrawioPath(args: unknown): string | null {
   if (!args || typeof args !== "object" || Array.isArray(args)) return null
   const record = args as Record<string, unknown>
@@ -8329,7 +8335,11 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
   await loadWorkspaceEnvironment(input.directory)
 
   return {
-"experimental.chat.system.transform": async (_input, output) => {
+  "experimental.chat.system.transform": async (_input, output) => {
+    // OpenCode 1.18 的系统提示转换钩子不会直接提供当前选中的 Agent 名称，
+    // 但当前 Agent 的提示词已经合并到 output.system，因此用生成提示词中的稳定 Agent ID
+    // 判断本次请求是否属于 drawio-expert，避免向普通 Agent 或辅助模型请求注入绘图约束。
+    if (!isDrawioExpertSystem(output.system)) return
     output.system.push(DRAWIO_RUNTIME_GUIDANCE)
   },
   "tool.execute.before": async (input, output) => {
