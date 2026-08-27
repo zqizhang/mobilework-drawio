@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { createServer, type IncomingMessage, type Server } from "node:http"
 import { createConnection } from "node:net"
 import path from "node:path"
-import { type Plugin, tool } from "@opencode-ai/plugin"
+import type { tool } from "@opencode-ai/plugin"
 import { XMLBuilder, XMLParser, XMLValidator } from "fast-xml-parser"
 import pako from "pako"
 
@@ -8238,72 +8238,16 @@ async function bindIntegratedSession(
   return { session, token, bridge }
 }
 
-const nodeSchema = tool.schema.object({
-  id: tool.schema.string().describe("Stable unique cell id; 0 and 1 are reserved"),
-  label: tool.schema.string().describe("Visible node label"),
-  kind: tool.schema
-    .enum(["default", "application", "service", "database", "external", "decision"])
-    .optional()
-    .describe("Visual node category"),
-})
-
-const edgeSchema = tool.schema.object({
-  id: tool.schema.string().optional().describe("Stable unique edge id"),
-  source: tool.schema.string().describe("Source node id"),
-  target: tool.schema.string().describe("Target node id"),
-  label: tool.schema.string().optional().describe("Visible edge label"),
-})
-
-const patchStyleUpdatesSchema = tool.schema.object({
-  font_size: tool.schema.number().positive().max(200).optional(),
-  font_family: tool.schema.string().min(1).max(120).optional(),
-  font_color: tool.schema.string().min(1).max(80).optional(),
-  fill_color: tool.schema.string().min(1).max(80).optional(),
-  stroke_color: tool.schema.string().min(1).max(80).optional(),
-  stroke_width: tool.schema.number().min(0).max(50).optional(),
-  opacity: tool.schema.number().min(0).max(100).optional(),
-  rounded: tool.schema.boolean().optional(),
-  dashed: tool.schema.boolean().optional(),
-})
-
-const patchOperationSchema = tool.schema.object({
-  type: tool.schema.enum([
-    "add-node",
-    "update-node",
-    "remove-node",
-    "add-edge",
-    "update-edge",
-    "remove-edge",
-  ]),
-  id: tool.schema.string().describe("Stable target or new cell id"),
-  label: tool.schema.string().optional(),
-  kind: tool.schema
-    .enum(["default", "application", "service", "database", "external", "decision"])
-    .optional(),
-  source: tool.schema.string().optional(),
-  target: tool.schema.string().optional(),
-  x: tool.schema.number().optional(),
-  y: tool.schema.number().optional(),
-  width: tool.schema.number().positive().optional(),
-  height: tool.schema.number().positive().optional(),
-  style_updates: patchStyleUpdatesSchema
-    .optional()
-    .describe("Whitelisted visual property updates that preserve unrelated style keys"),
-  cascade: tool.schema
-    .boolean()
-    .optional()
-    .describe("For remove-node, also remove connected edges"),
-})
-
 const DRAWIO_RUNTIME_GUIDANCE = `## Draw.io 文件写入与交付
 
 已通过 drawio_open 绑定的文件可能包含用户在内置浏览器中的手动修改。
+只要当前会话已通过 drawio_open 或 drawio_finalize 绑定 .drawio 文件，每一轮对话开始、在决定本轮动作或回复前，都必须并发调用 drawio_list_annotations(file, status="pending") 和 drawio_get_state，合并检查待处理注释、最新 revision、updatedBy 以及人工/外部版本变动。此要求不依赖本轮是否重新加载 Skill；用户只说“嗯”“继续”“好了吗”等简短回复时也不得跳过。若用户本轮有其它明确任务，完成后必须在同一轮重新执行这两项探测并重新计算 freshness；最终回复前再次列出 pending 注释，不得遗留可直接执行的 fresh 注释，除非用户明确要求暂不处理、注释需要确认或工具失败。
 每次修改前必须立即调用 drawio_get_state，并把返回的最新 XML 作为修改基线。人工编辑不是只读内容，可以按当前任务要求继续调整。
 提交时必须携带该次读取返回的准确 base_revision；revision_conflict 后重新读取，在新 XML 上重新执行所需变更并重试，禁止重发旧 XML。
 禁止用普通 write、edit 或脚本直接覆盖已绑定的 .drawio 文件，因为这会绕过 revision 检查并可能用旧快照丢失最新内容。
 对已绑定文件执行 drawio_patch 或 drawio_polish 时，先以 dry_run=true 生成同画布修改预览；字体、填充色、文字色、边框色等常用属性使用 drawio_patch.style_updates。只有完整 XML 才能表达的页面背景或高级样式先调用 drawio_preview_state，禁止直接调用 drawio_update_state 绕过预览。预览提供“修改前”（原始基线）、“修改后”（无临时标记的精确候选）和“对比”（候选加彩色覆盖层，默认）三种视图及属性级前后值；绿色表示新增、黄色表示修改、红色表示删除或原位置、蓝色表示变更连线。关闭变化详情只收起面板，不影响候选；“取消本次修改”、拒绝或关闭审批才会使候选失效。普通修改调用 drawio_authorize_preview；用户在审批弹窗点击允许后，该工具会立即校验并提交画布中展示的精确候选，Agent 不得等待用户再发文字确认，也不得重复调用正式 patch/polish。注释修改继续调用 drawio_authorize_annotation_change，并把 dry-run 返回的 preview_id 与精确稳定 ID 清单一起纳入范围审批。
-本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。调用前必须先调用 drawio_list_annotations(status='pending') 探测未完成注释；存在 requiresConfirmation=false 的注释时 drawio_finalize 会拒绝执行，必须先逐条处理并 drawio_resolve_annotation 后再重试，不得跳过。只有返回 shouldOpenBrowser=true 时才将 openUrl 交给 MobileWork 现有 browser.open_url 打开；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
-drawio_export 支持 PNG、JPEG、PDF、xmlpng、SVG、xmlsvg 和 html2。SVG、xmlsvg、html2 由内置浏览器编辑器渲染并通过 Bridge 写回工作区；返回 editor_required 时必须立即调用 browser.open_url 自动打开其 openUrl，等待编辑器连接后用完全相同的参数重试，禁止把该状态解释为不支持格式或要求用户手工导出。PNG、JPEG、xmlpng、SVG、xmlsvg 使用 all_pages=true 时逐页生成文件并返回 outputs[]，必须核对 page_count 与 outputs 数量一致；PDF 和 html2 的 all_pages=true 各返回一个包含全部页面的多页单文件，html2 还需核对 contains_all_pages=true。
+本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。调用前必须先调用 drawio_list_annotations(status='pending') 探测未完成注释；存在 requiresConfirmation=false 的注释时 drawio_finalize 会拒绝执行，必须先逐条处理并 drawio_resolve_annotation 后再重试，不得跳过。只有返回 shouldOpenBrowser=true 时才调用 MobileWork 工具 openwork_browser_open_url，并传入 url=openUrl、provider="builtin"；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
+drawio_export 支持 PNG、JPEG、PDF、xmlpng、SVG、xmlsvg 和 html2。SVG、xmlsvg、html2 由内置浏览器编辑器渲染并通过 Bridge 写回工作区；返回 editor_required 时必须立即调用 openwork_browser_open_url，并传入 url=openUrl、provider="builtin"，等待编辑器连接后用完全相同的参数重试，禁止把该状态解释为不支持格式或要求用户手工导出。PNG、JPEG、xmlpng、SVG、xmlsvg 使用 all_pages=true 时逐页生成文件并返回 outputs[]，必须核对 page_count 与 outputs 数量一致；PDF 和 html2 的 all_pages=true 各返回一个包含全部页面的多页单文件，html2 还需核对 contains_all_pages=true。
 
 ## 注释任务（框选评审）
 
@@ -8331,35 +8275,131 @@ function candidateDrawioPath(args: unknown): string | null {
   return null
 }
 
-export const DrawioExpertPlugin: Plugin = async (input) => {
-  await loadWorkspaceEnvironment(input.directory)
+export async function initializeDrawioWorkspace(directory: string): Promise<void> {
+  await loadWorkspaceEnvironment(directory)
+}
 
-  return {
-  "experimental.chat.system.transform": async (_input, output) => {
-    // OpenCode 1.18 的系统提示转换钩子不会直接提供当前选中的 Agent 名称，
-    // 但当前 Agent 的提示词已经合并到 output.system，因此用生成提示词中的稳定 Agent ID
-    // 判断本次请求是否属于 drawio-expert，避免向普通 Agent 或辅助模型请求注入绘图约束。
-    if (!isDrawioExpertSystem(output.system)) return
-    output.system.push(DRAWIO_RUNTIME_GUIDANCE)
-  },
-  "tool.execute.before": async (input, output) => {
-    if (!["write", "edit", "apply_patch"].includes(input.tool)) return
-    const requested = candidateDrawioPath(output.args)
-    if (!requested) return
-    const state = getIntegratedBridgeState()
-    const session = state.sessions.get(input.sessionID)
-    if (!session) return
-    const target = path.isAbsolute(requested)
-      ? path.resolve(requested)
-      : path.resolve(session.workspace, requested)
-    if (target.toLowerCase() === path.resolve(session.file).toLowerCase()) {
-      throw new Error(
-        "This Draw.io file is bound to an active browser session. "
-        + "Call drawio_get_state, then use drawio_patch, drawio_polish, or drawio_update_state with its exact revision.",
-      )
-    }
-  },
-  tool: {
+export function applyDrawioSystemGuidance(output: { system: string[] }): void {
+  // OpenCode 1.18 的系统提示转换钩子不会直接提供当前选中的 Agent 名称，
+  // 但当前 Agent 的提示词已经合并到 output.system，因此用生成提示词中的稳定 Agent ID
+  // 判断本次请求是否属于 drawio-expert，避免向普通 Agent 或辅助模型请求注入绘图约束。
+  if (!isDrawioExpertSystem(output.system)) return
+  output.system.push(DRAWIO_RUNTIME_GUIDANCE)
+}
+
+export function enforceDrawioWriteGuard(
+  input: { tool: string; sessionID: string; callID?: string },
+  output: { args: unknown },
+): void {
+  if (!["write", "edit", "apply_patch"].includes(input.tool)) return
+  const requested = candidateDrawioPath(output.args)
+  if (!requested) return
+  const state = getIntegratedBridgeState()
+  const session = state.sessions.get(input.sessionID)
+  if (!session) return
+  const target = path.isAbsolute(requested)
+    ? path.resolve(requested)
+    : path.resolve(session.workspace, requested)
+  if (target.toLowerCase() === path.resolve(session.file).toLowerCase()) {
+    throw new Error(
+      "This Draw.io file is bound to an active browser session. "
+      + "Call drawio_get_state, then use drawio_patch, drawio_polish, or drawio_update_state with its exact revision.",
+    )
+  }
+}
+
+export const DRAWIO_TOOL_NAMES = [
+  "drawio_validate",
+  "drawio_export",
+  "drawio_health_check",
+  "drawio_create",
+  "drawio_inspect",
+  "drawio_quality",
+  "drawio_patch",
+  "drawio_polish",
+  "drawio_compare",
+  "drawio_get_state",
+  "drawio_preview_state",
+  "drawio_update_state",
+  "drawio_open",
+  "drawio_finalize",
+  "drawio_list_annotations",
+  "drawio_get_annotation",
+  "drawio_authorize_preview",
+  "drawio_authorize_annotation_change",
+  "drawio_resolve_annotation",
+] as const
+
+type DrawioToolFactory = typeof tool
+type DrawioToolDefinition = ReturnType<DrawioToolFactory>
+type DrawioToolset = { [Name in (typeof DRAWIO_TOOL_NAMES)[number]]: DrawioToolDefinition }
+
+const drawioToolsets = new WeakMap<DrawioToolFactory, DrawioToolset>()
+
+export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
+  const cachedToolset = drawioToolsets.get(toolApi)
+  if (cachedToolset) return cachedToolset
+
+  const tool = toolApi
+
+  const nodeSchema = tool.schema.object({
+    id: tool.schema.string().describe("Stable unique cell id; 0 and 1 are reserved"),
+    label: tool.schema.string().describe("Visible node label"),
+    kind: tool.schema
+      .enum(["default", "application", "service", "database", "external", "decision"])
+      .optional()
+      .describe("Visual node category"),
+  })
+
+  const edgeSchema = tool.schema.object({
+    id: tool.schema.string().optional().describe("Stable unique edge id"),
+    source: tool.schema.string().describe("Source node id"),
+    target: tool.schema.string().describe("Target node id"),
+    label: tool.schema.string().optional().describe("Visible edge label"),
+  })
+
+  const patchStyleUpdatesSchema = tool.schema.object({
+    font_size: tool.schema.number().positive().max(200).optional(),
+    font_family: tool.schema.string().min(1).max(120).optional(),
+    font_color: tool.schema.string().min(1).max(80).optional(),
+    fill_color: tool.schema.string().min(1).max(80).optional(),
+    stroke_color: tool.schema.string().min(1).max(80).optional(),
+    stroke_width: tool.schema.number().min(0).max(50).optional(),
+    opacity: tool.schema.number().min(0).max(100).optional(),
+    rounded: tool.schema.boolean().optional(),
+    dashed: tool.schema.boolean().optional(),
+  })
+
+  const patchOperationSchema = tool.schema.object({
+    type: tool.schema.enum([
+      "add-node",
+      "update-node",
+      "remove-node",
+      "add-edge",
+      "update-edge",
+      "remove-edge",
+    ]),
+    id: tool.schema.string().describe("Stable target or new cell id"),
+    label: tool.schema.string().optional(),
+    kind: tool.schema
+      .enum(["default", "application", "service", "database", "external", "decision"])
+      .optional(),
+    source: tool.schema.string().optional(),
+    target: tool.schema.string().optional(),
+    x: tool.schema.number().optional(),
+    y: tool.schema.number().optional(),
+    width: tool.schema.number().positive().optional(),
+    height: tool.schema.number().positive().optional(),
+    style_updates: patchStyleUpdatesSchema
+      .optional()
+      .describe("Whitelisted visual property updates that preserve unrelated style keys"),
+    cascade: tool.schema
+      .boolean()
+      .optional()
+      .describe("For remove-node, also remove connected edges"),
+  })
+
+  const toolset: DrawioToolset = {
     drawio_validate: tool({
       description: "Validate a workspace Draw.io file and report pages, file size, nodes, edges, errors, and warnings.",
       args: {
@@ -8391,7 +8431,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
 
     drawio_export: tool({
       description:
-        "Export a workspace Draw.io file. PNG, JPEG, PDF, and editable PNG (xmlpng) use the Docker HTTP Export Server. SVG, editable SVG (xmlsvg), and HTML (html2) use the built-in browser Bridge. all_pages=true writes one file per page for PNG/JPEG/xmlpng/SVG/XMLSVG, while PDF and HTML2 each produce one multi-page file. page_id exports one page for every format. When an editor-channel export is not connected, open the returned openUrl with browser.open_url and retry the same export.",
+        "Export a workspace Draw.io file. PNG, JPEG, PDF, and editable PNG (xmlpng) use the Docker HTTP Export Server. SVG, editable SVG (xmlsvg), and HTML (html2) use the built-in browser Bridge. all_pages=true writes one file per page for PNG/JPEG/xmlpng/SVG/XMLSVG, while PDF and HTML2 each produce one multi-page file. page_id exports one page for every format. When an editor-channel export is not connected, call openwork_browser_open_url with url=openUrl and provider=builtin, then retry the same export.",
       args: {
         input_path: tool.schema.string().describe("Workspace-relative .drawio or .xml input file"),
         format: tool.schema.enum(["png", "jpeg", "pdf", "xmlpng", "svg", "xmlsvg", "html2"]),
@@ -8443,7 +8483,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
                 all_pages: true,
                 openUrl: outcome.openUrl,
                 browserAction:
-                  "Call MobileWork's built-in browser.open_url with openUrl now, wait for the editor page to finish loading, then call drawio_export again with identical arguments to complete the export.",
+                  "Call openwork_browser_open_url with url=openUrl and provider=builtin now, wait for the editor page to finish loading, then call drawio_export again with identical arguments to complete the export.",
                 tokenExpiresAt: outcome.tokenExpiresAt,
               }, null, 2)
             }
@@ -8488,7 +8528,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
               format: args.format,
               openUrl: outcome.openUrl,
               browserAction:
-                "Call MobileWork's built-in browser.open_url with openUrl now, wait for the editor page to finish loading, then call drawio_export again with identical arguments to complete the export.",
+                "Call openwork_browser_open_url with url=openUrl and provider=builtin now, wait for the editor page to finish loading, then call drawio_export again with identical arguments to complete the export.",
               tokenExpiresAt: outcome.tokenExpiresAt,
             }, null, 2)
           }
@@ -9288,8 +9328,8 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           editorConnected,
           shouldOpenBrowser: !editorConnected,
           browserAction: editorConnected
-            ? "Keep the connected editor open. Do not call browser.open_url because reopening it can discard an in-progress manual edit."
-            : "Open the returned openUrl with OpenWork's existing browser.open_url action.",
+            ? "Keep the connected editor open. Do not call openwork_browser_open_url because reopening it can discard an in-progress manual edit."
+            : "Call openwork_browser_open_url with url=openUrl and provider=builtin.",
           saveMode: "workspace-file",
           tokenExpiresAt: new Date(Date.now() + BRIDGE_TOKEN_TTL_MS).toISOString(),
         }, null, 2)
@@ -9391,8 +9431,8 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           editorConnected,
           shouldOpenBrowser: !editorConnected,
           browserAction: editorConnected
-            ? "Keep the connected editor open. Do not call browser.open_url because reopening it can discard an in-progress manual edit."
-            : "Immediately call MobileWork's existing browser.open_url with openUrl before ending the task.",
+            ? "Keep the connected editor open. Do not call openwork_browser_open_url because reopening it can discard an in-progress manual edit."
+            : "Immediately call openwork_browser_open_url with url=openUrl and provider=builtin before ending the task.",
           saveMode: "workspace-file",
           tokenExpiresAt: new Date(Date.now() + BRIDGE_TOKEN_TTL_MS).toISOString(),
         }, null, 2)
@@ -9779,6 +9819,20 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-  },
   }
+
+  drawioToolsets.set(toolApi, toolset)
+  return toolset
+}
+
+export function createDrawioTool(
+  name: string,
+  toolApi: DrawioToolFactory,
+): DrawioToolDefinition {
+  const toolset = createDrawioToolset(toolApi)
+  const definition = (toolset as Record<string, DrawioToolDefinition | undefined>)[name]
+  if (!definition) {
+    throw new Error(`Unknown Draw.io tool: ${name}`)
+  }
+  return definition
 }

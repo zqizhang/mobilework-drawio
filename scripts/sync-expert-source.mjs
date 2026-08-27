@@ -1,73 +1,168 @@
-import { spawnSync } from "node:child_process"
-import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
-import os from "node:os"
+import { createHash } from "node:crypto"
+import { promises as fs } from "node:fs"
 import path from "node:path"
-import { fileURLToPath } from "node:url"
 
-const scriptDirectory = path.dirname(fileURLToPath(import.meta.url))
-const projectDirectory = path.resolve(scriptDirectory, "..")
-const manifestPath = path.join(projectDirectory, "expert.json")
-const pluginPath = path.join(projectDirectory, "runtime", "drawio-runtime.ts")
+const SKILLS = ["drawio-skill", "drawio-session-editing"]
 
-const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
-const localPlugins = manifest.runtime_extensions?.plugins?.local
-if (!Array.isArray(localPlugins)) {
-  throw new Error("expert.json does not contain runtime_extensions.plugins.local")
+function normalizeBrowserContract(value) {
+  if (typeof value === "string") {
+    return value
+      .replaceAll(
+        "MobileWork现有browser.open_url",
+        "MobileWork工具openwork_browser_open_url，并传入url=openUrl、provider=\"builtin\"",
+      )
+      .replaceAll(
+        "MobileWork已有的browser.open_url",
+        "MobileWork工具openwork_browser_open_url，并传入url=openUrl、provider=\"builtin\"",
+      )
+      .replaceAll(
+        "MobileWork已有browser.open_url",
+        "MobileWork工具openwork_browser_open_url，并传入url=openUrl、provider=\"builtin\"",
+      )
+      .replaceAll(
+        "MobileWork内置浏览器browser.open_url",
+        "MobileWork工具openwork_browser_open_url（url=openUrl、provider=\"builtin\"）",
+      )
+      .replaceAll("browser.open_url", "openwork_browser_open_url")
+  }
+  if (Array.isArray(value)) return value.map(normalizeBrowserContract)
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, normalizeBrowserContract(entry)]),
+    )
+  }
+  return value
 }
 
-const plugin = localPlugins.find((entry) => entry.path === "drawio-runtime.js")
-if (!plugin) {
-  throw new Error("expert.json does not declare drawio-runtime.js")
+function renderToolAdapter(name) {
+  return `import { tool } from "@opencode-ai/plugin"\n\nconst coreUrl = new URL(import.meta.url)\ncoreUrl.pathname = coreUrl.pathname.replace(\n  /\\/tools\\/[^/]+$/,\n  "/skills/drawio-session-editing/scripts/drawio-runtime-core.mjs",\n)\nconst { createDrawioTool } = await import(coreUrl.href)\n\nexport default createDrawioTool(${JSON.stringify(name)}, tool)\n`
 }
 
-const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "drawio-runtime-bundle-"))
-const bundlePath = path.join(temporaryDirectory, "drawio-runtime.js")
-try {
-  const prebuiltBundle = process.env.DRAWIO_PREBUILT_BUNDLE?.trim()
-  if (prebuiltBundle) {
-    const source = path.resolve(projectDirectory, prebuiltBundle)
-    await copyFile(source, bundlePath)
-    console.log(`Using prebuilt runtime bundle ${path.relative(projectDirectory, source)}`)
-  } else {
-    const build = spawnSync(process.platform === "win32" ? "bun.cmd" : "bun", [
-      "build",
-      pluginPath,
-      "--outfile",
-      bundlePath,
-      "--target",
-      "bun",
-      "--format",
-      "esm",
-      "--external",
-      "@opencode-ai/plugin",
-      "--minify",
-    ], {
-      cwd: projectDirectory,
-      encoding: "utf8",
-      stdio: "pipe",
-      shell: process.platform === "win32",
-    })
-    if (build.stdout) process.stdout.write(build.stdout)
-    if (build.stderr) process.stderr.write(build.stderr)
-    if (build.status !== 0) {
-      throw new Error(`bun build failed with exit code ${build.status}`)
+function normalizeCommandTemplate(template) {
+  const normalized = normalizeBrowserContract(template).trim()
+  const argumentsLine = normalized.includes("$ARGUMENTS")
+    ? ""
+    : "\n\n用户要求：$ARGUMENTS"
+  const attachmentLine = normalized.includes("本次调用中可访问")
+    ? ""
+    : "\n结合本次调用中可访问的图片、Draw.io 文件或其他附件；附件不可访问时明确要求用户重新附加。"
+  return `${normalized}${argumentsLine}${attachmentLine}`
+}
+
+async function walkFiles(root) {
+  const files = []
+  async function walk(directory) {
+    const entries = await fs.readdir(directory, { withFileTypes: true })
+    for (const entry of entries) {
+      const full = path.join(directory, entry.name)
+      if (entry.isDirectory()) await walk(full)
+      else if (entry.isFile()) files.push(full)
     }
   }
-  plugin.content = (await readFile(bundlePath, "utf8"))
-    // fast-xml-parser bundles diagnostic labels containing literal parent-path
-    // tokens. Keep the security regexes intact while making the labels pass the
-    // portable expert package scanner.
-    .replaceAll("Unix path traversal: ../", "Unix path traversal: parent slash")
-    .replaceAll("Windows path traversal: ..\\\\", "Windows path traversal: parent backslash")
-    .replaceAll('".."', '"."+"."')
-  const runtimeOutput = process.env.DRAWIO_RUNTIME_OUTPUT?.trim()
-  if (runtimeOutput) {
-    const output = path.resolve(projectDirectory, runtimeOutput)
-    await writeFile(output, plugin.content, "utf8")
-    console.log(`Wrote runtime bundle ${path.relative(projectDirectory, output)}`)
-  }
-} finally {
-  await rm(temporaryDirectory, { recursive: true, force: true })
+  await walk(root)
+  return files.sort((left, right) => left.localeCompare(right, "en"))
 }
-await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8")
-console.log(`Bundled ${path.relative(projectDirectory, pluginPath)} into expert.json`)
+
+function resourceKind(content) {
+  if (content.includes(0)) return "binary"
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(content)
+    return "text"
+  } catch {
+    return "binary"
+  }
+}
+
+async function collectPackageResources(manifestDirectory) {
+  const root = path.join(manifestDirectory, ".opencode", "skills")
+  const resources = []
+  for (const skill of SKILLS) {
+    for (const file of await walkFiles(path.join(root, skill))) {
+      const content = await fs.readFile(file)
+      resources.push({
+        path: path.relative(manifestDirectory, file).replaceAll(path.sep, "/"),
+        kind: resourceKind(content),
+        sha256: createHash("sha256").update(content).digest("hex"),
+      })
+    }
+  }
+  return resources.sort((left, right) => left.path.localeCompare(right.path, "en"))
+}
+
+export async function synchronizeExpertSource({ projectDirectory, manifestDirectory }) {
+  const sourceManifestPath = path.join(projectDirectory, "expert.json")
+  const source = normalizeBrowserContract(
+    JSON.parse(await fs.readFile(sourceManifestPath, "utf8")),
+  )
+  const toolsDescriptor = JSON.parse(
+    await fs.readFile(path.join(projectDirectory, "runtime", "drawio-tools.json"), "utf8"),
+  )
+  const hooksContent = await fs.readFile(
+    path.join(projectDirectory, "runtime", "drawio-runtime-hooks.js"),
+    "utf8",
+  )
+  const projectPackage = JSON.parse(
+    await fs.readFile(path.join(projectDirectory, "package.json"), "utf8"),
+  )
+
+  const customTools = toolsDescriptor.tools.map(({ name, purpose }) => ({
+    path: `${name}.js`,
+    purpose,
+    content: renderToolAdapter(name),
+  }))
+
+  const manifest = {
+    ...source,
+    skills: SKILLS.map((name) => ({
+      name,
+      origin: "legacy-migrated",
+      edit_policy: "managed",
+    })),
+    package_resources: await collectPackageResources(manifestDirectory),
+    runtime_extensions: {
+      commands: (source.runtime_extensions?.commands ?? []).map((command) => ({
+        name: command.name,
+        description: command.description,
+        template: normalizeCommandTemplate(command.template),
+        agent: "drawio-expert",
+        subtask: true,
+      })),
+      custom_tools: customTools,
+      plugins: {
+        local: [{
+          path: "drawio-runtime-hooks.js",
+          content: hooksContent,
+        }],
+        package_json: {
+          dependencies: {
+            "@opencode-ai/plugin": projectPackage.dependencies["@opencode-ai/plugin"],
+          },
+        },
+      },
+    },
+    agent: {
+      ...source.agent,
+      mode: "all",
+      autonomy: "guided",
+      steps: 80,
+      skills: [...SKILLS],
+      custom_tools: customTools.map(({ path: toolPath }) => toolPath),
+      permission: {
+        drawio_authorize_preview: "ask",
+        drawio_authorize_annotation_change: "ask",
+      },
+      permission_reason: "预览提交和批注范围写入必须保留人工审批；其余权限按 guided 自主度派生。",
+    },
+  }
+  delete manifest.common_skills
+  delete manifest.agent.max_turns
+  delete manifest.agent.maxTurns
+  delete manifest.agent.instructions
+  delete manifest.agent.mcp
+  delete manifest.agent.references
+
+  const serialized = `${JSON.stringify(manifest, null, 2)}\n`
+  await fs.writeFile(sourceManifestPath, serialized, "utf8")
+  await fs.writeFile(path.join(manifestDirectory, "expert.json"), serialized, "utf8")
+  return manifest
+}

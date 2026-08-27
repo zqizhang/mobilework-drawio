@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
-import { DrawioExpertPlugin } from "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js"
+import { DrawioExpertPlugin } from "./load-drawio-extension.mjs"
 
 process.env.DRAWIO_EXPORT_URL ||= "http://127.0.0.1:18765/ImageExport4/export"
 process.env.DRAWIO_WEB_URL ||= "http://127.0.0.1:18080"

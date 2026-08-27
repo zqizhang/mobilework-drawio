@@ -10,7 +10,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 ## 标准流程
 
 1. 创建或修改完成后调用`drawio_finalize`，自动校验并导出同名PNG；仅打开已有文件时调用`drawio_open`。
-2. 检查返回的`shouldOpenBrowser`：仅为`true`时将`openUrl`交给MobileWork现有的`browser.open_url`打开；若`editorConnected=true`，必须保持现有编辑器，不得重新打开或刷新，以免覆盖用户尚未保存的编辑。
+2. 检查返回的`shouldOpenBrowser`：仅为`true`时调用MobileWork工具`openwork_browser_open_url`，传入`url=openUrl`、`provider="builtin"`；若`editorConnected=true`，必须保持现有编辑器，不得重新打开或刷新，以免覆盖用户尚未保存的编辑。
 3. 如果任务依赖项目内容，先读取相关工作区文件再设计或修改图表。
 4. 每次修改前立即调用`drawio_get_state`，取得最新XML和revision。
 5. 以最新XML中的图元、标签、几何和样式为起点，根据当前任务判断哪些内容需要保留、调整、删除或重构。

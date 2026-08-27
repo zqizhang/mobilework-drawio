@@ -4,11 +4,7 @@ import { createServer } from "node:http"
 import os from "node:os"
 import path from "node:path"
 import { Script } from "node:vm"
-
-const runtimeModule = process.env.DRAWIO_TEST_SOURCE === "1"
-  ? "../runtime/drawio-runtime.ts"
-  : "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js"
-const { DrawioExpertPlugin } = await import(runtimeModule)
+import { DrawioExpertPlugin } from "./load-drawio-extension.mjs"
 
 function createSseFrameReader(reader, timeoutMs = 2000) {
   const decoder = new TextDecoder()
@@ -164,7 +160,7 @@ try {
   assert.match(systemOutput.system.join("\n"), /不能只提示用户稍后继续/)
   assert.match(systemOutput.system.join("\n"), /禁止先改后问/)
   assert.match(systemOutput.system.join("\n"), /SVG、xmlsvg、html2/)
-  assert.match(systemOutput.system.join("\n"), /browser\.open_url 自动打开/)
+  assert.match(systemOutput.system.join("\n"), /openwork_browser_open_url/)
   const generalAgentSystemOutput = { system: ["You are a general coding agent."] }
   await plugin["experimental.chat.system.transform"]({}, generalAgentSystemOutput)
   assert.deepEqual(generalAgentSystemOutput.system, ["You are a general coding agent."])
@@ -510,7 +506,7 @@ try {
   assert.match(finalize.openUrl, /\/editor\?/)
   assert.equal(finalize.editorConnected, true)
   assert.equal(finalize.shouldOpenBrowser, false)
-  assert.match(finalize.browserAction, /Do not call browser\.open_url/)
+  assert.match(finalize.browserAction, /Do not call openwork_browser_open_url/)
   await eventsResponse.body.cancel()
 
   const health = JSON.parse(await plugin.tool.drawio_health_check.execute({ deep: true }, context))
@@ -1722,7 +1718,7 @@ try {
   }, unicodeContext))
   assert.equal(svgEditorRequired.status, "editor_required")
   assert.match(svgEditorRequired.openUrl, /\/editor\?/)
-  assert.match(svgEditorRequired.browserAction, /browser\.open_url/)
+  assert.match(svgEditorRequired.browserAction, /openwork_browser_open_url/)
   assert.equal(
     exportRequests.slice(editorExportRequestStart).every((request) => request.format === "png"),
     true,

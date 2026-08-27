@@ -6,7 +6,7 @@ import os from "node:os"
 import path from "node:path"
 import vm from "node:vm"
 
-import { DrawioExpertPlugin } from "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js"
+import { DrawioExpertPlugin } from "./load-drawio-extension.mjs"
 
 const DRAWIO_ENVIRONMENT_KEYS = [
   "DRAWIO_WEB_URL",

@@ -1,12 +1,12 @@
 ---
 name: drawio-skill
-version: 3.0.0
 description: 当用户需要生成图表、流程图、架构图、ER图、UML/序列/类图、SysML/MBSE图（块定义、内部块、需求、参数）、BPMN业务流程图、泳道/跨职能流程图、网络拓扑、Terraform或Kubernetes基础设施图、ML/DL模型图（Transformer/CNN/LSTM）、思维导图等可视化内容时使用。也应在解释含有3个以上组件、复杂数据流或适合可视化的系统关系时主动使用。适用于需要自定义样式、丰富形状词汇、泳道或导出PNG/JPEG/PDF/xmlpng/SVG/xmlsvg/html2的场景。生成.drawio XML；位图和PDF通过Docker Export Server导出，SVG、可编辑SVG和HTML通过自动打开的内置浏览器与Bridge导出。
 license: MIT
-homepage: https://github.com/Agents365-ai/drawio-skill
 compatibility: 核心创建、校验、质量检查、Docker HTTP导出和内置浏览器协同由专家包内OpenCode TypeScript插件提供，用户无需安装Python、uv、npm或Draw.io Desktop。可选高级脚本需要Python，autolayout.py还需要Graphviz（dot）；缺少时不得作为默认主流程。
-platforms: [macos, linux, windows]
-metadata: {"openclaw":{"emoji":"📐","os":["darwin","linux","win32"]},"hermes":{"tags":["drawio","diagram","flowchart","architecture","visualization","uml"],"category":"design","related_skills":["mermaid","excalidraw","plantuml"]},"author":"Agents365-ai (MCP adaptation by wujingming)","version":"3.0.0"}
+metadata:
+  author: "Agents365-ai (MCP adaptation by wujingming)"
+  source: "https://github.com/Agents365-ai/drawio-skill"
+  source-version: "3.0.0"
 ---
 
 # Draw.io 图表生成与导出
@@ -175,7 +175,7 @@ drawio_export(
 - 每次迭代覆盖同一预览PNG（`overwrite=true`）
 - 每轮修改后重新`drawio_validate`→`drawio_export`预览
 - 循环直到用户说通过/完成/LGTM
-- **安全阀：** 最多5轮；每轮任务结束仍必须调用`drawio_finalize`。仅当返回`shouldOpenBrowser=true`时用MobileWork现有`browser.open_url`打开；已有编辑器连接时保持原页面，让用户继续微调。之后必须按revision重新读取与合并。
+- **安全阀：** 最多5轮；每轮任务结束仍必须调用`drawio_finalize`。仅当返回`shouldOpenBrowser=true`时调用MobileWork工具`openwork_browser_open_url`，传入`url=openUrl`、`provider="builtin"`；已有编辑器连接时保持原页面，让用户继续微调。之后必须按revision重新读取与合并。
 
 ### 步骤6 —— 自动收尾、PNG导出和内置浏览器
 
@@ -185,7 +185,7 @@ drawio_export(
 drawio_finalize(file="<工作区相对路径>/<名称>.drawio")
 ```
 
-该工具会读取最新revision、校验、评分、覆盖更新同名PNG并返回`openUrl`与`shouldOpenBrowser`。仅当`shouldOpenBrowser=true`时调用MobileWork现有`browser.open_url`；若`editorConnected=true`，不得重新打开或刷新现有编辑器。Agent更新只提示新revision并保留用户当前画布，用户保存时再进行三方合并或冲突处理。
+该工具会读取最新revision、校验、评分、覆盖更新同名PNG并返回`openUrl`与`shouldOpenBrowser`。仅当`shouldOpenBrowser=true`时调用MobileWork工具`openwork_browser_open_url`，传入`url=openUrl`、`provider="builtin"`；若`editorConnected=true`，不得重新打开或刷新现有编辑器。Agent更新只提示新revision并保留用户当前画布，用户保存时再进行三方合并或冲突处理。
 
 用户另外指定JPEG、PDF、输出目录或高分辨率PNG时，再补充调用`drawio_export`：
 
@@ -220,7 +220,7 @@ drawio_export(
 
 - 如用户未指定格式，`drawio_finalize`默认导出同名PNG。
 - 报告`.drawio`源文件和导出图像的文件路径。
-- 仅当`drawio_finalize`返回`shouldOpenBrowser=true`时使用MobileWork已有的`browser.open_url`打开地址；已有编辑器连接时禁止重复打开。
+- 仅当`drawio_finalize`返回`shouldOpenBrowser=true`时调用MobileWork工具`openwork_browser_open_url`，传入`url=openUrl`、`provider="builtin"`；已有编辑器连接时禁止重复打开。
 
 ## TypeScript运行时工具参考
 
@@ -246,7 +246,7 @@ drawio_export(
 **预览建议：** `format="png"`，输出到`preview/`或临时目录，`overwrite=true`。
 **最终文件建议：** `overwrite=false`（默认），未经用户允许不得覆盖已有文件。
 
-**SVG/HTML导出流程（编辑器通道）：** 若编辑器页面未打开，工具返回`status="editor_required"`及`openUrl`。Agent必须立即用MobileWork内置浏览器`browser.open_url`自动打开`openUrl`，等待编辑器连接后以相同参数重试`drawio_export`，由Bridge接收编辑器产物并写入工作区；不得把`editor_required`解释为格式不支持，也不应让用户手工执行菜单导出。指定`page_id`时，Bridge使用隐藏的导出专用编辑器加载冻结XML，不切换用户可见页面；`all_pages=true`时SVG/xmlsvg返回逐页文件，html2返回一个多页HTML文件。
+**SVG/HTML导出流程（编辑器通道）：** 若编辑器页面未打开，工具返回`status="editor_required"`及`openUrl`。Agent必须立即调用MobileWork工具`openwork_browser_open_url`，传入`url=openUrl`、`provider="builtin"`，等待编辑器连接后以相同参数重试`drawio_export`，由Bridge接收编辑器产物并写入工作区；不得把`editor_required`解释为格式不支持，也不应让用户手工执行菜单导出。指定`page_id`时，Bridge使用隐藏的导出专用编辑器加载冻结XML，不切换用户可见页面；`all_pages=true`时SVG/xmlsvg返回逐页文件，html2返回一个多页HTML文件。
 
 **禁止错误降级：** 用户请求SVG或xmlsvg的`all_pages=true`时，必须直接调用`drawio_export`并使用返回的`outputs[]`；不得声称运行时不支持，也不得在未调用工具时改成逐个`page_id`导出。只有工具真实返回错误时才能报告失败，`editor_required`应按上述自动打开与重试流程处理。
 
@@ -339,7 +339,7 @@ PNG导出统一调用专家提供的`drawio_export`或`drawio_finalize`工具，
 ### 内置浏览器编辑
 
 生成或修改完成时调用`drawio_finalize(file="<工作区相对路径>")`；仅在返回`shouldOpenBrowser=true`时使用MobileWork已有的
-`browser.open_url`打开返回的`openUrl`。已有编辑器连接时保持现有页面。仅打开现有文件且不需要导出时可调用`drawio_open`。
+调用`openwork_browser_open_url`并传入`url=openUrl`、`provider="builtin"`打开返回的地址。已有编辑器连接时保持现有页面。仅打开现有文件且不需要导出时可调用`drawio_open`。
 浏览器保存会增加revision；Agent写入前必须立即调用`drawio_get_state`，只在最新XML上修改，
 并携带该次读取返回的准确`base_revision`。不允许由工具自动补齐revision。
 

@@ -104,4 +104,4 @@ The skill runs both directions — these turn a `.drawio` back into something el
 - **`restyle.py`** — apply a style preset (user or built-in, e.g. `dark`) to an existing `.drawio`: palette remap by hue, font, dark-theme extras, page background. Layout, shapes, and edge routing stay put.
 - **`validate.py`** — deterministic structural lint (dangling edges, dup/reserved ids, overlaps; `--score` for layout readability). Run before exporting.
 - PNG export is owned by the bundled TypeScript `drawio_export` / `drawio_finalize` tools, not by a Python helper.
-- For interactive editing, use `drawio_open` and MobileWork's existing `browser.open_url` action.
+- For interactive editing, use `drawio_open`, then call `openwork_browser_open_url` with `url=openUrl` and `provider="builtin"` only when `shouldOpenBrowser=true`.

@@ -2,8 +2,15 @@
   "name": "drawio-expert-integrated-build",
   "private": true,
   "type": "module",
+  "scripts": {
+    "build": "node scripts/build-expert.mjs",
+    "test:source": "node tests/run-source-integration.mjs",
+    "test:generated": "node tests/integrated.integration.mjs",
+    "test:history": "node tests/integrated-history.integration.mjs && node tests/integrated-history-fixes.integration.mjs",
+    "test:package": "node tests/workspace-package.integration.mjs"
+  },
   "dependencies": {
-    "@opencode-ai/plugin": "1.18.12",
+    "@opencode-ai/plugin": "1.16.2",
     "fast-xml-parser": "5.10.1",
     "pako": "2.2.0"
   }

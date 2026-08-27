@@ -1,39 +1,60 @@
 {
+  "$schema": "https://opencode.ai/config.json",
   "agent": {
     "drawio-expert": {
-      "mode": "primary",
-      "description": "理解复杂绘图需求，选择合适的Draw.io创作方法，执行可恢复的增量修改，通过Docker Export Server或内置浏览器Bridge完成图像导出，并在内置浏览器保存的最新版本上继续编辑。",
+      "mode": "all",
+      "description": "理解复杂绘图需求，选择合适的Draw.io创作方法，执行可恢复的增量修改，通过Docker Export Server或内置浏览器Bridge完成图像导出，并在内置浏览器保存的最新版本上继续编辑。 当用户需要以下能力时使用：用户要求创建流程图、架构图、ER图、UML、BPMN、SysML、网络拓扑、基础设施图或其他Draw.io图表。；用户要求解释、审查、比较、修复或增量修改现有.drawio文件。；用户要求导出Draw.io为PNG、JPEG、PDF、可编辑PNG、SVG、可编辑SVG或HTML。",
+      "steps": 80,
       "permission": {
-        "read": "allow",
+        "*": "ask",
+        "read": {
+          "*": "allow",
+          ".env": "deny",
+          ".env.*": "deny",
+          ".env.example": "allow"
+        },
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "lsp": "allow",
         "edit": "allow",
         "bash": {
-          "*": "deny",
-          "git status*": "allow",
-          "git diff*": "allow",
-          "python .opencode/skills/drawio-skill/scripts/*": "allow",
-          "python3 .opencode/skills/drawio-skill/scripts/*": "allow"
+          "*": "ask"
         },
-        "webfetch": "ask",
+        "webfetch": "allow",
+        "external_directory": {
+          "*": "ask"
+        },
+        "doom_loop": "ask",
         "skill": {
-          "*": "deny",
-          "drawio-expert-common": "allow",
-          "drawio-expert-drawio-expert": "allow",
+          "*": "ask",
           "drawio-skill": "allow",
           "drawio-session-editing": "allow"
         },
         "task": {
           "*": "deny"
         },
-        "question": "allow",
         "drawio_authorize_annotation_change": "ask",
-        "drawio_authorize_preview": "ask"
+        "drawio_authorize_preview": "ask",
+        "drawio_compare": "allow",
+        "drawio_create": "allow",
+        "drawio_export": "allow",
+        "drawio_finalize": "allow",
+        "drawio_get_annotation": "allow",
+        "drawio_get_state": "allow",
+        "drawio_health_check": "allow",
+        "drawio_inspect": "allow",
+        "drawio_list_annotations": "allow",
+        "drawio_open": "allow",
+        "drawio_patch": "allow",
+        "drawio_polish": "allow",
+        "drawio_preview_state": "allow",
+        "drawio_quality": "allow",
+        "drawio_resolve_annotation": "allow",
+        "drawio_update_state": "allow",
+        "drawio_validate": "allow",
+        "todowrite": "allow"
       }
-    }
-  },
-  "references": {
-    "drawio-intranet": {
-      "path": "references/drawio-intranet.md",
-      "description": "内置浏览器、文件Bridge和revision冲突处理说明"
     }
   }
 }

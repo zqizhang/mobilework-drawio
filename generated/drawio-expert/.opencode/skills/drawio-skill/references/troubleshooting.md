@@ -18,7 +18,7 @@
 | XML validation fails | Repair root structure, duplicate IDs, missing parents, and dangling source/target references. |
 | Shapes overlap | Run `drawio_quality`, preview `drawio_polish` with `dry_run=true`, then accept only a passing and reasonable diff. |
 | Edges cross nodes | Add waypoints, increase spacing, or use `edgeports.py`; do not claim the HTTP exporter performs routing. |
-| Iteration exceeds five rounds | Call `drawio_open`, open its URL with MobileWork's existing `browser.open_url`, then use the revision read-merge-retry protocol. |
+| Iteration exceeds five rounds | Call `drawio_open`, then call `openwork_browser_open_url` with `url=openUrl` and `provider="builtin"` only when `shouldOpenBrowser=true`; use the revision read-merge-retry protocol. |
 
 ## Browser session
 

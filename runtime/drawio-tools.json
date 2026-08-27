@@ -1,0 +1,25 @@
+{
+  "runtime_core": ".opencode/skills/drawio-session-editing/scripts/drawio-runtime-core.mjs",
+  "hooks_plugin": ".opencode/plugins/drawio-runtime-hooks.js",
+  "tools": [
+    { "name": "drawio_validate", "purpose": "校验Draw.io文件结构并返回页面、节点、连线、错误和警告。" },
+    { "name": "drawio_export", "purpose": "通过Docker或浏览器Bridge导出七种目标格式。" },
+    { "name": "drawio_health_check", "purpose": "检查导出服务、浏览器Bridge和运行配置是否可用。" },
+    { "name": "drawio_create", "purpose": "根据结构化节点和连线创建新的Draw.io文件。" },
+    { "name": "drawio_inspect", "purpose": "读取图表页面、图元、稳定ID、几何和结构信息。" },
+    { "name": "drawio_quality", "purpose": "计算布局、重叠、连线和标签等质量评分。" },
+    { "name": "drawio_patch", "purpose": "基于稳定ID和revision执行可预览的增量修改。" },
+    { "name": "drawio_polish", "purpose": "对布局、路由和样式执行带质量门禁的自动优化。" },
+    { "name": "drawio_compare", "purpose": "比较两个Draw.io版本并返回稳定ID差异。" },
+    { "name": "drawio_get_state", "purpose": "读取当前绑定文件的最新XML、revision和人工修改状态。" },
+    { "name": "drawio_preview_state", "purpose": "将完整XML候选显示为同画布预览并生成候选哈希。" },
+    { "name": "drawio_update_state", "purpose": "提交经过审批且哈希匹配的完整XML候选。" },
+    { "name": "drawio_open", "purpose": "绑定当前会话、文件和浏览器Bridge。" },
+    { "name": "drawio_finalize", "purpose": "完成校验、评分、PNG导出和浏览器绑定。" },
+    { "name": "drawio_list_annotations", "purpose": "列出图表文件持久化的注释任务。" },
+    { "name": "drawio_get_annotation", "purpose": "读取单条注释、范围、稳定ID和新鲜度。" },
+    { "name": "drawio_authorize_preview", "purpose": "请求普通候选预览审批并提交获批候选。" },
+    { "name": "drawio_authorize_annotation_change", "purpose": "请求注释范围审批并生成一次性写入token。" },
+    { "name": "drawio_resolve_annotation", "purpose": "在写入完成后更新注释终态和结果摘要。" }
+  ]
+}
