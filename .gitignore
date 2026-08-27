@@ -42,3 +42,6 @@ Desktop.ini
 
 # Local planning notes
 todo.md
+
+# Trusted-source git repo created by mobilework-expert-manager inside the generated package
+generated/drawio-expert/.git/

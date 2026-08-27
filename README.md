@@ -307,7 +307,7 @@ mobilework-drawio/
 
 ## 能力边界
 
-- 导出格式：PNG、JPEG、PDF、可编辑PNG（`xmlpng`，Docker Export Server 通道）；SVG、可编辑SVG（`xmlsvg`）、HTML（`html2`，内置浏览器编辑器页面渲染）。编辑器未连接时工具返回 `editor_required` 与 `openUrl`，Agent应立即经 `browser.open_url`自动打开内置浏览器，等待Bridge连接后重试相同导出，不要求用户手工操作导出菜单。
+- 导出格式：PNG、JPEG、PDF、可编辑PNG（`xmlpng`，Docker Export Server 通道）；SVG、可编辑SVG（`xmlsvg`）、HTML（`html2`，内置浏览器编辑器页面渲染）。编辑器未连接时工具返回 `editor_required` 与 `openUrl`，Agent应立即调用 `openwork_browser_open_url`，以 `url=openUrl`、`provider="builtin"` 自动打开内置浏览器，等待Bridge连接后重试相同导出，不要求用户手工操作导出菜单。
 - 页面导出：七种格式都支持按稳定`page_id`导出。PNG、JPEG、xmlpng、SVG和xmlsvg在`all_pages=true`时逐页生成独立文件并返回`outputs[]`；PDF和html2各生成一个包含全部页面的文件。编辑器通道的指定页导出使用隐藏导出页面，不切换用户正在编辑的可见页面；返回的`page_count`必须与源图页面数一致。
 - 不调用 Draw.io Desktop，也不依赖 `rlespinasse/drawio-export`；推荐运行时依赖官方 Compose 中的 `jgraph/drawio` 与 `jgraph/export-server`。
 - Skills 中的数据提取、Graphviz 自动布局等高级脚本是可选能力；只有使用这些脚本时才需要 Python 或相应第三方工具。

@@ -7,8 +7,9 @@ import { Script } from "node:vm"
 
 const runtimeModule = process.env.DRAWIO_TEST_SOURCE === "1"
   ? "../runtime/drawio-runtime.ts"
-  : "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js"
-const { DrawioExpertPlugin } = await import(runtimeModule)
+  : "../generated/drawio-expert/.opencode/skills/drawio-expert-common/scripts/drawio-runtime-core.mjs"
+const runtime = await import(runtimeModule)
+const { tool } = await import("@opencode-ai/plugin")
 
 function createSseFrameReader(reader, timeoutMs = 2000) {
   const decoder = new TextDecoder()
@@ -140,7 +141,8 @@ const context = {
 }
 
 try {
-  const plugin = await DrawioExpertPlugin({ directory: workspace })
+  await runtime.initializeDrawioWorkspace(workspace)
+  const plugin = { tool: runtime.createDrawioToolset(tool) }
   assert.equal(process.env.DRAWIO_WEB_URL, "http://127.0.0.1:18080")
   assert.equal(process.env.DRAWIO_UNRELATED_VALUE, undefined)
   assert.equal(typeof plugin.tool.drawio_export.execute, "function")
@@ -150,8 +152,12 @@ try {
   assert.equal(typeof plugin.tool.drawio_authorize_annotation_change.execute, "function")
   assert.equal(typeof plugin.tool.drawio_authorize_preview.execute, "function")
   assert.equal(typeof plugin.tool.drawio_preview_state.execute, "function")
-  const systemOutput = { system: [] }
-  await plugin["experimental.chat.system.transform"]({}, systemOutput)
+  const generatedAgentPrompt = await fs.readFile(
+    path.resolve("generated/drawio-expert/.opencode/agents/drawio-expert.md"),
+    "utf8",
+  )
+  const systemOutput = { system: [generatedAgentPrompt] }
+  assert.equal(runtime.applyDrawioSystemGuidance(systemOutput), true)
   assert.match(systemOutput.system.join("\n"), /人工编辑不是只读内容/)
   assert.match(systemOutput.system.join("\n"), /最新 XML 作为修改基线/)
   assert.match(systemOutput.system.join("\n"), /freshness=stale/)
@@ -160,13 +166,60 @@ try {
   assert.match(systemOutput.system.join("\n"), /不能只提示用户稍后继续/)
   assert.match(systemOutput.system.join("\n"), /禁止先改后问/)
   assert.match(systemOutput.system.join("\n"), /SVG、xmlsvg、html2/)
-  assert.match(systemOutput.system.join("\n"), /browser\.open_url 自动打开/)
-  const generatedAgentPrompt = await fs.readFile(
-    path.resolve("generated/drawio-expert/.opencode/agents/drawio-expert.md"),
-    "utf8",
-  )
+  assert.match(systemOutput.system.join("\n"), /openwork_browser_open_url/)
+  assert.match(systemOutput.system.join("\n"), /每次新的用户轮次/)
+  assert.match(systemOutput.system.join("\n"), /drawio_list_annotations\(file=当前文件, status="all"\)/)
+  assert.match(systemOutput.system.join("\n"), /禁止复用旧 preview_id、approval_token/)
+  assert.doesNotMatch(systemOutput.system.join("\n"), /\bbrowser\.open_url\b/)
+  const generalAgentSystemOutput = { system: ["You are a general coding agent."] }
+  assert.equal(runtime.applyDrawioSystemGuidance(generalAgentSystemOutput), false)
+  assert.deepEqual(generalAgentSystemOutput.system, ["You are a general coding agent."])
+
+  const auxiliarySystemOutput = { system: ["Generate a short title for this session."] }
+  assert.equal(runtime.applyDrawioSystemGuidance(auxiliarySystemOutput), false)
+  assert.deepEqual(auxiliarySystemOutput.system, ["Generate a short title for this session."])
+
   assert.match(generatedAgentPrompt, /禁止声称运行时不支持/)
   assert.match(generatedAgentPrompt, /逐个page_id/)
+  assert.match(generatedAgentPrompt, /openwork_browser_open_url/)
+  assert.match(generatedAgentPrompt, /每次新的用户轮次只要涉及已绑定图表/)
+  assert.match(generatedAgentPrompt, /drawio_list_annotations\(file=当前文件,status="all"\)/)
+  assert.match(generatedAgentPrompt, /本轮未加载drawio-skill或drawio-session-editing/)
+  const generatedRoleSkill = await fs.readFile(
+    path.resolve("generated/drawio-expert/.opencode/skills/drawio-expert-drawio-expert/SKILL.md"),
+    "utf8",
+  )
+  assert.match(generatedRoleSkill, /## 每轮同步检查/)
+  assert.match(generatedRoleSkill, /drawio_list_annotations\(file=当前文件, status="all"\)/)
+  const generatedCommonSkill = await fs.readFile(
+    path.resolve("generated/drawio-expert/.opencode/skills/drawio-expert-common/SKILL.md"),
+    "utf8",
+  )
+  assert.match(generatedCommonSkill, /禁止复用上一轮缓存/)
+  const generatedOpenCodeConfig = JSON.parse(await fs.readFile(
+    path.resolve("generated/drawio-expert/opencode.json"),
+    "utf8",
+  ))
+  assert.equal(
+    generatedOpenCodeConfig.agent["drawio-expert"].permission.drawio_authorize_annotation_change,
+    "ask",
+  )
+  assert.equal(
+    generatedOpenCodeConfig.agent["drawio-expert"].permission.drawio_authorize_preview,
+    "ask",
+  )
+  assert.equal(
+    generatedOpenCodeConfig.agent["drawio-expert"].permission.drawio_open,
+    "allow",
+  )
+  assert.equal(
+    generatedOpenCodeConfig.agent["drawio-expert"].mode,
+    "all",
+  )
+  assert.equal(
+    generatedOpenCodeConfig.agent["drawio-expert"].steps,
+    80,
+  )
   const createResult = JSON.parse(await plugin.tool.drawio_create.execute({
     file: "architecture.drawio",
     title: "Integrated test",
@@ -255,10 +308,27 @@ try {
   assert.match(editorPage, /允许修改整个图表/)
   assert.match(editorPage, /所有页面、节点、连线和布局/)
   assert.match(editorPage, /Agent 修改预览/)
-  assert.match(editorPage, /id="patch-preview-exit"/)
+  assert.match(editorPage, /class="preview-overview"/)
+  assert.match(editorPage, /class="preview-actions"/)
+  assert.match(editorPage, /class="preview-meta"/)
+  assert.match(editorPage, /class="segmented" role="group"/)
+  assert.match(editorPage, /grid-template-areas: "overview actions" "meta meta"/)
+  assert.match(editorPage, /@media \(max-width: 760px\)/)
+  assert.match(editorPage, /white-space: nowrap/)
+  assert.match(editorPage, /top: calc\(100% \+ 8px\)/)
+  assert.match(editorPage, /项变化 · 基于版本/)
   assert.match(editorPage, /id="patch-preview-before"/)
   assert.match(editorPage, /id="patch-preview-after"/)
+  assert.match(editorPage, /id="patch-preview-compare"/)
+  assert.match(editorPage, /id="patch-preview-details-toggle"/)
+  assert.match(editorPage, /id="patch-preview-details-close"/)
+  assert.match(editorPage, /id="patch-preview-cancel"/)
+  assert.match(editorPage, /取消修改/)
+  assert.doesNotMatch(editorPage, /id="patch-preview-exit"/)
   assert.match(editorPage, /id="patch-preview-details"/)
+  assert.match(editorPage, /setPatchPreviewDetailsExpanded\(!patchPreviewDetailsExpanded\)/)
+  assert.match(editorPage, /view === "after"[\s\S]*activePatchPreview\.candidateXml/)
+  assert.match(editorPage, /view === "compare"[\s\S]*activePatchPreview\.comparePreviewXml/)
   assert.match(editorPage, /const cancelUrl = new URL\(CONFIG\.patchPreviewUrl\)/)
   assert.doesNotMatch(editorPage, /CONFIG\.patchPreviewUrl \+ "\/"/)
   assert.match(editorPage, /id="history-btn"/, "editor page must include the history entry")
@@ -294,8 +364,8 @@ try {
     }, context),
     /base_revision is required/,
   )
-  await assert.rejects(
-    plugin["tool.execute.before"](
+  assert.throws(
+    () => runtime.enforceDrawioWriteGuard(
       { tool: "write", sessionID: context.sessionID, callID: "write-call" },
       { args: { filePath: "architecture.drawio", content: XML } },
     ),
@@ -485,7 +555,7 @@ try {
   assert.match(finalize.openUrl, /\/editor\?/)
   assert.equal(finalize.editorConnected, true)
   assert.equal(finalize.shouldOpenBrowser, false)
-  assert.match(finalize.browserAction, /Do not call browser\.open_url/)
+  assert.match(finalize.browserAction, /Do not call openwork_browser_open_url/)
   await eventsResponse.body.cancel()
 
   const health = JSON.parse(await plugin.tool.drawio_health_check.execute({ deep: true }, context))
@@ -815,6 +885,9 @@ try {
   const styleVisiblePreview = await fetch(previewUrl).then((response) => response.json())
   assert.equal(typeof styleVisiblePreview.preview.beforePreviewXml, "string")
   assert.equal(typeof styleVisiblePreview.preview.afterPreviewXml, "string")
+  assert.equal(styleVisiblePreview.preview.afterPreviewXml, styleVisiblePreview.preview.candidateXml)
+  assert.notEqual(styleVisiblePreview.preview.comparePreviewXml, styleVisiblePreview.preview.candidateXml)
+  assert.equal(styleVisiblePreview.preview.xml, styleVisiblePreview.preview.comparePreviewXml)
   const candidateEdgeTag = styleVisiblePreview.preview.afterPreviewXml
     .match(/<mxCell[^>]*id="preview-edge"[^>]*>/)?.[0]
   assert.match(candidateEdgeTag, /strokeColor=#7c3aed/)
@@ -835,6 +908,8 @@ try {
   const fullXmlVisiblePreview = await fetch(previewUrl).then((response) => response.json())
   assert.doesNotMatch(fullXmlVisiblePreview.preview.beforePreviewXml, /background="#ddeeff"/)
   assert.match(fullXmlVisiblePreview.preview.afterPreviewXml, /background="#ddeeff"/)
+  assert.equal(fullXmlVisiblePreview.preview.afterPreviewXml, fullXmlVisiblePreview.preview.candidateXml)
+  assert.equal(fullXmlVisiblePreview.preview.xml, fullXmlVisiblePreview.preview.comparePreviewXml)
   const undecoratedPreviewSave = await fetch(apiUrl, {
     method: "PUT",
     headers: { "content-type": "application/json" },
@@ -1484,6 +1559,8 @@ try {
   }, context))
   assert.equal(otherOpen.editorConnected, false)
   assert.equal(otherOpen.shouldOpenBrowser, true)
+  assert.match(otherOpen.browserAction, /openwork_browser_open_url/)
+  assert.match(otherOpen.browserAction, /provider=builtin/)
 
   // An editor URL is permanently bound to its diagram. After the same
   // OpenCode session switches files, the old page must not read or write the
@@ -1670,7 +1747,8 @@ try {
   }, unicodeContext))
   assert.equal(svgEditorRequired.status, "editor_required")
   assert.match(svgEditorRequired.openUrl, /\/editor\?/)
-  assert.match(svgEditorRequired.browserAction, /browser\.open_url/)
+  assert.match(svgEditorRequired.browserAction, /openwork_browser_open_url/)
+  assert.match(svgEditorRequired.browserAction, /provider=builtin/)
   assert.equal(
     exportRequests.slice(editorExportRequestStart).every((request) => request.format === "png"),
     true,

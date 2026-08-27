@@ -5,7 +5,8 @@ import { createServer } from "node:http"
 import os from "node:os"
 import path from "node:path"
 
-import { DrawioExpertPlugin } from "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js"
+import { createDrawioToolset, initializeDrawioWorkspace } from "../generated/drawio-expert/.opencode/skills/drawio-expert-common/scripts/drawio-runtime-core.mjs"
+import { tool } from "@opencode-ai/plugin"
 
 const DRAWIO_ENVIRONMENT_KEYS = [
   "DRAWIO_WEB_URL",
@@ -92,7 +93,8 @@ async function restoreVersion(openResult, snapshotId, baseRevision, clientId = "
 }
 
 try {
-  const plugin = await DrawioExpertPlugin({ directory: workspace })
+  await initializeDrawioWorkspace(workspace)
+  const plugin = { tool: createDrawioToolset(tool) }
   await fs.writeFile(path.join(workspace, "architecture.drawio"), BASE_XML, "utf8")
   const openResult = JSON.parse(await plugin.tool.drawio_open.execute({
     file: "architecture.drawio",

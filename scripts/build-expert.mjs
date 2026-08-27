@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process"
+import { existsSync } from "node:fs"
 import { promises as fs } from "node:fs"
-import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -9,13 +9,6 @@ const projectDirectory = path.resolve(scriptDirectory, "..")
 const manifestPath = path.join(projectDirectory, "expert.json")
 const outputRoot = path.join(projectDirectory, "generated")
 const packageDirectory = path.join(outputRoot, "drawio-expert")
-const managerScripts = path.join(
-  os.homedir(),
-  ".agents",
-  "skills",
-  "mobilework-expert-manager",
-  "scripts",
-)
 
 function run(command, args, cwd = projectDirectory) {
   const result = spawnSync(command, args, {
@@ -31,9 +24,34 @@ function run(command, args, cwd = projectDirectory) {
   }
 }
 
-async function copyDirectory(source, target, filter = () => true) {
-  await fs.rm(target, { recursive: true, force: true })
-  await fs.cp(source, target, { recursive: true, filter })
+// The manager must come from the current MobileWork source tree. The legacy
+// ~/.agents installation is intentionally not used.
+function resolveManagerScripts() {
+  const candidates = []
+  const fromEnv = process.env.MOBILEWORK_SOURCE_DIR?.trim()
+  if (fromEnv) candidates.push(path.resolve(fromEnv))
+  const sibling = path.resolve(projectDirectory, "..", "mobilework-project")
+  candidates.push(sibling)
+
+  for (const sourceDir of candidates) {
+    const managerScripts = path.join(
+      sourceDir,
+      "apps",
+      "desktop",
+      "resources",
+      "presets",
+      "skills",
+      "mobilework-expert-manager",
+      "scripts",
+    )
+    if (existsSync(path.join(managerScripts, "create_expert.py"))) {
+      return managerScripts
+    }
+  }
+  throw new Error(
+    "mobilework-expert-manager scripts not found; set MOBILEWORK_SOURCE_DIR or place "
+    + "mobilework-project next to this repository",
+  )
 }
 
 async function readFiles(root, predicate) {
@@ -114,37 +132,85 @@ async function verifyNoCaches(root) {
   if (failures.length) throw new Error(`Generated package contains caches:\n${failures.join("\n")}`)
 }
 
+async function verifyGeneratedRuntime() {
+  const manifest = JSON.parse(await fs.readFile(path.join(packageDirectory, "expert.json"), "utf8"))
+  const tools = JSON.parse(await fs.readFile(path.join(projectDirectory, "runtime", "drawio-tools.json"), "utf8")).tools
+  const toolsDirectory = path.join(packageDirectory, ".opencode", "tools")
+
+  const declared = manifest.runtime_extensions.custom_tools.map(item => item.path)
+  const expected = tools.map(item => item.path)
+  if (declared.length !== expected.length || declared.some((value, index) => value !== expected[index])) {
+    throw new Error("generated expert.json custom tools drifted from runtime/drawio-tools.json")
+  }
+  for (const item of manifest.runtime_extensions.custom_tools) {
+    const target = path.join(toolsDirectory, ...item.path.split("/"))
+    const content = await fs.readFile(target, "utf8")
+    if (content !== item.content) {
+      throw new Error(`generated adapter does not match manifest content: ${item.path}`)
+    }
+    if (!content.includes(`createDrawioTool("${path.basename(item.path, ".js")}", tool)`)) {
+      throw new Error(`generated adapter does not reference its tool name: ${item.path}`)
+    }
+  }
+  const adapters = (await fs.readdir(toolsDirectory)).filter(name => name.endsWith(".js"))
+  if (adapters.length !== tools.length) {
+    throw new Error(`expected ${tools.length} adapters in .opencode/tools, found ${adapters.length}`)
+  }
+
+  const hooksPlugin = manifest.runtime_extensions.plugins.local[0]
+  const hooksTarget = path.join(packageDirectory, ".opencode", "plugins", hooksPlugin.path)
+  if ((await fs.readFile(hooksTarget, "utf8")) !== hooksPlugin.content) {
+    throw new Error("generated hook plugin does not match manifest content")
+  }
+  if (/drawio_validate|createDrawioToolset/.test(hooksPlugin.content)) {
+    throw new Error("hook plugin must not register drawio_* tools")
+  }
+
+  const coreName = path.basename(
+    JSON.parse(await fs.readFile(path.join(projectDirectory, "runtime", "drawio-tools.json"), "utf8")).runtime_core,
+  )
+  const coreTarget = path.join(
+    packageDirectory,
+    ".opencode",
+    "skills",
+    "drawio-expert-common",
+    "scripts",
+    coreName,
+  )
+  const cores = await readFiles(packageDirectory, file => path.basename(file) === coreName)
+  if (cores.length !== 1 || cores[0] !== coreTarget) {
+    throw new Error(
+      `the shared runtime core must exist exactly once at ${path.relative(packageDirectory, coreTarget)}; found: ${cores.map(file => path.relative(packageDirectory, file)).join(", ") || "none"}`,
+    )
+  }
+  const coreContent = await fs.readFile(coreTarget, "utf8")
+  if (/from\s*["']@opencode-ai/.test(coreContent)) {
+    throw new Error("shared runtime core must not contain runtime @opencode-ai imports")
+  }
+}
+
+const managerScripts = resolveManagerScripts()
+
 run(process.platform === "win32" ? "bun.cmd" : "bun", ["install", "--frozen-lockfile"])
 run("node", [path.join(scriptDirectory, "sync-expert-source.mjs")])
 run("python", [
   path.join(managerScripts, "create_expert.py"),
   "--manifest",
   manifestPath,
+  "--creation-target",
+  "custom",
   "--output-dir",
   outputRoot,
   "--force",
 ])
 
-for (const skill of ["drawio-skill", "drawio-session-editing"]) {
-  await copyDirectory(
-    path.join(projectDirectory, "skill-sources", skill),
-    path.join(packageDirectory, ".opencode", "skills", skill),
-    source => !["__pycache__", ".pytest_cache", ".venv"].includes(path.basename(source))
-      && !source.endsWith(".pyc"),
-  )
-}
-
-await fs.copyFile(
-  path.join(projectDirectory, ".env.example"),
-  path.join(packageDirectory, ".env.example"),
-)
-
-for (const skill of ["drawio-skill", "drawio-session-editing"]) {
-  await verifySkill(path.join(packageDirectory, ".opencode", "skills", skill))
+for (const skill of await fs.readdir(path.join(packageDirectory, ".opencode", "skills"), { withFileTypes: true })) {
+  if (skill.isDirectory()) await verifySkill(path.join(packageDirectory, ".opencode", "skills", skill.name))
 }
 await verifyMarkdownLinks(path.join(packageDirectory, ".opencode", "skills"))
 await verifyNoDesktopFallback(path.join(packageDirectory, ".opencode", "skills", "drawio-skill"))
-await verifyNoCaches(packageDirectory)
+await verifyNoCaches(path.join(packageDirectory, ".opencode"))
+await verifyGeneratedRuntime()
 
 run("python", [path.join(managerScripts, "validate_expert.py"), packageDirectory])
 console.log(`Built and validated ${packageDirectory}`)

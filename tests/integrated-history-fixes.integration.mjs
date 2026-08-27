@@ -6,7 +6,8 @@ import os from "node:os"
 import path from "node:path"
 import vm from "node:vm"
 
-import { DrawioExpertPlugin } from "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js"
+import { createDrawioToolset, initializeDrawioWorkspace } from "../generated/drawio-expert/.opencode/skills/drawio-expert-common/scripts/drawio-runtime-core.mjs"
+import { tool } from "@opencode-ai/plugin"
 
 const DRAWIO_ENVIRONMENT_KEYS = [
   "DRAWIO_WEB_URL",
@@ -125,7 +126,8 @@ function historyDirectory(file) {
 }
 
 try {
-  const plugin = await DrawioExpertPlugin({ directory: workspace })
+  await initializeDrawioWorkspace(workspace)
+  const plugin = { tool: createDrawioToolset(tool) }
 
   // =====================================================================
   // FIX-P0-1: browser save decision logic (extracted pure function tests)

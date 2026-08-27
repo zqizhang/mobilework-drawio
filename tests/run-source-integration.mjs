@@ -1,12 +1,22 @@
-import fs from "node:fs"
+import { spawnSync } from "node:child_process"
 import path from "node:path"
-import { pathToFileURL } from "node:url"
+import { fileURLToPath } from "node:url"
 
-const testPath = path.resolve("tests/integrated.integration.mjs")
-const sourceUrl = pathToFileURL(path.resolve("runtime/drawio-runtime.ts")).href
-const code = fs.readFileSync(testPath, "utf8").replace(
-  "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js",
-  sourceUrl,
-)
+const scriptDirectory = path.dirname(fileURLToPath(import.meta.url))
+const testPath = path.resolve(scriptDirectory, "integrated.integration.mjs")
 
-await import(`data:text/javascript;base64,${Buffer.from(code).toString("base64")}`)
+// Run the integrated suite against the TypeScript source instead of the
+// generated runtime core. Bun is required because it imports the .ts entry
+// directly; the generated-package run remains `bun tests/integrated.integration.mjs`.
+const result = spawnSync(process.execPath, [testPath], {
+  cwd: path.resolve(scriptDirectory, ".."),
+  env: { ...process.env, DRAWIO_TEST_SOURCE: "1" },
+  encoding: "utf8",
+  stdio: "inherit",
+})
+
+if (result.error) {
+  console.error(result.error)
+  process.exit(1)
+}
+process.exit(result.status ?? 1)

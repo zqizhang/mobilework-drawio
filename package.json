@@ -2,6 +2,10 @@
   "name": "drawio-expert-integrated-build",
   "private": true,
   "type": "module",
+  "scripts": {
+    "build": "node scripts/build-expert.mjs",
+    "test:migration": "node tests/custom-tools.integration.mjs"
+  },
   "dependencies": {
     "@opencode-ai/plugin": "1.18.12",
     "fast-xml-parser": "5.10.1",

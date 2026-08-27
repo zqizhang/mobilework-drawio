@@ -4,7 +4,8 @@ import { promises as fs } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
-import { DrawioExpertPlugin } from "../generated/drawio-expert/.opencode/plugins/drawio-runtime.js"
+import { createDrawioToolset, initializeDrawioWorkspace } from "../generated/drawio-expert/.opencode/skills/drawio-expert-common/scripts/drawio-runtime-core.mjs"
+import { tool } from "@opencode-ai/plugin"
 
 process.env.DRAWIO_EXPORT_URL ||= "http://127.0.0.1:18765/ImageExport4/export"
 process.env.DRAWIO_WEB_URL ||= "http://127.0.0.1:18080"
@@ -24,7 +25,8 @@ const context = {
 }
 
 try {
-  const plugin = await DrawioExpertPlugin({ directory: workspace })
+  await initializeDrawioWorkspace(workspace)
+  const plugin = { tool: createDrawioToolset(tool) }
   const health = JSON.parse(await plugin.tool.drawio_health_check.execute({ deep: true }, context))
   assert.equal(health.success, true)
   assert.equal(health.checks.deep_test.success, true)

@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { createServer, type IncomingMessage, type Server } from "node:http"
 import { createConnection } from "node:net"
 import path from "node:path"
-import { type Plugin, tool } from "@opencode-ai/plugin"
+import type { tool } from "@opencode-ai/plugin"
 import { XMLBuilder, XMLParser, XMLValidator } from "fast-xml-parser"
 import pako from "pako"
 
@@ -3151,8 +3151,7 @@ type PatchPreview = {
   candidateXml: string
   candidateHash: string
   beforePreviewXml: string
-  afterPreviewXml: string
-  previewXml: string
+  comparePreviewXml: string
   changedIds: string[]
   changedQualifiedIds: string[]
   affectedPageIds: string[]
@@ -4352,9 +4351,12 @@ function patchPreviewPayload(preview: PatchPreview, includeXml = false) {
     createdAt: preview.createdAt,
     expiresAt: new Date(preview.expiresAt).toISOString(),
     ...(includeXml ? {
-      xml: preview.afterPreviewXml,
+      // xml remains the default compare view for older wrapper pages.
+      xml: preview.comparePreviewXml,
       beforePreviewXml: preview.beforePreviewXml,
-      afterPreviewXml: preview.afterPreviewXml,
+      afterPreviewXml: preview.candidateXml,
+      candidateXml: preview.candidateXml,
+      comparePreviewXml: preview.comparePreviewXml,
     } : {}),
   }
 }
@@ -4449,7 +4451,7 @@ function createPatchPreview(
     ...diff.changed.map((entry) => entry.pageId),
     ...diff.pageChanges.map((entry) => entry.pageId),
   ])].filter(Boolean)
-  const afterPreviewXml = decoratePatchPreviewXml(beforeXml, candidateXml, diff, id)
+  const comparePreviewXml = decoratePatchPreviewXml(beforeXml, candidateXml, diff, id)
   const preview: PatchPreview = {
     id,
     sessionId: session.sessionId,
@@ -4461,8 +4463,7 @@ function createPatchPreview(
     candidateXml,
     candidateHash: integratedHash(candidateXml),
     beforePreviewXml: beforeXml,
-    afterPreviewXml,
-    previewXml: afterPreviewXml,
+    comparePreviewXml,
     changedIds: [...new Set(changedIds.length > 0
       ? changedIds
       : [
@@ -5429,22 +5430,71 @@ return `<!doctype html>
       border-radius: 8px; background: rgba(15, 23, 42, .88); color: white; opacity: 0;
       pointer-events: none; transition: opacity .15s; }
     #status.visible { opacity: 1; }
-    #patch-preview-bar { position: fixed; z-index: 11; top: 10px; left: 50%; transform: translateX(-50%);
-      display: none; align-items: center; gap: 10px; max-width: 94vw; padding: 9px 13px;
-      border: 1px solid #d97706; border-radius: 10px; background: rgba(255,251,235,.97);
-      color: #92400e; box-shadow: 0 4px 16px rgba(15,23,42,.18); }
-    #patch-preview-bar.visible { display: flex; }
-    #patch-preview-bar .legend { display: flex; gap: 8px; white-space: nowrap; font-size: 11px; }
-    #patch-preview-bar .swatch { display: inline-block; width: 10px; height: 10px; margin-right: 3px;
-      border-radius: 2px; vertical-align: -1px; }
-    #patch-preview-bar button { border: 1px solid #d97706; border-radius: 6px; background: #fff;
-      color: #92400e; padding: 4px 9px; cursor: pointer; }
-    #patch-preview-bar button.active { background: #d97706; color: #fff; }
-    #patch-preview-details { position: fixed; z-index: 10; display: none; top: 64px; right: 14px;
-      width: min(390px, calc(100vw - 28px)); max-height: 54vh; overflow: auto; padding: 11px 12px;
-      border: 1px solid #d97706; border-radius: 10px; background: rgba(255,255,255,.97);
-      color: #334155; box-shadow: 0 4px 16px rgba(15,23,42,.16); font-size: 12px; }
+    #patch-preview-bar { --preview-accent: #d97706; --preview-ink: #172033; --preview-muted: #64748b;
+      position: fixed; z-index: 11; top: 12px; left: 50%; transform: translateX(-50%);
+      box-sizing: border-box; width: min(920px, calc(100vw - 24px)); display: none;
+      grid-template-columns: minmax(220px, 1fr) auto;
+      grid-template-areas: "overview actions" "meta meta"; align-items: center; gap: 9px 18px;
+      padding: 11px 14px 10px; border: 1px solid rgba(148,163,184,.54);
+      border-top: 3px solid var(--preview-accent); border-radius: 14px;
+      background: rgba(255,255,255,.96); color: var(--preview-ink);
+      box-shadow: 0 16px 40px rgba(15,23,42,.16), 0 2px 8px rgba(15,23,42,.08);
+      backdrop-filter: blur(16px); font-family: "Segoe UI Variable", "Microsoft YaHei UI", sans-serif; }
+    #patch-preview-bar.visible { display: grid; }
+    #patch-preview-bar .preview-overview { grid-area: overview; min-width: 0; display: flex;
+      align-items: center; gap: 10px; }
+    #patch-preview-bar .preview-eyebrow { flex: none; padding: 5px 7px; border-radius: 6px;
+      background: #fff7ed; color: #9a3412; font-size: 10px; font-weight: 750;
+      letter-spacing: .08em; line-height: 1; white-space: nowrap; }
+    #patch-preview-summary { min-width: 0; overflow: hidden; color: var(--preview-ink);
+      font-size: 13px; font-weight: 700; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+    #patch-preview-bar .preview-actions { grid-area: actions; display: flex; align-items: center;
+      justify-content: flex-end; gap: 8px; white-space: nowrap; }
+    #patch-preview-bar .segmented { display: inline-flex; flex: none; gap: 2px; padding: 3px;
+      border: 1px solid #dbe2ea; border-radius: 10px; background: #f1f5f9; }
+    #patch-preview-bar button { min-height: 32px; box-sizing: border-box; border: 1px solid transparent;
+      border-radius: 8px; background: transparent; color: #475569; padding: 5px 10px;
+      cursor: pointer; font: inherit; font-weight: 650; line-height: 1.2; white-space: nowrap;
+      transition: background-color .15s ease, border-color .15s ease, color .15s ease; }
+    #patch-preview-bar button:hover { background: #f8fafc; color: #0f172a; }
+    #patch-preview-bar button:focus-visible { outline: 3px solid rgba(37,99,235,.28); outline-offset: 2px; }
+    #patch-preview-bar .segmented button { min-width: 60px; }
+    #patch-preview-bar .segmented button.active { border-color: #cbd5e1; background: #fff;
+      color: #9a3412; box-shadow: 0 1px 3px rgba(15,23,42,.11); }
+    #patch-preview-details-toggle { display: inline-flex; align-items: center; gap: 6px;
+      border-color: #dbe2ea !important; background: #fff !important; color: #334155 !important; }
+    #patch-preview-details-count { min-width: 19px; height: 18px; padding: 0 5px; box-sizing: border-box;
+      display: inline-flex; align-items: center; justify-content: center; border-radius: 999px;
+      background: #e2e8f0; color: #475569; font-size: 10px; font-weight: 750; }
+    #patch-preview-bar button.danger { border-color: #fecaca; background: #fff; color: #b91c1c; }
+    #patch-preview-bar button.danger:hover { border-color: #fca5a5; background: #fef2f2; color: #991b1b; }
+    #patch-preview-bar button:disabled { opacity: .48; cursor: not-allowed; }
+    #patch-preview-bar .preview-meta { grid-area: meta; min-width: 0; display: flex;
+      align-items: center; gap: 14px; padding-top: 8px; border-top: 1px solid #e8edf3; }
+    #patch-preview-guidance { min-width: 0; display: flex; align-items: center; gap: 7px;
+      overflow: hidden; color: var(--preview-muted); font-size: 11px; text-overflow: ellipsis;
+      white-space: nowrap; }
+    #patch-preview-guidance::before { content: ""; flex: none; width: 7px; height: 7px;
+      border-radius: 50%; background: #f59e0b; box-shadow: 0 0 0 3px #ffedd5; }
+    #patch-preview-bar .legend { margin-left: auto; display: flex; flex-wrap: wrap;
+      align-items: center; gap: 5px 11px; color: #475569; font-size: 11px; }
+    #patch-preview-bar .legend span { display: inline-flex; align-items: center; white-space: nowrap; }
+    #patch-preview-bar .swatch { display: inline-block; width: 8px; height: 8px; margin-right: 5px;
+      border-radius: 50%; box-shadow: 0 0 0 1px rgba(15,23,42,.08); }
+    #patch-preview-details { position: absolute; z-index: 10; display: none; top: calc(100% + 8px); right: 0;
+      width: min(410px, calc(100vw - 24px)); max-height: min(58vh, 520px); overflow: hidden;
+      border: 1px solid #dbe2ea; border-radius: 12px; background: rgba(255,255,255,.98);
+      color: #334155; box-shadow: 0 18px 42px rgba(15,23,42,.18), 0 2px 8px rgba(15,23,42,.08);
+      font-size: 12px; }
     #patch-preview-details.visible { display: block; }
+    #patch-preview-details .details-head { position: sticky; top: 0; display: flex; align-items: center;
+      gap: 8px; padding: 10px 12px; border-bottom: 1px solid #e2e8f0; background: inherit; }
+    #patch-preview-details .details-head strong { flex: 1; }
+    #patch-preview-details .details-head button { width: 30px; height: 30px; border: 0;
+      border-radius: 6px; background: transparent; color: #64748b; cursor: pointer; font-size: 18px; }
+    #patch-preview-details .details-head button:hover { background: #f1f5f9; color: #0f172a; }
+    #patch-preview-details-body { max-height: min(calc(58vh - 52px), 468px); overflow: auto;
+      padding: 3px 12px 11px; scrollbar-gutter: stable; }
     #patch-preview-details .change { padding: 7px 0; border-bottom: 1px solid #e2e8f0; }
     #patch-preview-details .change:last-child { border-bottom: 0; }
     #patch-preview-details .property { display: grid; grid-template-columns: 94px 1fr 18px 1fr;
@@ -5642,10 +5692,48 @@ return `<!doctype html>
       padding: 6px 12px; cursor: pointer; }
     #ann-form .actions .primary { border-color: #2563eb; background: #2563eb; color: #fff; }
     #ann-form .actions .primary:disabled { opacity: .5; cursor: not-allowed; }
+    @media (max-width: 760px) {
+      #patch-preview-bar { top: 8px; width: calc(100vw - 16px); grid-template-columns: 1fr;
+        grid-template-areas: "overview" "actions" "meta"; gap: 9px; padding: 10px 11px 9px; }
+      #patch-preview-bar .preview-actions { justify-content: stretch; }
+      #patch-preview-bar .segmented { flex: 1 1 auto; min-width: 0; }
+      #patch-preview-bar .segmented button { flex: 1 1 0; min-width: 0; }
+      #patch-preview-bar .preview-meta { align-items: flex-start; flex-wrap: wrap; gap: 7px 12px; }
+      #patch-preview-guidance { flex-basis: 100%; }
+      #patch-preview-bar .legend { margin-left: 0; }
+      #patch-preview-details { width: min(390px, 100%); }
+    }
+    @media (max-width: 440px) {
+      #patch-preview-bar .preview-actions { display: grid; grid-template-columns: 1fr auto; }
+      #patch-preview-bar .segmented { grid-column: 1 / -1; }
+      #patch-preview-details-toggle { justify-content: center; }
+      #patch-preview-summary { font-size: 12px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #patch-preview-bar button { transition: none; }
+    }
     @media (prefers-color-scheme: dark) {
       body { background: #0f172a; }
-      #patch-preview-bar { background: rgba(69,26,3,.96); color: #fde68a; }
-      #patch-preview-bar button { background: #78350f; color: #fef3c7; }
+      #patch-preview-bar { --preview-ink: #f8fafc; --preview-muted: #94a3b8;
+        border-color: #334155; border-top-color: #f59e0b; background: rgba(15,23,42,.96); }
+      #patch-preview-bar .preview-eyebrow { background: #431407; color: #fed7aa; }
+      #patch-preview-bar .segmented { border-color: #334155; background: #111827; }
+      #patch-preview-bar button { color: #cbd5e1; }
+      #patch-preview-bar button:hover { background: #243049; color: #f8fafc; }
+      #patch-preview-bar .segmented button.active { border-color: #475569; background: #334155; color: #fed7aa; }
+      #patch-preview-details-toggle { border-color: #475569 !important; background: #1e293b !important;
+        color: #e2e8f0 !important; }
+      #patch-preview-details-count { background: #334155; color: #cbd5e1; }
+      #patch-preview-bar button.danger { border-color: #7f1d1d; background: #1f1518; color: #fca5a5; }
+      #patch-preview-bar button.danger:hover { border-color: #b91c1c; background: #450a0a; color: #fecaca; }
+      #patch-preview-bar .preview-meta { border-color: #334155; }
+      #patch-preview-guidance::before { box-shadow: 0 0 0 3px #431407; }
+      #patch-preview-bar .legend { color: #cbd5e1; }
+      #patch-preview-details { border-color: #334155; background: rgba(15,23,42,.98); color: #e2e8f0; }
+      #patch-preview-details .details-head, #patch-preview-details .change { border-color: #334155; }
+      #patch-preview-details .details-head button { color: #94a3b8; }
+      #patch-preview-details .details-head button:hover { background: #243049; color: #f8fafc; }
+      #patch-preview-details .value { color: #cbd5e1; }
       #history-btn, #ann-btn, #ann-drawer { background: #1e293b; color: #e2e8f0; border-color: #334155; }
       #history-btn:hover, #ann-btn:hover, #ann-drawer header button { background: #243049; }
       #ann-filters { background: #172033; border-color: #334155; }
@@ -5696,20 +5784,38 @@ return `<!doctype html>
 <body>
   <iframe id="editor" title="Draw.io editor"></iframe>
   <div id="status" role="status"></div>
-  <div id="patch-preview-bar" role="status">
-    <strong id="patch-preview-summary">Agent 修改预览</strong>
-    <span class="legend">
-      <span><i class="swatch" style="background:#22c55e"></i>新增</span>
-      <span><i class="swatch" style="background:#f59e0b"></i>修改</span>
-      <span><i class="swatch" style="background:#ef4444"></i>删除/原位置</span>
-      <span><i class="swatch" style="background:#3b82f6"></i>连线</span>
-    </span>
-    <button type="button" id="patch-preview-before">修改前</button>
-    <button type="button" id="patch-preview-after" class="active">修改后</button>
-    <span id="patch-preview-guidance">只读预览，不会写入源文件</span>
-    <button type="button" id="patch-preview-exit">退出预览</button>
+  <div id="patch-preview-bar" role="region" aria-label="Agent 修改预览">
+    <div class="preview-overview">
+      <span class="preview-eyebrow">AGENT 预览</span>
+      <strong id="patch-preview-summary">正在准备修改摘要</strong>
+    </div>
+    <div class="preview-actions">
+      <div class="segmented" role="group" aria-label="预览显示方式">
+        <button type="button" id="patch-preview-before" aria-pressed="false">修改前</button>
+        <button type="button" id="patch-preview-after" aria-pressed="false">修改后</button>
+        <button type="button" id="patch-preview-compare" class="active" aria-pressed="true">对比</button>
+      </div>
+      <button type="button" id="patch-preview-details-toggle" aria-expanded="true"
+        aria-controls="patch-preview-details">变化详情 <span id="patch-preview-details-count">0</span></button>
+      <button type="button" id="patch-preview-cancel" class="danger">取消修改</button>
+    </div>
+    <div class="preview-meta">
+      <span id="patch-preview-guidance" role="status">只读预览，不会写入源文件</span>
+      <span class="legend" aria-label="对比颜色说明">
+        <span><i class="swatch" style="background:#22c55e"></i>新增</span>
+        <span><i class="swatch" style="background:#f59e0b"></i>修改</span>
+        <span><i class="swatch" style="background:#ef4444"></i>删除/原位置</span>
+        <span><i class="swatch" style="background:#3b82f6"></i>连线</span>
+      </span>
+    </div>
+    <aside id="patch-preview-details" aria-live="polite" aria-label="修改变化详情">
+      <div class="details-head">
+        <strong>变化详情</strong>
+        <button type="button" id="patch-preview-details-close" aria-label="关闭变化详情">×</button>
+      </div>
+      <div id="patch-preview-details-body"></div>
+    </aside>
   </div>
-  <div id="patch-preview-details" aria-live="polite"></div>
   <div id="conflict-banner" role="alert">
     <span id="conflict-message">图表刚发生变化，当前画布暂未保存，请确认最新版本。</span>
     <button type="button" id="conflict-retry" style="display:none">重试加载</button>
@@ -5858,6 +5964,8 @@ return `<!doctype html>
       let activePatchPreview = null;
       let previewTargetXml = null;
       let previewExitXml = null;
+      let patchPreviewView = "compare";
+      let patchPreviewDetailsExpanded = true;
 
       const historyBtn = document.getElementById("history-btn");
       const annBtn = document.getElementById("ann-btn");
@@ -5885,7 +5993,11 @@ return `<!doctype html>
       const patchPreviewGuidance = document.getElementById("patch-preview-guidance");
       const patchPreviewBefore = document.getElementById("patch-preview-before");
       const patchPreviewAfter = document.getElementById("patch-preview-after");
+      const patchPreviewCompare = document.getElementById("patch-preview-compare");
+      const patchPreviewDetailsToggle = document.getElementById("patch-preview-details-toggle");
+      const patchPreviewDetailsCount = document.getElementById("patch-preview-details-count");
       const patchPreviewDetails = document.getElementById("patch-preview-details");
+      const patchPreviewDetailsBody = document.getElementById("patch-preview-details-body");
 
       function selectedAnnotationScope() {
         return document.querySelector('input[name="ann-scope"]:checked')?.value || "selection_only";
@@ -6063,8 +6175,19 @@ return `<!doctype html>
       }
 
       function renderPatchPreviewDetails(preview) {
-        patchPreviewDetails.replaceChildren();
+        patchPreviewDetailsBody.replaceChildren();
         const diff = preview?.diff || {};
+        for (const [kind, entries] of [["新增", diff.added || []], ["删除", diff.removed || []]]) {
+          for (const change of entries) {
+            const section = document.createElement("div");
+            section.className = "change";
+            const title = document.createElement("strong");
+            title.textContent = kind + (change.cell?.edge ? "连线 " : "图元 ")
+              + (change.cell?.id || change.key || "");
+            section.appendChild(title);
+            patchPreviewDetailsBody.appendChild(section);
+          }
+        }
         for (const change of diff.changed || []) {
           const section = document.createElement("div");
           section.className = "change";
@@ -6081,7 +6204,7 @@ return `<!doctype html>
           for (const geometry of change.geometryChanges || []) {
             appendPatchPreviewProperty(section, geometry.property, geometry.before, geometry.after);
           }
-          patchPreviewDetails.appendChild(section);
+          patchPreviewDetailsBody.appendChild(section);
         }
         for (const change of diff.pageChanges || []) {
           const section = document.createElement("div");
@@ -6090,27 +6213,43 @@ return `<!doctype html>
           title.textContent = "页面 " + (change.pageName || change.pageId);
           section.appendChild(title);
           appendPatchPreviewProperty(section, change.property, change.before, change.after);
-          patchPreviewDetails.appendChild(section);
+          patchPreviewDetailsBody.appendChild(section);
         }
-        patchPreviewDetails.classList.toggle("visible", patchPreviewDetails.childElementCount > 0);
+        const count = patchPreviewDetailsBody.childElementCount;
+        patchPreviewDetailsCount.textContent = String(count);
+        patchPreviewDetailsToggle.disabled = count === 0;
+        setPatchPreviewDetailsExpanded(count > 0 && patchPreviewDetailsExpanded);
+      }
+
+      function setPatchPreviewDetailsExpanded(expanded) {
+        patchPreviewDetailsExpanded = expanded;
+        patchPreviewDetails.classList.toggle("visible", expanded);
+        patchPreviewDetailsToggle.setAttribute("aria-expanded", String(expanded));
       }
 
       function updatePatchPreviewViewButtons(view) {
         patchPreviewBefore.classList.toggle("active", view === "before");
         patchPreviewAfter.classList.toggle("active", view === "after");
+        patchPreviewCompare.classList.toggle("active", view === "compare");
+        patchPreviewBefore.setAttribute("aria-pressed", String(view === "before"));
+        patchPreviewAfter.setAttribute("aria-pressed", String(view === "after"));
+        patchPreviewCompare.setAttribute("aria-pressed", String(view === "compare"));
       }
 
       function setPatchPreviewView(view) {
         if (!activePatchPreview || !editorReady) return;
         const xml = view === "before"
           ? activePatchPreview.beforePreviewXml
-          : activePatchPreview.afterPreviewXml || activePatchPreview.xml;
+          : view === "after"
+            ? activePatchPreview.candidateXml || activePatchPreview.afterPreviewXml
+            : activePatchPreview.comparePreviewXml || activePatchPreview.xml;
         if (typeof xml !== "string" || !xml) return;
+        patchPreviewView = view;
         previewTargetXml = xml;
         editorMode = "preview-loading";
         updatePatchPreviewViewButtons(view);
         sendEditor({ action: "load", xml, autosave: 0, diffSync: false,
-          title: CONFIG.file + (view === "before" ? " · 修改前" : " · Agent 修改后") });
+          title: CONFIG.file + ({ before: " · 修改前", after: " · 修改后", compare: " · 修改对比" }[view]) });
       }
 
       async function showPatchPreview(preview) {
@@ -6140,25 +6279,24 @@ return `<!doctype html>
         current = latest;
         canvasRevision = latest.revision;
         activePatchPreview = preview;
-        previewTargetXml = preview.xml;
+        patchPreviewView = "compare";
+        patchPreviewDetailsExpanded = true;
+        previewTargetXml = preview.comparePreviewXml || preview.xml;
         previewExitXml = null;
         editorMode = "preview-loading";
-        updatePatchPreviewViewButtons("after");
+        updatePatchPreviewViewButtons("compare");
         renderPatchPreviewDetails(preview);
         closeDrawer();
         closeHistory();
         setPatchPreviewControlsDisabled(true);
-        const summary = preview.summary || {};
-        patchPreviewSummary.textContent = "新增 " + (summary.added || 0)
-          + " · 修改 " + (summary.changed || 0)
-          + " · 删除 " + (summary.removed || 0)
-          + " · revision " + preview.baseRevision;
+        const totalChanges = patchPreviewDetailsBody.childElementCount;
+        patchPreviewSummary.textContent = totalChanges + " 项变化 · 基于版本 " + preview.baseRevision;
         patchPreviewGuidance.textContent = preview.status === "authorized"
           ? "已批准，正在提交精确候选"
           : "请核对画布后在 OpenCode 审批弹窗中确认";
         patchPreviewBar.classList.add("visible");
-        sendEditor({ action: "load", xml: preview.xml, autosave: 0, diffSync: false,
-          title: CONFIG.file + " · Agent 修改预览" });
+        sendEditor({ action: "load", xml: previewTargetXml, autosave: 0, diffSync: false,
+          title: CONFIG.file + " · Agent 修改对比" });
       }
 
       async function leavePatchPreview(reloadLatest = true) {
@@ -6169,6 +6307,7 @@ return `<!doctype html>
           editorMode = "editing";
           patchPreviewBar.classList.remove("visible");
           patchPreviewDetails.classList.remove("visible");
+          patchPreviewDetailsToggle.setAttribute("aria-expanded", "false");
           setPatchPreviewControlsDisabled(false);
           return;
         }
@@ -6197,6 +6336,7 @@ return `<!doctype html>
           editorMode = "editing";
           patchPreviewBar.classList.remove("visible");
           patchPreviewDetails.classList.remove("visible");
+          patchPreviewDetailsToggle.setAttribute("aria-expanded", "false");
           setPatchPreviewControlsDisabled(false);
           showStatus("已返回正式图表", 1800);
           return true;
@@ -7118,11 +7258,26 @@ return `<!doctype html>
         const nextStatus = target.getAttribute("data-status");
         if (id && nextStatus) void updateAnnotationStatus(id, nextStatus, target);
       });
-      document.getElementById("patch-preview-exit").addEventListener("click", () => {
-        void cancelVisiblePatchPreview().catch(error => showStatus(error.message || "取消预览失败", 5000));
+      document.getElementById("patch-preview-cancel").addEventListener("click", () => {
+        void cancelVisiblePatchPreview().catch(error => showStatus(error.message || "取消候选失败", 5000));
       });
       patchPreviewBefore.addEventListener("click", () => setPatchPreviewView("before"));
       patchPreviewAfter.addEventListener("click", () => setPatchPreviewView("after"));
+      patchPreviewCompare.addEventListener("click", () => setPatchPreviewView("compare"));
+      patchPreviewDetailsToggle.addEventListener("click", () => {
+        if (!patchPreviewDetailsToggle.disabled) {
+          setPatchPreviewDetailsExpanded(!patchPreviewDetailsExpanded);
+        }
+      });
+      document.getElementById("patch-preview-details-close").addEventListener("click", () => {
+        setPatchPreviewDetailsExpanded(false);
+      });
+      document.addEventListener("keydown", event => {
+        if (event.key === "Escape" && patchPreviewDetailsExpanded
+          && (editorMode === "preview-loading" || editorMode === "previewing")) {
+          setPatchPreviewDetailsExpanded(false);
+        }
+      });
 
       historyBtn.addEventListener("click", () => void openHistory());
       document.getElementById("hist-close").addEventListener("click", closeHistory);
@@ -7364,7 +7519,7 @@ async function handleIntegratedBridgeRequest(
       body.source === "editor"
       && activePreview
       && (integratedHash(xml) === activePreview.candidateHash
-        || integratedHash(xml) === integratedHash(activePreview.afterPreviewXml))
+        || integratedHash(xml) === integratedHash(activePreview.comparePreviewXml))
     ) {
       integratedJsonResponse(response, 409, {
         ok: false,
@@ -8074,72 +8229,16 @@ async function bindIntegratedSession(
   return { session, token, bridge }
 }
 
-const nodeSchema = tool.schema.object({
-  id: tool.schema.string().describe("Stable unique cell id; 0 and 1 are reserved"),
-  label: tool.schema.string().describe("Visible node label"),
-  kind: tool.schema
-    .enum(["default", "application", "service", "database", "external", "decision"])
-    .optional()
-    .describe("Visual node category"),
-})
-
-const edgeSchema = tool.schema.object({
-  id: tool.schema.string().optional().describe("Stable unique edge id"),
-  source: tool.schema.string().describe("Source node id"),
-  target: tool.schema.string().describe("Target node id"),
-  label: tool.schema.string().optional().describe("Visible edge label"),
-})
-
-const patchStyleUpdatesSchema = tool.schema.object({
-  font_size: tool.schema.number().positive().max(200).optional(),
-  font_family: tool.schema.string().min(1).max(120).optional(),
-  font_color: tool.schema.string().min(1).max(80).optional(),
-  fill_color: tool.schema.string().min(1).max(80).optional(),
-  stroke_color: tool.schema.string().min(1).max(80).optional(),
-  stroke_width: tool.schema.number().min(0).max(50).optional(),
-  opacity: tool.schema.number().min(0).max(100).optional(),
-  rounded: tool.schema.boolean().optional(),
-  dashed: tool.schema.boolean().optional(),
-})
-
-const patchOperationSchema = tool.schema.object({
-  type: tool.schema.enum([
-    "add-node",
-    "update-node",
-    "remove-node",
-    "add-edge",
-    "update-edge",
-    "remove-edge",
-  ]),
-  id: tool.schema.string().describe("Stable target or new cell id"),
-  label: tool.schema.string().optional(),
-  kind: tool.schema
-    .enum(["default", "application", "service", "database", "external", "decision"])
-    .optional(),
-  source: tool.schema.string().optional(),
-  target: tool.schema.string().optional(),
-  x: tool.schema.number().optional(),
-  y: tool.schema.number().optional(),
-  width: tool.schema.number().positive().optional(),
-  height: tool.schema.number().positive().optional(),
-  style_updates: patchStyleUpdatesSchema
-    .optional()
-    .describe("Whitelisted visual property updates that preserve unrelated style keys"),
-  cascade: tool.schema
-    .boolean()
-    .optional()
-    .describe("For remove-node, also remove connected edges"),
-})
-
 const DRAWIO_RUNTIME_GUIDANCE = `## Draw.io 文件写入与交付
 
 已通过 drawio_open 绑定的文件可能包含用户在内置浏览器中的手动修改。
+每次新的用户轮次只要涉及已绑定图表，即使本轮没有加载任何 Draw.io Skill，也必须先调用 drawio_get_state 同步最新 revision、XML、updatedBy 和 updatedAt，再调用 drawio_list_annotations(file=当前文件, status="all") 检查新增注释以及 instruction、scope、freshness、resolved 或 ignored 状态变化；本轮结果覆盖上一轮缓存。正式写入前再次检查 revision，最终交付前再次调用 drawio_list_annotations(file=当前文件, status="pending")；若状态变化，必须按最新基线重新规划，禁止复用旧 preview_id、approval_token、稳定 ID 清单或上一轮结论。
 每次修改前必须立即调用 drawio_get_state，并把返回的最新 XML 作为修改基线。人工编辑不是只读内容，可以按当前任务要求继续调整。
 提交时必须携带该次读取返回的准确 base_revision；revision_conflict 后重新读取，在新 XML 上重新执行所需变更并重试，禁止重发旧 XML。
 禁止用普通 write、edit 或脚本直接覆盖已绑定的 .drawio 文件，因为这会绕过 revision 检查并可能用旧快照丢失最新内容。
-对已绑定文件执行 drawio_patch 或 drawio_polish 时，先以 dry_run=true 生成同画布修改预览；字体、填充色、文字色、边框色等常用属性使用 drawio_patch.style_updates。只有完整 XML 才能表达的页面背景或高级样式先调用 drawio_preview_state，禁止直接调用 drawio_update_state 绕过预览。预览提供修改前/修改后切换和属性级前后值；绿色表示新增、黄色表示修改、红色表示删除或原位置、蓝色表示变更连线。普通修改调用 drawio_authorize_preview；用户在审批弹窗点击允许后，该工具会立即校验并提交画布中展示的精确候选，Agent 不得等待用户再发文字确认，也不得重复调用正式 patch/polish。注释修改继续调用 drawio_authorize_annotation_change，并把 dry-run 返回的 preview_id 与精确稳定 ID 清单一起纳入范围审批。
-本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。调用前必须先调用 drawio_list_annotations(status='pending') 探测未完成注释；存在 requiresConfirmation=false 的注释时 drawio_finalize 会拒绝执行，必须先逐条处理并 drawio_resolve_annotation 后再重试，不得跳过。只有返回 shouldOpenBrowser=true 时才将 openUrl 交给 MobileWork 现有 browser.open_url 打开；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
-drawio_export 支持 PNG、JPEG、PDF、xmlpng、SVG、xmlsvg 和 html2。SVG、xmlsvg、html2 由内置浏览器编辑器渲染并通过 Bridge 写回工作区；返回 editor_required 时必须立即调用 browser.open_url 自动打开其 openUrl，等待编辑器连接后用完全相同的参数重试，禁止把该状态解释为不支持格式或要求用户手工导出。PNG、JPEG、xmlpng、SVG、xmlsvg 使用 all_pages=true 时逐页生成文件并返回 outputs[]，必须核对 page_count 与 outputs 数量一致；PDF 和 html2 的 all_pages=true 各返回一个包含全部页面的多页单文件，html2 还需核对 contains_all_pages=true。
+对已绑定文件执行 drawio_patch 或 drawio_polish 时，先以 dry_run=true 生成同画布修改预览；字体、填充色、文字色、边框色等常用属性使用 drawio_patch.style_updates。只有完整 XML 才能表达的页面背景或高级样式先调用 drawio_preview_state，禁止直接调用 drawio_update_state 绕过预览。预览把修改前、真实修改后和带高亮覆盖层的前后对比分开，并提供可收起的属性级变化详情；绿色表示新增、黄色表示修改、红色表示删除或原位置、蓝色表示变更连线。普通修改调用 drawio_authorize_preview；用户在审批弹窗点击允许后，该工具会立即校验并提交画布中展示的精确候选，Agent 不得等待用户再发文字确认，也不得重复调用正式 patch/polish。注释修改继续调用 drawio_authorize_annotation_change，并把 dry-run 返回的 preview_id 与精确稳定 ID 清单一起纳入范围审批。
+本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。调用前必须先调用 drawio_list_annotations(status='pending') 探测未完成注释；存在 requiresConfirmation=false 的注释时 drawio_finalize 会拒绝执行，必须先逐条处理并 drawio_resolve_annotation 后再重试，不得跳过。只有返回 shouldOpenBrowser=true 时才调用 MobileWork 工具 openwork_browser_open_url，并传入 url=openUrl、provider="builtin"；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
+drawio_export 支持 PNG、JPEG、PDF、xmlpng、SVG、xmlsvg 和 html2。SVG、xmlsvg、html2 由内置浏览器编辑器渲染并通过 Bridge 写回工作区；返回 editor_required 时必须立即调用 openwork_browser_open_url，并传入 url=openUrl、provider="builtin"，等待编辑器连接后用完全相同的参数重试，禁止把该状态解释为不支持格式或要求用户手工导出。PNG、JPEG、xmlpng、SVG、xmlsvg 使用 all_pages=true 时逐页生成文件并返回 outputs[]，必须核对 page_count 与 outputs 数量一致；PDF 和 html2 的 all_pages=true 各返回一个包含全部页面的多页单文件，html2 还需核对 contains_all_pages=true。
 
 ## 注释任务（框选评审）
 
@@ -8149,6 +8248,8 @@ drawio_export 支持 PNG、JPEG、PDF、xmlpng、SVG、xmlsvg 和 html2。SVG、
 不得修改授权范围外内容。确需越界时，在 authorization 的 escalation_reason 中先说明不可避免的原因并申请更宽范围；未获批准不得写入。drawio_polish 会重排整页，存在活动注释时只有取得 diagram_wide 审批后才能正式运行。
 用户本轮另有明确任务时先完成该任务，然后在同一轮重新探测注释；最终回复前仍存在 requiresConfirmation=false 的 open 注释时必须继续处理，不能只提示用户稍后继续。
 注释任务的检查与处理流程由 drawio-session-editing 技能负责编排，详见该 SKILL.md。`
+
+const DRAWIO_EXPERT_AGENT_MARKER = "Agent ID 是 `drawio-expert`"
 
 function candidateDrawioPath(args: unknown): string | null {
   if (!args || typeof args !== "object" || Array.isArray(args)) return null
@@ -8161,32 +8262,142 @@ function candidateDrawioPath(args: unknown): string | null {
   return null
 }
 
-export const DrawioExpertPlugin: Plugin = async (input) => {
-  await loadWorkspaceEnvironment(input.directory)
+export async function initializeDrawioWorkspace(directory: string): Promise<void> {
+  await loadWorkspaceEnvironment(directory)
+}
 
-  return {
-"experimental.chat.system.transform": async (_input, output) => {
-    output.system.push(DRAWIO_RUNTIME_GUIDANCE)
-  },
-  "tool.execute.before": async (input, output) => {
-    if (!["write", "edit", "apply_patch"].includes(input.tool)) return
-    const requested = candidateDrawioPath(output.args)
-    if (!requested) return
-    const state = getIntegratedBridgeState()
-    const session = state.sessions.get(input.sessionID)
-    if (!session) return
-    const target = path.isAbsolute(requested)
-      ? path.resolve(requested)
-      : path.resolve(session.workspace, requested)
-    if (target.toLowerCase() === path.resolve(session.file).toLowerCase()) {
-      throw new Error(
-        "This Draw.io file is bound to an active browser session. "
-        + "Call drawio_get_state, then use drawio_patch, drawio_polish, or drawio_update_state with its exact revision.",
-      )
-    }
-  },
-  tool: {
-    drawio_validate: tool({
+export function applyDrawioSystemGuidance(output: { system: string[] }): boolean {
+  // OpenCode 的系统提示转换钩子不会直接提供当前选中的 Agent 名称，
+  // 但当前 Agent 的生成提示词已经合并到 output.system。只识别该稳定 ID 标记，
+  // 避免把 Draw.io 工作流约束注入普通 Agent、标题生成等辅助模型请求。
+  if (!output.system.some((part) => part.includes(DRAWIO_EXPERT_AGENT_MARKER))) return false
+  output.system.push(DRAWIO_RUNTIME_GUIDANCE)
+  return true
+}
+
+export function enforceDrawioWriteGuard(
+  input: { tool: string; sessionID: string; callID?: string },
+  output: { args: unknown },
+): void {
+  if (!["write", "edit", "apply_patch"].includes(input.tool)) return
+  const requested = candidateDrawioPath(output.args)
+  if (!requested) return
+  const state = getIntegratedBridgeState()
+  const session = state.sessions.get(input.sessionID)
+  if (!session) return
+  const target = path.isAbsolute(requested)
+    ? path.resolve(requested)
+    : path.resolve(session.workspace, requested)
+  if (target.toLowerCase() === path.resolve(session.file).toLowerCase()) {
+    throw new Error(
+      "This Draw.io file is bound to an active browser session. "
+      + "Call drawio_get_state, then use drawio_patch, drawio_polish, or drawio_update_state with its exact revision.",
+    )
+  }
+}
+
+export const DRAWIO_TOOL_NAMES = [
+  "drawio_validate",
+  "drawio_export",
+  "drawio_health_check",
+  "drawio_create",
+  "drawio_inspect",
+  "drawio_quality",
+  "drawio_patch",
+  "drawio_polish",
+  "drawio_compare",
+  "drawio_get_state",
+  "drawio_preview_state",
+  "drawio_update_state",
+  "drawio_open",
+  "drawio_finalize",
+  "drawio_list_annotations",
+  "drawio_get_annotation",
+  "drawio_authorize_preview",
+  "drawio_authorize_annotation_change",
+  "drawio_resolve_annotation",
+] as const
+
+type DrawioToolFactory = typeof tool
+type DrawioToolDefinition = ReturnType<DrawioToolFactory>
+type DrawioToolset = { [Name in (typeof DRAWIO_TOOL_NAMES)[number]]: DrawioToolDefinition }
+
+const drawioToolsets = new WeakMap<DrawioToolFactory, DrawioToolset>()
+
+export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
+  const cachedToolset = drawioToolsets.get(toolApi)
+  if (cachedToolset) return cachedToolset
+
+  const tool = toolApi
+
+  const nodeSchema = tool.schema.object({
+    id: tool.schema.string().describe("Stable unique cell id; 0 and 1 are reserved"),
+    label: tool.schema.string().describe("Visible node label"),
+    kind: tool.schema
+      .enum(["default", "application", "service", "database", "external", "decision"])
+      .optional()
+      .describe("Visual node category"),
+  })
+
+  const edgeSchema = tool.schema.object({
+    id: tool.schema.string().optional().describe("Stable unique edge id"),
+    source: tool.schema.string().describe("Source node id"),
+    target: tool.schema.string().describe("Target node id"),
+    label: tool.schema.string().optional().describe("Visible edge label"),
+  })
+
+  const patchStyleUpdatesSchema = tool.schema.object({
+    font_size: tool.schema.number().positive().max(200).optional(),
+    font_family: tool.schema.string().min(1).max(120).optional(),
+    font_color: tool.schema.string().min(1).max(80).optional(),
+    fill_color: tool.schema.string().min(1).max(80).optional(),
+    stroke_color: tool.schema.string().min(1).max(80).optional(),
+    stroke_width: tool.schema.number().min(0).max(50).optional(),
+    opacity: tool.schema.number().min(0).max(100).optional(),
+    rounded: tool.schema.boolean().optional(),
+    dashed: tool.schema.boolean().optional(),
+  })
+
+  const patchOperationSchema = tool.schema.object({
+    type: tool.schema.enum([
+      "add-node",
+      "update-node",
+      "remove-node",
+      "add-edge",
+      "update-edge",
+      "remove-edge",
+    ]),
+    id: tool.schema.string().describe("Stable target or new cell id"),
+    label: tool.schema.string().optional(),
+    kind: tool.schema
+      .enum(["default", "application", "service", "database", "external", "decision"])
+      .optional(),
+    source: tool.schema.string().optional(),
+    target: tool.schema.string().optional(),
+    x: tool.schema.number().optional(),
+    y: tool.schema.number().optional(),
+    width: tool.schema.number().positive().optional(),
+    height: tool.schema.number().positive().optional(),
+    style_updates: patchStyleUpdatesSchema
+      .optional()
+      .describe("Whitelisted visual property updates that preserve unrelated style keys"),
+    cascade: tool.schema
+      .boolean()
+      .optional()
+      .describe("For remove-node, also remove connected edges"),
+  })
+
+  const defineTool = (config: Parameters<DrawioToolFactory>[0]): DrawioToolDefinition =>
+    toolApi({
+      ...config,
+      async execute(args, context) {
+        await loadWorkspaceEnvironment(context.directory)
+        return config.execute(args, context)
+      },
+    })
+
+  const toolset: DrawioToolset = {
+    drawio_validate: defineTool({
       description: "Validate a workspace Draw.io file and report pages, file size, nodes, edges, errors, and warnings.",
       args: {
         input_path: tool.schema.string().describe("Workspace-relative .drawio or .xml file"),
@@ -8215,9 +8426,9 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_export: tool({
+    drawio_export: defineTool({
       description:
-        "Export a workspace Draw.io file. PNG, JPEG, PDF, and editable PNG (xmlpng) use the Docker HTTP Export Server. SVG, editable SVG (xmlsvg), and HTML (html2) use the built-in browser Bridge. all_pages=true writes one file per page for PNG/JPEG/xmlpng/SVG/XMLSVG, while PDF and HTML2 each produce one multi-page file. page_id exports one page for every format. When an editor-channel export is not connected, open the returned openUrl with browser.open_url and retry the same export.",
+        "Export a workspace Draw.io file. PNG, JPEG, PDF, and editable PNG (xmlpng) use the Docker HTTP Export Server. SVG, editable SVG (xmlsvg), and HTML (html2) use the built-in browser Bridge. all_pages=true writes one file per page for PNG/JPEG/xmlpng/SVG/XMLSVG, while PDF and HTML2 each produce one multi-page file. page_id exports one page for every format. When an editor-channel export is not connected, call openwork_browser_open_url with url=openUrl and provider=builtin, then retry the same export.",
       args: {
         input_path: tool.schema.string().describe("Workspace-relative .drawio or .xml input file"),
         format: tool.schema.enum(["png", "jpeg", "pdf", "xmlpng", "svg", "xmlsvg", "html2"]),
@@ -8269,7 +8480,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
                 all_pages: true,
                 openUrl: outcome.openUrl,
                 browserAction:
-                  "Call MobileWork's built-in browser.open_url with openUrl now, wait for the editor page to finish loading, then call drawio_export again with identical arguments to complete the export.",
+                  "Call MobileWork's openwork_browser_open_url tool with url=openUrl and provider=builtin now, wait for the editor page to finish loading, then call drawio_export again with identical arguments to complete the export.",
                 tokenExpiresAt: outcome.tokenExpiresAt,
               }, null, 2)
             }
@@ -8314,7 +8525,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
               format: args.format,
               openUrl: outcome.openUrl,
               browserAction:
-                "Call MobileWork's built-in browser.open_url with openUrl now, wait for the editor page to finish loading, then call drawio_export again with identical arguments to complete the export.",
+              "Call MobileWork's openwork_browser_open_url tool with url=openUrl and provider=builtin now, wait for the editor page to finish loading, then call drawio_export again with identical arguments to complete the export.",
               tokenExpiresAt: outcome.tokenExpiresAt,
             }, null, 2)
           }
@@ -8396,7 +8607,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_health_check: tool({
+    drawio_health_check: defineTool({
       description: "Check the TypeScript Draw.io runtime and Docker Export Server; deep=true performs a real PNG export.",
       args: {
         deep: tool.schema.boolean().default(false),
@@ -8455,7 +8666,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_create: tool({
+    drawio_create: defineTool({
       description:
         "Create a validated Draw.io file from a semantic graph. Use this instead of writing mxGraphModel XML directly.",
       args: {
@@ -8509,7 +8720,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_inspect: tool({
+    drawio_inspect: defineTool({
       description:
         "Inspect a compressed or uncompressed Draw.io file and return pages, nodes, edges, geometry, and styles.",
       args: {
@@ -8534,7 +8745,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_quality: tool({
+    drawio_quality: defineTool({
       description:
         "Score Draw.io layout quality and report actionable issues including node overlaps, edge-node intersections, edge crossings, edge-label collisions, empty labels, and missing arc line jumps.",
       args: {
@@ -8558,7 +8769,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_patch: tool({
+    drawio_patch: defineTool({
       description:
         "Apply semantic node and edge operations, including whitelisted font, color, stroke, opacity and shape-style updates, to an existing Draw.io file. Pass annotation_id when executing an annotation so its bound page is enforced. Preserves unrelated cells and creates a recoverable backup unless dry_run is true.",
       args: {
@@ -8724,7 +8935,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_polish: tool({
+    drawio_polish: defineTool({
       description:
         "Run a deterministic quality loop: analyze, auto-layout and reroute a page, validate the result, enforce a quality threshold, and optionally write with backup.",
       args: {
@@ -8867,7 +9078,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_compare: tool({
+    drawio_compare: defineTool({
       description:
         "Compare two Draw.io files by stable page and cell ids, reporting added, removed, changed, and unchanged nodes and edges.",
       args: {
@@ -8893,7 +9104,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_get_state: tool({
+    drawio_get_state: defineTool({
       description:
         "Read the latest XML and revision for the current session's active Draw.io file. Use this before changing a user-edited diagram.",
       args: {
@@ -8916,7 +9127,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_preview_state: tool({
+    drawio_preview_state: defineTool({
       description:
         "Preview an exact complete-XML candidate in the active Draw.io canvas without writing it. Use when semantic drawio_patch operations cannot express the requested change, including page backgrounds or advanced styles.",
       args: {
@@ -8994,7 +9205,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_update_state: tool({
+    drawio_update_state: defineTool({
       description:
         "Apply the exact complete-XML candidate from an approved drawio_preview_state preview. The candidate hash and base revision must match; a stale revision is rejected.",
       args: {
@@ -9080,7 +9291,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_open: tool({
+    drawio_open: defineTool({
       description:
         "Bind the current Draw.io session to one validated workspace file and return a URL for OpenWork's existing built-in browser.",
       args: {
@@ -9114,15 +9325,15 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           editorConnected,
           shouldOpenBrowser: !editorConnected,
           browserAction: editorConnected
-            ? "Keep the connected editor open. Do not call browser.open_url because reopening it can discard an in-progress manual edit."
-            : "Open the returned openUrl with OpenWork's existing browser.open_url action.",
+            ? "Keep the connected editor open. Do not call openwork_browser_open_url because reopening it can discard an in-progress manual edit."
+            : "Call MobileWork's openwork_browser_open_url tool with url=openUrl and provider=builtin.",
           saveMode: "workspace-file",
           tokenExpiresAt: new Date(Date.now() + BRIDGE_TOKEN_TTL_MS).toISOString(),
         }, null, 2)
       },
     }),
 
-    drawio_finalize: tool({
+    drawio_finalize: defineTool({
       description:
         "Finish a Draw.io task: refresh the latest revision, validate and score it, export an up-to-date PNG, bind the browser session, and report whether a new editor must be opened. Refuses to run while any fresh (requiresConfirmation=false) annotation is still open; returns pendingAnnotations for stale open annotations that still need user confirmation. Resolved and ignored annotations are terminal and do not block finalization.",
       args: {
@@ -9217,15 +9428,15 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
           editorConnected,
           shouldOpenBrowser: !editorConnected,
           browserAction: editorConnected
-            ? "Keep the connected editor open. Do not call browser.open_url because reopening it can discard an in-progress manual edit."
-            : "Immediately call MobileWork's existing browser.open_url with openUrl before ending the task.",
+            ? "Keep the connected editor open. Do not call openwork_browser_open_url because reopening it can discard an in-progress manual edit."
+            : "Immediately call MobileWork's openwork_browser_open_url tool with url=openUrl and provider=builtin before ending the task.",
           saveMode: "workspace-file",
           tokenExpiresAt: new Date(Date.now() + BRIDGE_TOKEN_TTL_MS).toISOString(),
         }, null, 2)
 },
     }),
 
-    drawio_list_annotations: tool({
+    drawio_list_annotations: defineTool({
       description:
         "List annotation (review comment) tasks for an opened Draw.io file. Each task contains selected stable cell ids, page, region, user-selected modification scope, instruction, approval state and status.",
       args: {
@@ -9259,7 +9470,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_get_annotation: tool({
+    drawio_get_annotation: defineTool({
       description:
         "Read one annotation task in full and make it the active guarded task, including selected stable cell ids, region, user-selected scope, instruction, base revision, staleness and latest per-cell snapshots.",
       args: {
@@ -9313,7 +9524,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_authorize_preview: tool({
+    drawio_authorize_preview: defineTool({
       description:
         "Request approval for the exact candidate visible in the Draw.io canvas and apply it immediately when the user allows the popup. Use after drawio_patch/drawio_polish dry-run or drawio_preview_state, and only for changes that are not driven by an annotation task.",
       args: {
@@ -9407,7 +9618,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_authorize_annotation_change: tool({
+    drawio_authorize_annotation_change: defineTool({
       description:
         "Request the user's pre-change approval for one annotation plan. OpenCode must show its permission popup before this tool runs. If approved, returns a one-time token bound to the current revision, declared stable IDs and requested scope. Never call after modifying the diagram.",
       args: {
@@ -9548,7 +9759,7 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
       },
     }),
 
-    drawio_resolve_annotation: tool({
+    drawio_resolve_annotation: defineTool({
       description:
         "Mark an annotation task as resolved after the requested change has been written (or after deciding no change is needed). This updates status and stores a summary; it does not modify the diagram itself.",
       args: {
@@ -9594,7 +9805,20 @@ export const DrawioExpertPlugin: Plugin = async (input) => {
         }, null, 2)
       },
     }),
-
-  },
   }
+
+  drawioToolsets.set(toolApi, toolset)
+  return toolset
+}
+
+export function createDrawioTool(
+  name: string,
+  toolApi: DrawioToolFactory,
+): DrawioToolDefinition {
+  const toolset = createDrawioToolset(toolApi)
+  const definition = (toolset as Record<string, DrawioToolDefinition | undefined>)[name]
+  if (!definition) {
+    throw new Error(`Unknown Draw.io tool: ${name}`)
+  }
+  return definition
 }
