@@ -14,7 +14,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 3. 如果任务依赖项目内容，先读取相关工作区文件再设计或修改图表。
 4. 每次修改前立即调用`drawio_get_state`，取得最新XML和revision。
 5. 以最新XML中的图元、标签、几何和样式为起点，根据当前任务判断哪些内容需要保留、调整、删除或重构。
-6. 优先调用`drawio_patch(dry_run=true)`或`drawio_polish(dry_run=true)`生成同画布差异预览；字体、填充色、文字色、边框色、透明度等常用视觉属性用`operations[].style_updates`。只有页面背景或高级样式必须用完整XML表达时，先调用`drawio_preview_state(base_revision, xml)`，不得直接写入。普通任务调用`drawio_authorize_preview`，用户在弹窗允许后该工具会立即提交已展示的精确候选，Agent不得再重复调用正式patch/polish。注释任务继续调用`drawio_authorize_annotation_change`并按其范围授权流程写入。
+6. 普通任务调用`drawio_patch(dry_run=false)`、`drawio_polish(dry_run=false)`或`drawio_update_state`正式修改时，工具会在同一次调用中生成或复用同画布差异预览、弹出OpenCode审批，并仅在批准后写入。`dry_run=true`和`drawio_preview_state`可用于提前看图，但看完后必须继续调用对应正式工具触发审批，不能停在预览结果。字体、填充色、文字色、边框色、透明度等常用视觉属性用`operations[].style_updates`；页面背景或高级样式使用完整XML。注释任务继续调用`drawio_authorize_annotation_change`并按其范围授权流程写入。
 7. 收到`revision_conflict`时，重新读取最新状态，在新XML上重新执行当前任务所需的变更，再以新revision重试。禁止原样重发旧XML。
 8. 更新成功后，简要说明结构变化、当前revision以及是否合并了人工修改。
 
@@ -34,9 +34,9 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 - `drawio_finalize(file=...)`：读取最新revision、校验、评分、导出同名PNG，并通过`shouldOpenBrowser`说明是否需要打开新编辑器；已有编辑器连接时禁止重复打开。
 - `drawio_get_state(since_revision=...)`：返回最新XML、revision及可选的稳定ID变化。
 - `drawio_preview_state(base_revision=..., xml=..., annotation_id?)`：为完整XML候选生成只读同画布预览，不写文件、不增加revision；返回属性级样式差异、页面背景差异、完整稳定ID和候选哈希。
-- `drawio_update_state(base_revision=..., xml=..., preview_id=..., ...)`：只提交已经预览并获批、哈希完全一致的完整XML候选；不能跳过`drawio_preview_state`。
+- `drawio_update_state(base_revision=..., xml=..., preview_id?, approval_plan?, ...)`：普通任务会自动创建或复用完整XML预览并弹出审批，批准后只提交哈希完全一致的候选；注释任务仍需范围审批。
 - `drawio_patch(dry_run=true)` / `drawio_polish(dry_run=true)`：除返回结构化diff外，还会把临时预览XML推送到同一画布；预览栏可切换修改前/修改后并查看属性前后值。绿色为新增、黄色为修改、红色为删除或原位置、蓝色为变更连线。预览不写入源文件，连线高亮也不会覆盖候选线条颜色。
-- `drawio_authorize_preview(preview_id, plan)`：无活动注释的普通修改在看图后调用；OpenCode弹窗允许后，运行时在同一次工具调用中校验候选哈希和revision并立即写入，返回`applied=true`与新revision。无需也不得要求用户再发文字确认。
+- `drawio_authorize_preview(preview_id, plan)`：保留的兼容入口；可对已有普通预览弹窗审批并立即提交。新流程直接调用对应正式patch、polish或update工具即可，不应依赖Agent额外调用该入口。
 - 这些工具根据运行时上下文识别session，不需要用户手动传入session ID。
 - 浏览器保存发生409时，运行时会以稳定页面/图元ID进行保守三方合并；不重叠修改自动合并并落盘，但不强制刷新仍可能处于输入状态的画布；重叠修改则保留本地画布、逐字段展示差异，并让用户选择保留用户版或AI版的冲突字段。
 - 自动合并只用于浏览器保存；Agent工具遇到`revision_conflict`时仍必须重新读取、重新执行增量修改并提交，不得把旧XML换用新revision重发。

@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { createServer, type IncomingMessage, type Server } from "node:http"
 import { createConnection } from "node:net"
 import path from "node:path"
-import type { tool } from "@opencode-ai/plugin"
+import type { tool, ToolContext } from "@opencode-ai/plugin"
 import { XMLBuilder, XMLParser, XMLValidator } from "fast-xml-parser"
 import pako from "pako"
 
@@ -4507,6 +4507,84 @@ function authorizePatchPreview(
   broadcastPatchPreview(preview, "authorized")
 }
 
+function patchPreviewForCandidate(
+  session: IntegratedSession,
+  requestedPreviewId: string | undefined,
+  baseRevision: number,
+  candidateXml: string,
+): PatchPreview | null {
+  const preview = requestedPreviewId
+    ? getIntegratedBridgeState().patchPreviews.get(requestedPreviewId) || null
+    : currentPatchPreview(session)
+  if (!preview) {
+    if (requestedPreviewId) throw new Error("patch preview not found for this session and diagram")
+    return null
+  }
+  if (preview.sessionId !== session.sessionId
+    || preview.diagramKey !== integratedDiagramKey(session.file)) {
+    throw new Error("patch preview not found for this session and diagram")
+  }
+  currentPatchPreview(session)
+  if (preview.status !== "pending" && preview.status !== "authorized") {
+    if (!requestedPreviewId) return null
+    throw new Error(`patch preview is ${preview.status}; generate a fresh preview`)
+  }
+  if (preview.baseRevision !== baseRevision
+    || preview.candidateHash !== integratedHash(candidateXml)) {
+    if (requestedPreviewId) {
+      throw new Error("formal write does not match the requested preview candidate or revision")
+    }
+    return null
+  }
+  return preview
+}
+
+function defaultPatchPreviewPlan(preview: PatchPreview): string {
+  const summary = preview.diff.summary
+  return `Apply the visible Draw.io candidate: ${summary.added} added, ${summary.removed} removed, ${summary.changed} changed.`
+}
+
+async function requestPatchPreviewApproval(
+  context: ToolContext,
+  session: IntegratedSession,
+  preview: PatchPreview,
+  plan?: string,
+): Promise<string> {
+  if (preview.status !== "pending") {
+    throw new Error(`patch preview is ${preview.status}; generate a fresh preview`)
+  }
+  const approvalPattern = [
+    "drawio-preview",
+    integratedHash(preview.diagramKey).slice(0, 12),
+    preview.id,
+    `revision-${preview.baseRevision}`,
+    preview.candidateHash.slice(0, 16),
+  ].join(":")
+  try {
+    await context.ask({
+      permission: "drawio_authorize_preview",
+      patterns: [approvalPattern],
+      always: [approvalPattern],
+      metadata: {
+        file: preview.file,
+        previewId: preview.id,
+        plan: plan?.trim() || defaultPatchPreviewPlan(preview),
+        baseRevision: preview.baseRevision,
+        candidateHash: preview.candidateHash,
+        changedIds: preview.changedIds,
+        summary: preview.diff.summary,
+      },
+    })
+  } catch (error) {
+    cancelPatchPreview(session, preview, "用户未批准该修改预览")
+    throw error
+  }
+  await refreshIntegratedSession(session)
+  const approvalToken = randomBytes(24).toString("base64url")
+  authorizePatchPreview(session, preview, approvalToken)
+  return approvalToken
+}
+
 function validatePatchPreviewWrite(
   session: IntegratedSession,
   previewId: string | undefined,
@@ -8236,7 +8314,7 @@ const DRAWIO_RUNTIME_GUIDANCE = `## Draw.io 文件写入与交付
 每次修改前必须立即调用 drawio_get_state，并把返回的最新 XML 作为修改基线。人工编辑不是只读内容，可以按当前任务要求继续调整。
 提交时必须携带该次读取返回的准确 base_revision；revision_conflict 后重新读取，在新 XML 上重新执行所需变更并重试，禁止重发旧 XML。
 禁止用普通 write、edit 或脚本直接覆盖已绑定的 .drawio 文件，因为这会绕过 revision 检查并可能用旧快照丢失最新内容。
-对已绑定文件执行 drawio_patch 或 drawio_polish 时，先以 dry_run=true 生成同画布修改预览；字体、填充色、文字色、边框色等常用属性使用 drawio_patch.style_updates。只有完整 XML 才能表达的页面背景或高级样式先调用 drawio_preview_state，禁止直接调用 drawio_update_state 绕过预览。预览把修改前、真实修改后和带高亮覆盖层的前后对比分开，并提供可收起的属性级变化详情；绿色表示新增、黄色表示修改、红色表示删除或原位置、蓝色表示变更连线。普通修改调用 drawio_authorize_preview；用户在审批弹窗点击允许后，该工具会立即校验并提交画布中展示的精确候选，Agent 不得等待用户再发文字确认，也不得重复调用正式 patch/polish。注释修改继续调用 drawio_authorize_annotation_change，并把 dry-run 返回的 preview_id 与精确稳定 ID 清单一起纳入范围审批。
+对已绑定文件执行普通 drawio_patch、drawio_polish 或 drawio_update_state 正式修改时，工具会在同一次调用中创建或复用同画布候选预览、触发 OpenCode 审批弹窗，并仅在用户允许后复核 revision 与候选哈希再写入。dry_run=true 和 drawio_preview_state 仅用于提前看图；看完后调用对应正式工具即可触发审批，不要停在预览结果，也不要再调用 drawio_authorize_preview。字体、填充色、文字色、边框色等常用属性使用 drawio_patch.style_updates；只有完整 XML 才能表达的页面背景或高级样式使用 drawio_preview_state 后调用 drawio_update_state。预览把修改前、真实修改后和带高亮覆盖层的前后对比分开，并提供可收起的属性级变化详情；绿色表示新增、黄色表示修改、红色表示删除或原位置、蓝色表示变更连线。注释修改继续调用 drawio_authorize_annotation_change，并把 dry-run 返回的 preview_id 与精确稳定 ID 清单一起纳入范围审批。
 本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。调用前必须先调用 drawio_list_annotations(status='pending') 探测未完成注释；存在 requiresConfirmation=false 的注释时 drawio_finalize 会拒绝执行，必须先逐条处理并 drawio_resolve_annotation 后再重试，不得跳过。只有返回 shouldOpenBrowser=true 时才调用 MobileWork 工具 openwork_browser_open_url，并传入 url=openUrl、provider="builtin"；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
 drawio_export 支持 PNG、JPEG、PDF、xmlpng、SVG、xmlsvg 和 html2。SVG、xmlsvg、html2 由内置浏览器编辑器渲染并通过 Bridge 写回工作区；返回 editor_required 时必须立即调用 openwork_browser_open_url，并传入 url=openUrl、provider="builtin"，等待编辑器连接后用完全相同的参数重试，禁止把该状态解释为不支持格式或要求用户手工导出。PNG、JPEG、xmlpng、SVG、xmlsvg 使用 all_pages=true 时逐页生成文件并返回 outputs[]，必须核对 page_count 与 outputs 数量一致；PDF 和 html2 的 all_pages=true 各返回一个包含全部页面的多页单文件，html2 还需核对 contains_all_pages=true。
 
@@ -8771,7 +8849,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
 
     drawio_patch: defineTool({
       description:
-        "Apply semantic node and edge operations, including whitelisted font, color, stroke, opacity and shape-style updates, to an existing Draw.io file. Pass annotation_id when executing an annotation so its bound page is enforced. Preserves unrelated cells and creates a recoverable backup unless dry_run is true.",
+        "Apply semantic node and edge operations to an opened Draw.io file. A formal non-annotation write creates or reuses the exact canvas preview, opens the approval popup, then revalidates revision and candidate hash before committing. Pass annotation_id and its scoped approval when executing an annotation.",
       args: {
         file: tool.schema.string().describe("Workspace-relative .drawio or .xml file"),
         page: tool.schema
@@ -8808,11 +8886,20 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           .string()
           .optional()
           .describe("One-time token returned by drawio_authorize_preview; annotation approval_token also authorizes its linked preview"),
+        approval_plan: tool.schema
+          .string()
+          .optional()
+          .describe("Concise explanation shown in the automatic approval popup for a formal non-annotation write"),
       },
       async execute(args, context) {
         const target = resolveWorkspacePath(context, args.file)
         const session = integratedSessionFor(context, target)
         const activeSession = session ? await refreshIntegratedSession(session) : null
+        if (!activeSession && !args.dry_run) {
+          throw new Error(
+            "formal Draw.io changes require an active preview session; call drawio_open before writing",
+          )
+        }
         let pageSelector = args.page
         if (args.annotation_id) {
           if (!activeSession) {
@@ -8876,7 +8963,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
             diff,
             preview: preview ? patchPreviewPayload(preview) : null,
             previewGuidance: preview
-              ? "The exact candidate is visible in the bound Draw.io canvas. Review it before authorization."
+              ? "The exact candidate is visible in the bound Draw.io canvas. Call the same tool with dry_run=false to open the approval popup and apply this candidate."
               : "Bind the file with drawio_open or drawio_finalize to receive an interactive canvas preview.",
             ...report,
           }, null, 2)
@@ -8887,10 +8974,28 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
             || annotationGuard?.authorization.previewId
             || activeSession.activePreviewId
             || undefined
-          const preview = validatePatchPreviewWrite(
+          let preview = patchPreviewForCandidate(
             activeSession,
             previewId,
-            args.preview_approval_token || args.approval_token,
+            args.base_revision!,
+            afterXml,
+          )
+          if (!preview) {
+            preview = createPatchPreview(activeSession, beforeXml, afterXml, page.id, changedIds, diff)
+          }
+          let previewApprovalToken = args.preview_approval_token || args.approval_token
+          if (!annotationGuard && !previewApprovalToken) {
+            previewApprovalToken = await requestPatchPreviewApproval(
+              context,
+              activeSession,
+              preview,
+              args.approval_plan,
+            )
+          }
+          validatePatchPreviewWrite(
+            activeSession,
+            preview.id,
+            previewApprovalToken,
             args.base_revision!,
             afterXml,
           )
@@ -8921,23 +9026,13 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           }, null, 2)
         }
 
-        const writeResult = await atomicWrite(target, afterXml, true)
-        return JSON.stringify({
-          file: workspaceRelative(context, target),
-          dryRun: false,
-          backup: writeResult.backup
-            ? workspaceRelative(context, writeResult.backup)
-            : null,
-          changedIds,
-          diff,
-          ...report,
-        }, null, 2)
+        throw new Error("formal Draw.io changes require an active preview session; call drawio_open before writing")
       },
     }),
 
     drawio_polish: defineTool({
       description:
-        "Run a deterministic quality loop: analyze, auto-layout and reroute a page, validate the result, enforce a quality threshold, and optionally write with backup.",
+        "Run a deterministic quality loop over an opened Draw.io file. A formal non-annotation write previews the exact accepted layout, opens the approval popup, then revalidates and commits with backup.",
       args: {
         file: tool.schema.string().describe("Workspace-relative .drawio or .xml file"),
         page: tool.schema
@@ -8977,11 +9072,20 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           .string()
           .optional()
           .describe("One-time token returned by drawio_authorize_preview"),
+        approval_plan: tool.schema
+          .string()
+          .optional()
+          .describe("Concise explanation shown in the automatic approval popup for a formal non-annotation write"),
       },
       async execute(args, context) {
         const target = resolveWorkspacePath(context, args.file)
         const session = integratedSessionFor(context, target)
         const activeSession = session ? await refreshIntegratedSession(session) : null
+        if (!activeSession && !args.dry_run) {
+          throw new Error(
+            "formal Draw.io changes require an active preview session; call drawio_open before writing",
+          )
+        }
         if (activeSession && !args.dry_run && args.base_revision === undefined) {
           throw new Error(
             "base_revision is required for an active Draw.io session; "
@@ -9043,10 +9147,28 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
             || annotationGuard?.authorization.previewId
             || activeSession.activePreviewId
             || undefined
-          const preview = validatePatchPreviewWrite(
+          let preview = patchPreviewForCandidate(
             activeSession,
             previewId,
-            args.preview_approval_token || args.approval_token,
+            args.base_revision!,
+            afterXml,
+          )
+          if (!preview) {
+            preview = createPatchPreview(activeSession, beforeXml, afterXml, page.id, changedIds, diff)
+          }
+          let previewApprovalToken = args.preview_approval_token || args.approval_token
+          if (!annotationGuard && !previewApprovalToken) {
+            previewApprovalToken = await requestPatchPreviewApproval(
+              context,
+              activeSession,
+              preview,
+              args.approval_plan,
+            )
+          }
+          validatePatchPreviewWrite(
+            activeSession,
+            preview.id,
+            previewApprovalToken,
             args.base_revision!,
             afterXml,
           )
@@ -9067,7 +9189,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           if (annotationGuard) await consumeAnnotationAuthorization(activeSession, annotationGuard)
           writeResult = { backup: activeSession.backupFile }
         } else {
-          writeResult = await atomicWrite(target, afterXml, true)
+          throw new Error("formal Draw.io changes require an active preview session; call drawio_open before writing")
         }
         return JSON.stringify({
           ...result,
@@ -9207,7 +9329,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
 
     drawio_update_state: defineTool({
       description:
-        "Apply the exact complete-XML candidate from an approved drawio_preview_state preview. The candidate hash and base revision must match; a stale revision is rejected.",
+        "Apply an exact complete-XML candidate to the active Draw.io session. For a normal change, the tool creates or reuses its canvas preview, opens the approval popup, and writes only after revision and candidate-hash revalidation. Annotation changes still require their scoped approval.",
       args: {
         base_revision: tool.schema.number().int().min(0),
         xml: tool.schema.string().min(1),
@@ -9227,6 +9349,10 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           .string()
           .optional()
           .describe("Preview approval token; annotation approval_token also authorizes its linked preview"),
+        approval_plan: tool.schema
+          .string()
+          .optional()
+          .describe("Concise explanation shown in the automatic approval popup for a formal non-annotation write"),
       },
       async execute(args, context) {
         const session = getIntegratedBridgeState().sessions.get(context.sessionID)
@@ -9261,10 +9387,53 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           )
         }
         const previewId = args.preview_id || annotationGuard?.authorization.previewId || undefined
-        const preview = validatePatchPreviewWrite(
+        const beforePages = parseDrawio(session.xml)
+        const afterPages = parseDrawio(args.xml)
+        const candidateValidation = validationReport(afterPages)
+        if (!candidateValidation.valid) {
+          return JSON.stringify({
+            ok: false,
+            error: "invalid_drawio_xml",
+            validation: candidateValidation,
+          }, null, 2)
+        }
+        const diff = diffParsedPages(beforePages, afterPages)
+        let preview = patchPreviewForCandidate(
           session,
           previewId,
-          args.preview_approval_token || args.approval_token,
+          args.base_revision,
+          args.xml,
+        )
+        if (!preview) {
+          const firstAffectedPageId = diff.changed[0]?.pageId
+            || (diff.added[0] ? previewPageIdFromKey(diff.added[0].key, diff.added[0].cell.id) : undefined)
+            || (diff.removed[0] ? previewPageIdFromKey(diff.removed[0].key, diff.removed[0].cell.id) : undefined)
+            || diff.pageChanges[0]?.pageId
+            || afterPages[0]?.id
+            || beforePages[0]?.id
+            || "page-1"
+          preview = createPatchPreview(
+            session,
+            session.xml,
+            args.xml,
+            firstAffectedPageId,
+            [],
+            diff,
+          )
+        }
+        let previewApprovalToken = args.preview_approval_token || args.approval_token
+        if (!annotationGuard && !previewApprovalToken) {
+          previewApprovalToken = await requestPatchPreviewApproval(
+            context,
+            session,
+            preview,
+            args.approval_plan,
+          )
+        }
+        validatePatchPreviewWrite(
+          session,
+          preview.id,
+          previewApprovalToken,
           args.base_revision,
           args.xml,
         )
@@ -9550,30 +9719,12 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
         if (preview.status !== "pending") {
           throw new Error(`patch preview is ${preview.status}; generate a fresh dry-run preview`)
         }
-        const approvalPattern = [
-          "drawio-preview",
-          integratedHash(preview.diagramKey).slice(0, 12),
-          preview.id,
-          `revision-${preview.baseRevision}`,
-          preview.candidateHash.slice(0, 16),
-        ].join(":")
-        await context.ask({
-          permission: "drawio_authorize_preview",
-          patterns: [approvalPattern],
-          always: [approvalPattern],
-          metadata: {
-            file: preview.file,
-            previewId: preview.id,
-            plan: args.plan.trim(),
-            baseRevision: preview.baseRevision,
-            candidateHash: preview.candidateHash,
-            changedIds: preview.changedIds,
-            summary: preview.diff.summary,
-          },
-        })
-        await refreshIntegratedSession(session)
-        const approvalToken = randomBytes(24).toString("base64url")
-        authorizePatchPreview(session, preview, approvalToken)
+        const approvalToken = await requestPatchPreviewApproval(
+          context,
+          session,
+          preview,
+          args.plan,
+        )
         validatePatchPreviewWrite(
           session,
           preview.id,

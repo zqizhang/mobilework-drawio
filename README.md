@@ -240,10 +240,10 @@ Agent 或外部写入产生新 revision 时，浏览器会提示但不会强制�
 预览栏可在“修改前”和“修改后”之间切换，并列出字体大小、字体颜色、填充色、线条颜色、几何尺寸和
 页面背景等属性的前后值；颜色属性同时显示色块。连线高亮使用独立叠加连线，不会覆盖候选版本真正的线条颜色。
 
-普通修改通过 `drawio_authorize_preview` 请求 OpenCode 写前审批；用户点击允许后，该工具会在同一次
-调用中校验 preview ID、候选 XML 哈希和 `base_revision`，并立即提交画布中看到的候选版本，不需要
-用户再发一条“同意执行”，Agent 也不得重复调用正式 `drawio_patch`/`drawio_polish`。完整 XML 的正式写入
-必须来自 `drawio_preview_state` 生成并批准的精确候选，不能直接调用 `drawio_update_state` 绕过预览。注释任务继续使用
+普通正式 `drawio_patch`、`drawio_polish` 和 `drawio_update_state` 会在同一次调用中创建或复用预览、请求
+OpenCode 写前审批，并在用户点击允许后校验 preview ID、候选 XML 哈希和 `base_revision` 再提交。
+`dry_run=true` 与 `drawio_preview_state` 可用于提前看图，但不会写入；随后调用对应正式工具才会触发审批。
+`drawio_authorize_preview` 仅作为旧调用流程的兼容入口。注释任务继续使用
 `drawio_authorize_annotation_change`，并可绑定当前预览。用户退出预览、预览超过 30 分钟或图表
 revision 发生变化后，预览都会失效，必须重新 dry-run。预览状态下编辑器会停用保存和导出，Bridge
 也会拒绝任何含预览专用图元的 XML，避免临时标记污染源文件。

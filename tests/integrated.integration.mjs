@@ -233,6 +233,28 @@ try {
   assert.equal(createResult.created, "architecture.drawio")
   assert.equal((await fs.stat(path.join(workspace, "architecture.drawio"))).isFile(), true)
 
+  await assert.rejects(
+    plugin.tool.drawio_patch.execute({
+      file: "architecture.drawio",
+      operations: [{ type: "update-node", id: "node", label: "Unbound write" }],
+      dry_run: false,
+    }, context),
+    /active preview session; call drawio_open/,
+  )
+  assert.doesNotMatch(
+    await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"),
+    /Unbound write/,
+  )
+  await assert.rejects(
+    plugin.tool.drawio_polish.execute({
+      file: "architecture.drawio",
+      direction: "left-to-right",
+      threshold: 0,
+      dry_run: false,
+    }, context),
+    /active preview session; call drawio_open/,
+  )
+
   const validateResult = JSON.parse(await plugin.tool.drawio_validate.execute({
     input_path: "architecture.drawio",
   }, context))
@@ -393,12 +415,21 @@ try {
   assert.equal(stale.current.revision, 1)
   assert.equal(stale.manualChanges.available, true)
 
+  const beforeRejectedApproval = await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8")
   await assert.rejects(
     plugin.tool.drawio_update_state.execute({
       base_revision: 1,
       xml: manualXml.replace("MobileWork Manual", "No Preview"),
-    }, context),
-    /preview_id is required/,
+      approval_plan: "Reject this complete XML candidate",
+    }, {
+      ...context,
+      async ask() { throw new Error("approval declined") },
+    }),
+    /approval declined/,
+  )
+  assert.equal(
+    await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"),
+    beforeRejectedApproval,
   )
   const concurrent = await Promise.all([
     fetch(apiUrl, {
@@ -799,29 +830,23 @@ try {
   assert.match(await nextPreviewEvent(), /^: connected/)
 
   const generalPreviewState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
-  const generalPreviewDryRun = JSON.parse(await plugin.tool.drawio_patch.execute({
-    file: "architecture.drawio",
-    operations: [{ type: "update-node", id: "neighbor", label: "Neighbor Preview" }],
-    dry_run: true,
-    base_revision: generalPreviewState.revision,
-  }, context))
-  const createdPreviewEvent = await nextMatchingSseFrame(nextPreviewEvent, /"kind":"created"/)
-  assert.match(createdPreviewEvent, /^event: preview\ndata: /)
   const previewApprovalRequests = []
   const previewContext = {
     ...context,
     async ask(input) { previewApprovalRequests.push(input) },
   }
-  const generalPreviewAuthorization = JSON.parse(await plugin.tool.drawio_authorize_preview.execute({
+  const generalPreviewAuthorization = JSON.parse(await plugin.tool.drawio_patch.execute({
     file: "architecture.drawio",
-    preview_id: generalPreviewDryRun.preview.id,
-    plan: "将 Neighbor 节点改名为 Neighbor Preview",
+    operations: [{ type: "update-node", id: "neighbor", label: "Neighbor Preview" }],
+    dry_run: false,
+    base_revision: generalPreviewState.revision,
+    approval_plan: "将 Neighbor 节点改名为 Neighbor Preview",
   }, previewContext))
   assert.equal(previewApprovalRequests.length, 1)
   assert.equal(previewApprovalRequests[0].permission, "drawio_authorize_preview")
-  assert.equal(generalPreviewAuthorization.applied, true)
-  assert.equal(generalPreviewAuthorization.preview.status, "applied")
   assert.equal(generalPreviewAuthorization.revision, generalPreviewState.revision + 1)
+  const createdPreviewEvent = await nextMatchingSseFrame(nextPreviewEvent, /"kind":"created"/)
+  assert.match(createdPreviewEvent, /^event: preview\ndata: /)
   assert.match(await nextMatchingSseFrame(nextPreviewEvent, /"kind":"authorized"/), /^event: preview/)
   assert.match(await nextMatchingSseFrame(nextPreviewEvent, /"kind":"applied"/), /^event: preview/)
   assert.match(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /Neighbor Preview/)
@@ -1953,6 +1978,52 @@ try {
   assert.equal(pageHtml.page_name, "Page-2")
   await svgEventsReader.cancel()
 
+  const automaticApprovalRequests = []
+  const automaticContext = {
+    ...context,
+    sessionID: "automatic-approval-session",
+    messageID: "automatic-approval-message",
+    async ask(input) { automaticApprovalRequests.push(input) },
+  }
+  await plugin.tool.drawio_create.execute({
+    file: "automatic-approval.drawio",
+    title: "Automatic approval",
+    nodes: [
+      { id: "auto-a", label: "A" },
+      { id: "auto-b", label: "B" },
+    ],
+    edges: [{ id: "auto-edge", source: "auto-a", target: "auto-b" }],
+    direction: "left-to-right",
+    compressed: false,
+    overwrite: false,
+  }, automaticContext)
+  await plugin.tool.drawio_open.execute({ file: "automatic-approval.drawio" }, automaticContext)
+  const automaticState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, automaticContext))
+  const automaticXml = automaticState.xml.replace('value="A"', 'value="A updated"')
+  assert.notEqual(automaticXml, automaticState.xml)
+  const automaticUpdate = JSON.parse(await plugin.tool.drawio_update_state.execute({
+    base_revision: automaticState.revision,
+    xml: automaticXml,
+    approval_plan: "Rename node A",
+  }, automaticContext))
+  assert.equal(automaticUpdate.revision, automaticState.revision + 1)
+  assert.equal(automaticApprovalRequests.length, 1)
+  assert.equal(automaticApprovalRequests[0].permission, "drawio_authorize_preview")
+  assert.equal(automaticApprovalRequests[0].metadata.plan, "Rename node A")
+
+  const automaticPolish = JSON.parse(await plugin.tool.drawio_polish.execute({
+    file: "automatic-approval.drawio",
+    direction: "left-to-right",
+    threshold: 0,
+    dry_run: false,
+    base_revision: automaticUpdate.revision,
+    approval_plan: "Apply automatic layout",
+  }, automaticContext))
+  assert.equal(automaticPolish.dryRun, false)
+  assert.equal(automaticApprovalRequests.length, 2)
+  assert.equal(automaticApprovalRequests[1].permission, "drawio_authorize_preview")
+  assert.equal(automaticApprovalRequests[1].metadata.plan, "Apply automatic layout")
+
   console.log(JSON.stringify({
     ok: true,
     openUrl: true,
@@ -2001,6 +2072,11 @@ try {
     patchPreviewCancelWithoutWrite: true,
     patchPreviewBrowserActions: true,
     patchPreviewOneClickApply: true,
+    automaticPatchApproval: true,
+    automaticXmlApproval: true,
+    automaticPolishApproval: true,
+    rejectedApprovalDoesNotWrite: true,
+    unboundFormalWriteRejected: true,
     unicodePageIdExport: true,
   }, null, 2))
 } finally {
