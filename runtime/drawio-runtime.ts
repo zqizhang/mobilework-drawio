@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { createServer, type IncomingMessage, type Server } from "node:http"
 import { createConnection } from "node:net"
 import path from "node:path"
-import type { tool, ToolContext } from "@opencode-ai/plugin"
+import type { tool } from "@opencode-ai/plugin"
 import { XMLBuilder, XMLParser, XMLValidator } from "fast-xml-parser"
 import pako from "pako"
 
@@ -99,6 +99,8 @@ type QualityIssue = {
     | "node-overlap"
     | "edge-through-node"
     | "edge-crossing"
+    | "edge-overlap"
+    | "shared-port-congestion"
     | "label-overlap"
     | "empty-label"
     | "missing-line-jump"
@@ -1317,6 +1319,10 @@ function nodeStyle(kind: DiagramNode["kind"]): string {
   return base + styles[kind || "default"]
 }
 
+function distributedPortRatio(index: number, count: number): number {
+  return (index + 1) / (count + 1)
+}
+
 function buildGraphModel(
   nodes: DiagramNode[],
   edges: DiagramEdge[],
@@ -1368,9 +1374,27 @@ function buildGraphModel(
     const id = edge.id || `edge-${index + 1}`
     const source = positions.get(edge.source)!
     const target = positions.get(edge.target)!
-    const siblingEdges = edges.filter((candidate) => candidate.source === edge.source)
+    const crossAxisCenter = (nodeId: string) => {
+      const position = positions.get(nodeId)!
+      return direction === "left-to-right"
+        ? position.y + position.height / 2
+        : position.x + position.width / 2
+    }
+    const siblingEdges = edges
+      .filter((candidate) => candidate.source === edge.source)
+      .sort((left, right) =>
+        crossAxisCenter(left.target) - crossAxisCenter(right.target)
+        || edges.indexOf(left) - edges.indexOf(right))
     const siblingIndex = siblingEdges.indexOf(edge)
-    const laneOffset = (siblingIndex - (siblingEdges.length - 1) / 2) * 18
+    const incomingEdges = edges
+      .filter((candidate) => candidate.target === edge.target)
+      .sort((left, right) =>
+        crossAxisCenter(left.source) - crossAxisCenter(right.source)
+        || edges.indexOf(left) - edges.indexOf(right))
+    const incomingIndex = incomingEdges.indexOf(edge)
+    const sourcePortRatio = distributedPortRatio(siblingIndex, siblingEdges.length)
+    const targetPortRatio = distributedPortRatio(incomingIndex, incomingEdges.length)
+    const laneOffset = ((siblingEdges.length - 1) / 2 - siblingIndex) * 18
 
     let style = EDGE_BASE_STYLE
     let points: string
@@ -1381,9 +1405,9 @@ function buildGraphModel(
       const corridor = targetLeft > sourceRight
         ? (sourceRight + targetLeft) / 2 + laneOffset
         : Math.max(sourceRight, target.x + target.width) + 80 + siblingIndex * 18
-      const sourceY = source.y + source.height / 2
-      const targetY = target.y + target.height / 2
-      style += "exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;"
+      const sourceY = source.y + source.height * sourcePortRatio
+      const targetY = target.y + target.height * targetPortRatio
+      style += `exitX=1;exitY=${sourcePortRatio};exitDx=0;exitDy=0;entryX=0;entryY=${targetPortRatio};entryDx=0;entryDy=0;`
       points = `          <mxPoint x="${corridor}" y="${sourceY}"/>
           <mxPoint x="${corridor}" y="${targetY}"/>`
     } else {
@@ -1392,9 +1416,9 @@ function buildGraphModel(
       const corridor = targetTop > sourceBottom
         ? (sourceBottom + targetTop) / 2 + laneOffset
         : Math.max(sourceBottom, target.y + target.height) + 80 + siblingIndex * 18
-      const sourceX = source.x + source.width / 2
-      const targetX = target.x + target.width / 2
-      style += "exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;"
+      const sourceX = source.x + source.width * sourcePortRatio
+      const targetX = target.x + target.width * targetPortRatio
+      style += `exitX=${sourcePortRatio};exitY=1;exitDx=0;exitDy=0;entryX=${targetPortRatio};entryY=0;entryDx=0;entryDy=0;`
       points = `          <mxPoint x="${sourceX}" y="${corridor}"/>
           <mxPoint x="${targetX}" y="${corridor}"/>`
     }
@@ -1824,6 +1848,60 @@ function properSegmentIntersection(
   )
 }
 
+function collinearSegmentOverlapLength(
+  leftStart: Point,
+  leftEnd: Point,
+  rightStart: Point,
+  rightEnd: Point,
+): number {
+  const leftDx = leftEnd.x - leftStart.x
+  const leftDy = leftEnd.y - leftStart.y
+  const rightDx = rightEnd.x - rightStart.x
+  const rightDy = rightEnd.y - rightStart.y
+  const leftLength = Math.hypot(leftDx, leftDy)
+  const rightLength = Math.hypot(rightDx, rightDy)
+  if (leftLength < 1e-6 || rightLength < 1e-6) return 0
+
+  const parallelError = Math.abs(leftDx * rightDy - leftDy * rightDx)
+    / (leftLength * rightLength)
+  if (parallelError > 1e-6) return 0
+
+  const unitX = leftDx / leftLength
+  const unitY = leftDy / leftLength
+  const perpendicularDistance = (point: Point) => Math.abs(
+    (point.x - leftStart.x) * unitY - (point.y - leftStart.y) * unitX,
+  )
+  if (perpendicularDistance(rightStart) > 0.5 || perpendicularDistance(rightEnd) > 0.5) {
+    return 0
+  }
+
+  const project = (point: Point) =>
+    (point.x - leftStart.x) * unitX + (point.y - leftStart.y) * unitY
+  const rightA = project(rightStart)
+  const rightB = project(rightEnd)
+  const overlapStart = Math.max(0, Math.min(rightA, rightB))
+  const overlapEnd = Math.min(leftLength, Math.max(rightA, rightB))
+  return Math.max(0, overlapEnd - overlapStart)
+}
+
+function polylineOverlapLength(left: Point[], right: Point[]): number {
+  let maximum = 0
+  for (let leftIndex = 0; leftIndex < left.length - 1; leftIndex += 1) {
+    for (let rightIndex = 0; rightIndex < right.length - 1; rightIndex += 1) {
+      maximum = Math.max(
+        maximum,
+        collinearSegmentOverlapLength(
+          left[leftIndex],
+          left[leftIndex + 1],
+          right[rightIndex],
+          right[rightIndex + 1],
+        ),
+      )
+    }
+  }
+  return maximum
+}
+
 function segmentIntersectsRectangleInterior(
   start: Point,
   end: Point,
@@ -1868,6 +1946,8 @@ function qualityReport(pages: ParsedPage[], threshold = 90) {
     overlaps: 0,
     edgeNodeIntersections: 0,
     edgeCrossings: 0,
+    edgeOverlaps: 0,
+    sharedPortCongestions: 0,
     labelOverlaps: 0,
     emptyLabels: 0,
     missingLineJumps: 0,
@@ -1956,6 +2036,49 @@ function qualityReport(pages: ParsedPage[], threshold = 90) {
       }
     }
 
+    const portGroups = new Map<string, {
+      vertexId: string
+      role: "source" | "target"
+      edges: string[]
+    }>()
+    const coordinateKey = (value: number) => Math.round(value * 100) / 100
+    for (const edge of edges) {
+      const polyline = polylines.get(edge.id)
+      if (!polyline || polyline.length < 2) continue
+      const endpoints = [
+        { role: "source" as const, vertexId: edge.source, point: polyline[0] },
+        { role: "target" as const, vertexId: edge.target, point: polyline[polyline.length - 1] },
+      ]
+      for (const endpoint of endpoints) {
+        if (!endpoint.vertexId) continue
+        const key = [
+          endpoint.role,
+          endpoint.vertexId,
+          coordinateKey(endpoint.point.x),
+          coordinateKey(endpoint.point.y),
+        ].join(":")
+        const group = portGroups.get(key) || {
+          vertexId: endpoint.vertexId,
+          role: endpoint.role,
+          edges: [],
+        }
+        group.edges.push(edge.id)
+        portGroups.set(key, group)
+      }
+    }
+    for (const group of portGroups.values()) {
+      if (group.edges.length < 2) continue
+      metrics.sharedPortCongestions += 1
+      issues.push({
+        code: "shared-port-congestion",
+        severity: "error",
+        page: page.name,
+        cells: [group.vertexId, ...group.edges],
+        message:
+          `${page.name}: ${group.edges.length} edges share the same ${group.role} port on node ${group.vertexId}`,
+      })
+    }
+
     for (const edge of edges) {
       const labelRectangle = edgeLabelRectangles.get(edge.id)
       if (!labelRectangle) continue
@@ -1998,16 +2121,20 @@ function qualityReport(pages: ParsedPage[], threshold = 90) {
       if (!leftPolyline) continue
       for (let rightIndex = leftIndex + 1; rightIndex < edges.length; rightIndex += 1) {
         const right = edges[rightIndex]
-        if (
-          left.source === right.source
-          || left.source === right.target
-          || left.target === right.source
-          || left.target === right.target
-        ) {
-          continue
-        }
         const rightPolyline = polylines.get(right.id)
         if (!rightPolyline) continue
+        const overlapLength = polylineOverlapLength(leftPolyline, rightPolyline)
+        if (overlapLength >= 8) {
+          metrics.edgeOverlaps += 1
+          issues.push({
+            code: "edge-overlap",
+            severity: "error",
+            page: page.name,
+            cells: [left.id, right.id],
+            message:
+              `${page.name}: edges ${left.id} and ${right.id} overlap for ${Math.round(overlapLength)}px`,
+          })
+        }
         const crossing = leftPolyline.slice(0, -1).some((leftPoint, leftSegment) =>
           rightPolyline.slice(0, -1).some((rightPoint, rightSegment) =>
             properSegmentIntersection(
@@ -2038,6 +2165,8 @@ function qualityReport(pages: ParsedPage[], threshold = 90) {
       - metrics.overlaps * 12
       - metrics.edgeNodeIntersections * 8
       - metrics.edgeCrossings * 4
+      - metrics.edgeOverlaps * 10
+      - metrics.sharedPortCongestions * 8
       - metrics.labelOverlaps * 6
       - metrics.emptyLabels * 2
       - metrics.missingLineJumps,
@@ -2047,6 +2176,8 @@ function qualityReport(pages: ParsedPage[], threshold = 90) {
       validation.valid
       && metrics.overlaps === 0
       && metrics.edgeNodeIntersections === 0
+      && metrics.edgeOverlaps === 0
+      && metrics.sharedPortCongestions === 0
       && metrics.labelOverlaps === 0
       && score >= threshold,
     score,
@@ -2162,9 +2293,29 @@ function autoLayoutPage(page: EditablePage, direction: Direction): string[] {
     const targetId = attribute(edge["@_target"])!
     const source = positions.get(sourceId)!
     const target = positions.get(targetId)!
-    const siblings = edges.filter((candidate) => attribute(candidate["@_source"]) === sourceId)
+    const crossAxisCenter = (vertexId: string) => {
+      const position = positions.get(vertexId)!
+      return direction === "left-to-right"
+        ? position.y + position.height / 2
+        : position.x + position.width / 2
+    }
+    const siblings = edges
+      .filter((candidate) => attribute(candidate["@_source"]) === sourceId)
+      .sort((left, right) =>
+        crossAxisCenter(attribute(left["@_target"])!)
+        - crossAxisCenter(attribute(right["@_target"])!)
+        || rawCellId(left).localeCompare(rawCellId(right)))
     const siblingIndex = siblings.indexOf(edge)
-    const laneOffset = (siblingIndex - (siblings.length - 1) / 2) * 18
+    const incoming = edges
+      .filter((candidate) => attribute(candidate["@_target"]) === targetId)
+      .sort((left, right) =>
+        crossAxisCenter(attribute(left["@_source"])!)
+        - crossAxisCenter(attribute(right["@_source"])!)
+        || rawCellId(left).localeCompare(rawCellId(right)))
+    const incomingIndex = incoming.indexOf(edge)
+    const sourcePortRatio = distributedPortRatio(siblingIndex, siblings.length)
+    const targetPortRatio = distributedPortRatio(incomingIndex, incoming.length)
+    const laneOffset = ((siblings.length - 1) / 2 - siblingIndex) * 18
     const geometry = rawGeometry(edge)
     geometry["@_relative"] = "1"
     geometry["@_as"] = "geometry"
@@ -2178,12 +2329,12 @@ function autoLayoutPage(page: EditablePage, direction: Direction): string[] {
         ? (sourceRight + targetLeft) / 2 + laneOffset
         : Math.max(sourceRight, target.x + target.width) + 80 + edgeIndex * 18
       points = [
-        { x: corridor, y: source.y + source.height / 2 },
-        { x: corridor, y: target.y + target.height / 2 },
+        { x: corridor, y: source.y + source.height * sourcePortRatio },
+        { x: corridor, y: target.y + target.height * targetPortRatio },
       ]
       anchors = {
-        exitX: "1", exitY: "0.5", exitDx: "0", exitDy: "0",
-        entryX: "0", entryY: "0.5", entryDx: "0", entryDy: "0",
+        exitX: "1", exitY: String(sourcePortRatio), exitDx: "0", exitDy: "0",
+        entryX: "0", entryY: String(targetPortRatio), entryDx: "0", entryDy: "0",
       }
     } else {
       const sourceBottom = source.y + source.height
@@ -2192,12 +2343,12 @@ function autoLayoutPage(page: EditablePage, direction: Direction): string[] {
         ? (sourceBottom + targetTop) / 2 + laneOffset
         : Math.max(sourceBottom, target.y + target.height) + 80 + edgeIndex * 18
       points = [
-        { x: source.x + source.width / 2, y: corridor },
-        { x: target.x + target.width / 2, y: corridor },
+        { x: source.x + source.width * sourcePortRatio, y: corridor },
+        { x: target.x + target.width * targetPortRatio, y: corridor },
       ]
       anchors = {
-        exitX: "0.5", exitY: "1", exitDx: "0", exitDy: "0",
-        entryX: "0.5", entryY: "0", entryDx: "0", entryDy: "0",
+        exitX: String(sourcePortRatio), exitY: "1", exitDx: "0", exitDy: "0",
+        entryX: String(targetPortRatio), entryY: "0", entryDx: "0", entryDy: "0",
       }
     }
     geometry.Array = {
@@ -3125,7 +3276,7 @@ type AnnotationEffectiveStatus = AnnotationWorkflowStatus | "stale"
 type AnnotationStatusFilter = AnnotationWorkflowStatus | "pending" | "fresh" | "stale" | "all"
 
 type AnnotationAuthorization = {
-  token: string
+  approvalToken: string
   sessionId: string
   diagramKey: string
   scope: AnnotationScope
@@ -3139,6 +3290,46 @@ type AnnotationAuthorization = {
 }
 
 type PatchPreviewStatus = "pending" | "authorized" | "cancelled" | "applied" | "stale"
+
+type ApprovalReviewStatus =
+  | "awaiting_question"
+  | "waiting_for_user"
+  | "approved"
+  | "cancelled"
+  | "feedback"
+  | "consumed"
+  | "stale"
+
+type ApprovalQuestion = {
+  question: string
+  header: string
+  options: Array<{ label: string; description: string }>
+  multiple: false
+  custom: true
+}
+
+type ApprovalReview = {
+  id: string
+  fingerprint: string
+  kind: "preview" | "annotation"
+  sessionId: string
+  diagramKey: string
+  previewId: string
+  baseRevision: number
+  candidateHash: string
+  plan: string
+  annotationId: string | null
+  requestedScope: AnnotationScope | null
+  proposedChangedIds: string[]
+  escalationReason: string | null
+  question: ApprovalQuestion
+  requestIds: string[]
+  status: ApprovalReviewStatus
+  feedback: string | null
+  createdAt: string
+  expiresAt: number
+  resolvedAt: string | null
+}
 
 type PatchPreview = {
   id: string
@@ -3161,6 +3352,7 @@ type PatchPreview = {
   approvalToken: string | null
   approvedAt: string | null
   consumedAt: string | null
+  approvalReviewId: string | null
   createdAt: string
   expiresAt: number
   terminalAt: number | null
@@ -3234,6 +3426,8 @@ type IntegratedBridgeState = {
   previewActive: number
   previewWaiters: Array<() => void>
   patchPreviews: Map<string, PatchPreview>
+  approvalReviews: Map<string, ApprovalReview>
+  questionReviewIds: Map<string, string>
 }
 
 const integratedBridgeGlobal = globalThis as typeof globalThis & {
@@ -3260,6 +3454,8 @@ function getIntegratedBridgeState(): IntegratedBridgeState {
       previewActive: 0,
       previewWaiters: [],
       patchPreviews: new Map(),
+      approvalReviews: new Map(),
+      questionReviewIds: new Map(),
     }
   }
   integratedBridgeGlobal.__drawioIntegratedBridge.writeQueues ||= new Map()
@@ -3272,6 +3468,8 @@ function getIntegratedBridgeState(): IntegratedBridgeState {
   integratedBridgeGlobal.__drawioIntegratedBridge.previewActive ||= 0
   integratedBridgeGlobal.__drawioIntegratedBridge.previewWaiters ||= []
   integratedBridgeGlobal.__drawioIntegratedBridge.patchPreviews ||= new Map()
+  integratedBridgeGlobal.__drawioIntegratedBridge.approvalReviews ||= new Map()
+  integratedBridgeGlobal.__drawioIntegratedBridge.questionReviewIds ||= new Map()
   return integratedBridgeGlobal.__drawioIntegratedBridge
 }
 
@@ -4375,12 +4573,48 @@ function broadcastPatchPreview(preview: PatchPreview, kind: string): void {
 
 function prunePatchPreviews(now = Date.now()): void {
   const state = getIntegratedBridgeState()
+  for (const [id, review] of state.approvalReviews) {
+    if (
+      review.expiresAt <= now
+      && !["consumed", "cancelled", "feedback", "stale"].includes(review.status)
+    ) {
+      review.status = "stale"
+      review.resolvedAt = new Date(now).toISOString()
+    }
+    if (
+      review.resolvedAt
+      && Date.parse(review.resolvedAt) + PATCH_PREVIEW_RETENTION_MS <= now
+    ) {
+      for (const requestId of review.requestIds) state.questionReviewIds.delete(requestId)
+      state.approvalReviews.delete(id)
+    }
+  }
   for (const [id, preview] of state.patchPreviews) {
     const terminalAt = preview.terminalAt
     if (terminalAt !== null && terminalAt + PATCH_PREVIEW_RETENTION_MS <= now) {
       state.patchPreviews.delete(id)
     }
   }
+}
+
+function clearApprovalQuestionBindings(review: ApprovalReview): void {
+  const state = getIntegratedBridgeState()
+  for (const requestId of review.requestIds) state.questionReviewIds.delete(requestId)
+}
+
+function invalidateApprovalReview(
+  preview: PatchPreview,
+  status: "cancelled" | "stale",
+  reason: string,
+): void {
+  if (!preview.approvalReviewId) return
+  const state = getIntegratedBridgeState()
+  const review = state.approvalReviews.get(preview.approvalReviewId)
+  if (!review || ["consumed", "cancelled", "feedback", "stale"].includes(review.status)) return
+  review.status = status
+  review.feedback = reason
+  review.resolvedAt = new Date().toISOString()
+  clearApprovalQuestionBindings(review)
 }
 
 function currentPatchPreview(session: IntegratedSession): PatchPreview | null {
@@ -4399,6 +4633,7 @@ function currentPatchPreview(session: IntegratedSession): PatchPreview | null {
     preview.approvalToken = null
     preview.terminalAt = Date.now()
     session.activePreviewId = null
+    invalidateApprovalReview(preview, "stale", preview.statusReason)
     broadcastPatchPreview(preview, "stale")
   } else if ((preview.status === "pending" || preview.status === "authorized")
     && (preview.baseRevision !== session.revision || preview.baseFileHash !== session.fileHash)) {
@@ -4407,6 +4642,7 @@ function currentPatchPreview(session: IntegratedSession): PatchPreview | null {
     preview.approvalToken = null
     preview.terminalAt = Date.now()
     session.activePreviewId = null
+    invalidateApprovalReview(preview, "stale", preview.statusReason)
     broadcastPatchPreview(preview, "stale")
   }
   return preview
@@ -4418,6 +4654,7 @@ function cancelPatchPreview(session: IntegratedSession, preview: PatchPreview, r
   preview.statusReason = reason
   preview.approvalToken = null
   preview.terminalAt = Date.now()
+  invalidateApprovalReview(preview, "cancelled", reason)
   if (session.activePreviewId === preview.id) session.activePreviewId = null
   broadcastPatchPreview(preview, "cancelled")
 }
@@ -4480,6 +4717,7 @@ function createPatchPreview(
     approvalToken: null,
     approvedAt: null,
     consumedAt: null,
+    approvalReviewId: null,
     createdAt,
     expiresAt: Date.now() + PATCH_PREVIEW_TTL_MS,
     terminalAt: null,
@@ -4544,45 +4782,222 @@ function defaultPatchPreviewPlan(preview: PatchPreview): string {
   return `Apply the visible Draw.io candidate: ${summary.added} added, ${summary.removed} removed, ${summary.changed} changed.`
 }
 
-async function requestPatchPreviewApproval(
-  context: ToolContext,
+type ApprovalReviewInput = {
+  kind: "preview" | "annotation"
+  plan: string
+  annotationId?: string
+  requestedScope?: AnnotationScope
+  proposedChangedIds?: string[]
+  escalationReason?: string | null
+}
+
+type ForwardedApprovalAnswer = {
+  reviewId?: string
+  answer?: string
+}
+
+type ApprovalReviewOutcome =
+  | { approved: true; approvalToken: string; review: ApprovalReview }
+  | { approved: false; payload: Record<string, unknown>; review: ApprovalReview }
+
+const APPROVAL_CONFIRM_LABEL = "确认修改"
+const APPROVAL_CANCEL_LABEL = "取消修改"
+
+function approvalQuestion(review: Omit<ApprovalReview, "question">): ApprovalQuestion {
+  const scope = review.requestedScope ? `；范围：${annotationScopeLabel(review.requestedScope)}` : ""
+  const changedIds = review.proposedChangedIds.length > 0
+    ? `；变更 ID：${review.proposedChangedIds.join(", ")}`
+    : ""
+  return {
+    header: review.kind === "annotation" ? "批注修改审批" : "图表修改审批",
+    question:
+      `已在 Draw.io 画布展示候选修改，是否批准写入 ${review.baseRevision} 号版本？`
+      + `\n计划：${review.plan}${scope}${changedIds}`
+      + `\n审批编号：${review.id}`,
+    options: [
+      {
+        label: APPROVAL_CONFIRM_LABEL,
+        description: "仅批准当前画布中与该审批编号绑定的候选修改。",
+      },
+      {
+        label: APPROVAL_CANCEL_LABEL,
+        description: "不写入当前候选并使本次预览失效。",
+      },
+    ],
+    multiple: false,
+    custom: true,
+  }
+}
+
+function approvalReviewFingerprint(
+  preview: PatchPreview,
+  input: ApprovalReviewInput,
+): string {
+  return integratedHash(JSON.stringify({
+    kind: input.kind,
+    previewId: preview.id,
+    baseRevision: preview.baseRevision,
+    candidateHash: preview.candidateHash,
+    plan: input.plan.trim(),
+    annotationId: input.annotationId || null,
+    requestedScope: input.requestedScope || null,
+    proposedChangedIds: [...(input.proposedChangedIds || [])].toSorted(),
+    escalationReason: input.escalationReason?.trim() || null,
+  }))
+}
+
+function ensureApprovalReview(
   session: IntegratedSession,
   preview: PatchPreview,
-  plan?: string,
-): Promise<string> {
+  input: ApprovalReviewInput,
+): ApprovalReview {
   if (preview.status !== "pending") {
     throw new Error(`patch preview is ${preview.status}; generate a fresh preview`)
   }
-  const approvalPattern = [
-    "drawio-preview",
-    integratedHash(preview.diagramKey).slice(0, 12),
-    preview.id,
-    `revision-${preview.baseRevision}`,
-    preview.candidateHash.slice(0, 16),
-  ].join(":")
-  try {
-    await context.ask({
-      permission: "drawio_authorize_preview",
-      patterns: [approvalPattern],
-      always: [approvalPattern],
-      metadata: {
-        file: preview.file,
-        previewId: preview.id,
-        plan: plan?.trim() || defaultPatchPreviewPlan(preview),
-        baseRevision: preview.baseRevision,
-        candidateHash: preview.candidateHash,
-        changedIds: preview.changedIds,
-        summary: preview.diff.summary,
-      },
-    })
-  } catch (error) {
-    cancelPatchPreview(session, preview, "用户未批准该修改预览")
-    throw error
+  prunePatchPreviews()
+  const state = getIntegratedBridgeState()
+  if (preview.approvalReviewId) {
+    const current = state.approvalReviews.get(preview.approvalReviewId)
+    if (current) return current
   }
-  await refreshIntegratedSession(session)
-  const approvalToken = randomBytes(24).toString("base64url")
-  authorizePatchPreview(session, preview, approvalToken)
-  return approvalToken
+  const fingerprint = approvalReviewFingerprint(preview, input)
+  const id = `rev_${randomBytes(12).toString("base64url")}`
+  const base = {
+    id,
+    fingerprint,
+    kind: input.kind,
+    sessionId: session.sessionId,
+    diagramKey: preview.diagramKey,
+    previewId: preview.id,
+    baseRevision: preview.baseRevision,
+    candidateHash: preview.candidateHash,
+    plan: input.plan.trim(),
+    annotationId: input.annotationId || null,
+    requestedScope: input.requestedScope || null,
+    proposedChangedIds: [...(input.proposedChangedIds || [])],
+    escalationReason: input.escalationReason?.trim() || null,
+    requestIds: [],
+    status: "awaiting_question" as const,
+    feedback: null,
+    createdAt: new Date().toISOString(),
+    expiresAt: Math.min(preview.expiresAt, Date.now() + PATCH_PREVIEW_TTL_MS),
+    resolvedAt: null,
+  }
+  const review: ApprovalReview = { ...base, question: approvalQuestion(base) }
+  state.approvalReviews.set(id, review)
+  preview.approvalReviewId = id
+  return review
+}
+
+function approvalReviewPayload(review: ApprovalReview): Record<string, unknown> {
+  const status = review.status === "feedback"
+    ? "feedback_received"
+    : review.status === "cancelled"
+      ? "cancelled"
+      : review.status === "stale"
+        ? "stale"
+        : review.status === "waiting_for_user"
+          ? "question_pending"
+          : "question_required"
+  return {
+    ok: false,
+    applied: false,
+    approvalRequired: status === "question_required",
+    status,
+    reviewId: review.id,
+    previewId: review.previewId,
+    baseRevision: review.baseRevision,
+    candidateHash: review.candidateHash,
+    ...(review.feedback ? { userFeedback: review.feedback } : {}),
+    ...(status === "question_required" ? {
+      question: {
+        tool: "question",
+        arguments: { questions: [review.question] },
+      },
+      guidance:
+        "Call OpenCode's built-in question tool with exactly the returned arguments. "
+        + "After the user answers, call the same Draw.io authorization or formal-write tool again with "
+        + "approval_review_id set to reviewId and approval_answer set to the exact returned answer. "
+        + "Do not invent, summarize, or answer the question yourself.",
+    } : status === "question_pending" ? {
+      guidance:
+        "The OpenCode question is already active. Do not ask it again. "
+        + "If the Agent already received the user's answer, retry this same Draw.io tool with "
+        + "approval_review_id set to reviewId and approval_answer set to that exact answer. "
+        + "Otherwise wait for the user's answer.",
+      diagnostic: "question_answer_not_forwarded_or_pending",
+    } : status === "feedback_received" ? {
+      guidance:
+        "The user supplied revision feedback instead of approving. Do not write this candidate. "
+        + "Regenerate the candidate preview from the latest revision, then request a new question review.",
+    } : {
+      guidance: "The candidate was not approved. Do not write it; generate a new preview before trying again.",
+    }),
+  }
+}
+
+function resolvePatchPreviewApproval(
+  session: IntegratedSession,
+  preview: PatchPreview,
+  input: ApprovalReviewInput,
+  forwarded: ForwardedApprovalAnswer = {},
+): ApprovalReviewOutcome {
+  const review = ensureApprovalReview(session, preview, input)
+  const hasForwardedReviewId = forwarded.reviewId !== undefined
+  const hasForwardedAnswer = forwarded.answer !== undefined
+  if (hasForwardedReviewId !== hasForwardedAnswer) {
+    throw new Error("approval_review_id and approval_answer must be provided together after the OpenCode question returns")
+  }
+  if (hasForwardedReviewId && hasForwardedAnswer) {
+    if (forwarded.reviewId !== review.id) {
+      throw new Error("approval_review_id does not match the review bound to this preview")
+    }
+    if (review.status === "awaiting_question" || review.status === "waiting_for_user") {
+      const answer = forwarded.answer!.trim()
+      review.resolvedAt = new Date().toISOString()
+      clearApprovalQuestionBindings(review)
+      if (answer === APPROVAL_CONFIRM_LABEL) {
+        review.status = "approved"
+        review.feedback = null
+      } else if (!answer || answer === APPROVAL_CANCEL_LABEL) {
+        review.status = "cancelled"
+        review.feedback = null
+      } else {
+        review.status = "feedback"
+        review.feedback = answer
+      }
+    } else if (review.status === "approved" && forwarded.answer!.trim() !== APPROVAL_CONFIRM_LABEL) {
+      throw new Error("approval_answer conflicts with the answer already recorded for this review")
+    }
+  }
+  if (review.status === "approved") {
+    if (
+      review.sessionId !== session.sessionId
+      || review.diagramKey !== integratedDiagramKey(session.file)
+      || review.previewId !== preview.id
+      || review.baseRevision !== session.revision
+      || review.candidateHash !== preview.candidateHash
+    ) {
+      review.status = "stale"
+      review.feedback = "图表版本或候选内容已变化"
+      review.resolvedAt = new Date().toISOString()
+      return { approved: false, payload: approvalReviewPayload(review), review }
+    }
+    const approvalToken = randomBytes(24).toString("base64url")
+    authorizePatchPreview(session, preview, approvalToken)
+    review.status = "consumed"
+    review.resolvedAt = new Date().toISOString()
+    clearApprovalQuestionBindings(review)
+    return { approved: true, approvalToken, review }
+  }
+  if (review.status === "cancelled" || review.status === "feedback" || review.status === "stale") {
+    cancelPatchPreview(
+      session,
+      preview,
+      review.status === "feedback" ? "用户提出了新的修改意见" : "用户未批准该修改预览",
+    )
+  }
+  return { approved: false, payload: approvalReviewPayload(review), review }
 }
 
 function validatePatchPreviewWrite(
@@ -5133,9 +5548,9 @@ function requireAnnotationAuthorization(
     )
   }
   const authorization = session.annotationAuthorizations.get(active.id)
-  if (!authorization || !approvalToken || authorization.token !== approvalToken) {
+  if (!authorization || !approvalToken || authorization.approvalToken !== approvalToken) {
     throw new Error(
-      "annotation change has not been approved; call drawio_authorize_annotation_change and wait for the OpenCode approval popup before writing",
+      "annotation change has not been approved; complete the OpenCode question review returned by drawio_authorize_annotation_change before writing",
     )
   }
   if (authorization.consumedAt) {
@@ -5269,6 +5684,34 @@ async function consumeAnnotationAuthorization(
   guard.task.updatedAt = guard.authorization.consumedAt
   await persistStoredAnnotations(session)
   broadcastAnnotation(session, guard.task, "updated")
+}
+
+function annotationAuthorizationPayload(
+  session: IntegratedSession,
+  task: AnnotationTask,
+  authorization: AnnotationAuthorization,
+  alreadyAuthorized = false,
+): Record<string, unknown> {
+  const scope = annotationScopeContext(session, task, authorization.scope)
+  return {
+    ok: true,
+    annotationId: task.id,
+    approvalToken: authorization.approvalToken,
+    previewId: authorization.previewId,
+    baseRevision: authorization.baseRevision,
+    requestedScope: authorization.scope,
+    requestedScopeLabel: annotationScopeLabel(authorization.scope),
+    originalScope: task.scope,
+    originalScopeLabel: annotationScopeLabel(task.scope),
+    escalationReason: authorization.escalationReason,
+    proposedChangedIds: authorization.proposedChangedIds,
+    allowedExistingIds: authorization.scope === "diagram_wide"
+      ? [...scope.allowedQualifiedIds]
+      : [...scope.allowedIds],
+    alreadyAuthorized,
+    guidance:
+      "Approval is valid for one formal write at this exact revision. Pass annotation_id and approval_token to drawio_patch or drawio_update_state. Any undeclared or out-of-scope stable ID is rejected.",
+  }
 }
 
 function annotationStaleState(
@@ -5453,6 +5896,30 @@ function clearAnnotationSessionState(session: IntegratedSession, annotationId: s
     candidate.annotationAuthorizations.delete(annotationId)
     if (candidate.activeAnnotationId === annotationId) candidate.activeAnnotationId = null
   }
+}
+
+function resolveAnnotationPage(
+  pages: ParsedPage[],
+  pageId: string,
+  pageName: string,
+  cells: AnnotationCell[],
+): ParsedPage | null {
+  const exact = pageId ? pages.find((page) => page.id === pageId) : pages[0]
+  if (exact) return exact
+
+  // Draw.io assigns a zero-based numeric id when loading an <diagram> that has
+  // no explicit id, while parseDrawio deliberately uses stable page-1/page-2
+  // fallbacks. Only accept that numeric compatibility path when both the page
+  // name and every selected cell still identify the indexed canonical page.
+  if (!/^\d+$/u.test(pageId)) return null
+  const pageIndex = Number(pageId)
+  if (!Number.isSafeInteger(pageIndex) || pageIndex < 0) return null
+  const indexed = pages[pageIndex]
+  if (!indexed) return null
+  if (pageName && pageName !== indexed.name) return null
+  const indexedCellIds = new Set(indexed.cells.map((cell) => cell.id))
+  if (cells.some((cell) => !indexedCellIds.has(cell.id))) return null
+  return indexed
 }
 
 function buildIntegratedEditorPage(options: {
@@ -6337,7 +6804,7 @@ return `<!doctype html>
           activePatchPreview = preview;
           patchPreviewGuidance.textContent = preview.status === "authorized"
             ? "已批准，正在提交精确候选"
-            : "请核对画布后在 OpenCode 审批弹窗中确认";
+            : "请核对画布后在 OpenCode question 弹窗中确认、取消或填写修改意见";
           return;
         }
         await saveChain;
@@ -6371,7 +6838,7 @@ return `<!doctype html>
         patchPreviewSummary.textContent = totalChanges + " 项变化 · 基于版本 " + preview.baseRevision;
         patchPreviewGuidance.textContent = preview.status === "authorized"
           ? "已批准，正在提交精确候选"
-          : "请核对画布后在 OpenCode 审批弹窗中确认";
+          : "请核对画布后在 OpenCode question 弹窗中确认、取消或填写修改意见";
         patchPreviewBar.classList.add("visible");
         sendEditor({ action: "load", xml: previewTargetXml, autosave: 0, diffSync: false,
           title: CONFIG.file + " · Agent 修改对比" });
@@ -7941,6 +8408,7 @@ async function handleIntegratedBridgeRequest(
       return
     }
     const pageId = typeof body.pageId === "string" ? body.pageId : ""
+    const submittedPageName = typeof body.pageName === "string" ? body.pageName : ""
     const scope = annotationScope(body.scope)
     const cells = Array.isArray(body.cells)
       ? body.cells
@@ -7959,7 +8427,7 @@ async function handleIntegratedBridgeRequest(
     }
     await refreshIntegratedSession(session)
     const pages = parseDrawio(session.xml)
-    const resolvedPage = pageId ? pages.find((page) => page.id === pageId) : pages[0]
+    const resolvedPage = resolveAnnotationPage(pages, pageId, submittedPageName, cells)
     if (!resolvedPage) {
       integratedJsonResponse(response, 400, {
         ok: false,
@@ -8010,7 +8478,7 @@ async function handleIntegratedBridgeRequest(
       }
     }
     const resolvedPageId = resolvedPage.id
-    const pageName = typeof body.pageName === "string" ? body.pageName : resolvedPage.name || ""
+    const pageName = resolvedPage.name || submittedPageName
     const region = annotationRegion(pages, resolvedPageId, cells.map((cell) => cell.id))
     const now = new Date().toISOString()
     const id = `ant_${randomBytes(6).toString("base64url")}`
@@ -8314,7 +8782,7 @@ const DRAWIO_RUNTIME_GUIDANCE = `## Draw.io 文件写入与交付
 每次修改前必须立即调用 drawio_get_state，并把返回的最新 XML 作为修改基线。人工编辑不是只读内容，可以按当前任务要求继续调整。
 提交时必须携带该次读取返回的准确 base_revision；revision_conflict 后重新读取，在新 XML 上重新执行所需变更并重试，禁止重发旧 XML。
 禁止用普通 write、edit 或脚本直接覆盖已绑定的 .drawio 文件，因为这会绕过 revision 检查并可能用旧快照丢失最新内容。
-对已绑定文件执行普通 drawio_patch、drawio_polish 或 drawio_update_state 正式修改时，工具会在同一次调用中创建或复用同画布候选预览、触发 OpenCode 审批弹窗，并仅在用户允许后复核 revision 与候选哈希再写入。dry_run=true 和 drawio_preview_state 仅用于提前看图；看完后调用对应正式工具即可触发审批，不要停在预览结果，也不要再调用 drawio_authorize_preview。字体、填充色、文字色、边框色等常用属性使用 drawio_patch.style_updates；只有完整 XML 才能表达的页面背景或高级样式使用 drawio_preview_state 后调用 drawio_update_state。预览把修改前、真实修改后和带高亮覆盖层的前后对比分开，并提供可收起的属性级变化详情；绿色表示新增、黄色表示修改、红色表示删除或原位置、蓝色表示变更连线。注释修改继续调用 drawio_authorize_annotation_change，并把 dry-run 返回的 preview_id 与精确稳定 ID 清单一起纳入范围审批。
+对已绑定文件的普通修改必须先用 drawio_patch(dry_run=true)、drawio_polish(dry_run=true) 或 drawio_preview_state 生成同画布候选，再调用 drawio_authorize_preview。授权工具第一次只返回绑定 preview_id、revision 与候选哈希的 OpenCode question 参数；必须把 arguments 原样传给内置 question，不得自行回答或改写。Question 返回后，再次调用同一授权工具，并显式传入 approval_review_id=第一次返回的 reviewId 和 approval_answer=Question 返回的原始答案；只有“确认修改”才会复核并写入。“取消修改”、关闭或自定义文字都不写入，自定义文字是修改反馈，必须基于最新 revision 重新生成预览。字体、填充色、文字色、边框色等常用属性使用 drawio_patch.style_updates；只有完整 XML 才能表达的页面背景或高级样式使用 drawio_preview_state。预览把修改前、真实修改后和带高亮覆盖层的前后对比分开，并提供可收起的属性级变化详情；绿色表示新增、黄色表示修改、红色表示删除或原位置、蓝色表示变更连线。
 本轮全部可执行创建或修改（包括 fresh annotation）完成后必须统一调用 drawio_finalize：校验、评分、自动导出同名 PNG。调用前必须先调用 drawio_list_annotations(status='pending') 探测未完成注释；存在 requiresConfirmation=false 的注释时 drawio_finalize 会拒绝执行，必须先逐条处理并 drawio_resolve_annotation 后再重试，不得跳过。只有返回 shouldOpenBrowser=true 时才调用 MobileWork 工具 openwork_browser_open_url，并传入 url=openUrl、provider="builtin"；editorConnected=true 时必须保持现有编辑器，禁止重新打开或刷新，以免丢失用户尚未保存的编辑。
 drawio_export 支持 PNG、JPEG、PDF、xmlpng、SVG、xmlsvg 和 html2。SVG、xmlsvg、html2 由内置浏览器编辑器渲染并通过 Bridge 写回工作区；返回 editor_required 时必须立即调用 openwork_browser_open_url，并传入 url=openUrl、provider="builtin"，等待编辑器连接后用完全相同的参数重试，禁止把该状态解释为不支持格式或要求用户手工导出。PNG、JPEG、xmlpng、SVG、xmlsvg 使用 all_pages=true 时逐页生成文件并返回 outputs[]，必须核对 page_count 与 outputs 数量一致；PDF 和 html2 的 all_pages=true 各返回一个包含全部页面的多页单文件，html2 还需核对 contains_all_pages=true。
 
@@ -8322,7 +8790,7 @@ drawio_export 支持 PNG、JPEG、PDF、xmlpng、SVG、xmlsvg 和 html2。SVG、
 
 用户在内置浏览器中框选图元并提交注释后，每条注释是一条按图表文件持久化的独立任务，不绑定创建它的对话 session；任务记录稳定 ID、页面、区域范围、修改说明、允许范围和提交时的图表基线。
 注释的持久化 status 为 open/resolved/ignored；freshness=stale 表示图元已变化但任务仍未完成。执行 stale 注释前必须先询问用户；fresh 注释可直接进入计划和审批流程。resolved 和 ignored 都是终态，Agent 必须跳过，只有用户重新打开后才能处理。
-处理注释时必须先读取最新状态并 dry-run，让候选结果显示在同一 Draw.io 画布中；向用户说明计划、完整稳定 ID 清单和范围后，携带 preview_id 调用 drawio_authorize_annotation_change。该工具必须由 OpenCode 以 ask 权限弹窗在写入前批准；批准后才可把当前 session 的一次性 token 传给正式 drawio_patch/drawio_update_state，且写入 XML 必须与已展示候选完全一致。非全图范围由运行时强制使用注释绑定的 pageId；diagram_wide 覆盖当前图表全部页面并使用 pageId:cellId。禁止先改后问。
+处理注释时必须先读取最新状态并 dry-run，让候选结果显示在同一 Draw.io 画布中；向用户说明计划、完整稳定 ID 清单和范围后，携带 preview_id 调用 drawio_authorize_annotation_change。第一次调用只返回 OpenCode question 参数；原样调用内置 question。Question 返回后，把第一次返回的 reviewId 和原始答案分别作为 approval_review_id、approval_answer 显式传入第二次授权调用；只有“确认修改”才会返回当前 session 的一次性 token。插件事件桥仅作兼容和审计辅助，正常授权不依赖它。取消、关闭、自定义文字、过期或重放回复均不授权。正式 drawio_patch/drawio_update_state 的 XML 必须与已展示候选完全一致。非全图范围由运行时强制使用注释绑定的 pageId；diagram_wide 覆盖当前图表全部页面并使用 pageId:cellId。禁止先改后问。
 不得修改授权范围外内容。确需越界时，在 authorization 的 escalation_reason 中先说明不可避免的原因并申请更宽范围；未获批准不得写入。drawio_polish 会重排整页，存在活动注释时只有取得 diagram_wide 审批后才能正式运行。
 用户本轮另有明确任务时先完成该任务，然后在同一轮重新探测注释；最终回复前仍存在 requiresConfirmation=false 的 open 注释时必须继续处理，不能只提示用户稍后继续。
 注释任务的检查与处理流程由 drawio-session-editing 技能负责编排，详见该 SKILL.md。`
@@ -8342,6 +8810,88 @@ function candidateDrawioPath(args: unknown): string | null {
 
 export async function initializeDrawioWorkspace(directory: string): Promise<void> {
   await loadWorkspaceEnvironment(directory)
+}
+
+function approvalQuestionMatches(value: unknown, expected: ApprovalQuestion): boolean {
+  if (!integratedRecord(value)) return false
+  if (
+    value.question !== expected.question
+    || value.header !== expected.header
+    || value.multiple !== false
+    || value.custom !== true
+    || !Array.isArray(value.options)
+    || value.options.length !== expected.options.length
+  ) return false
+  return value.options.every((option, index) => {
+    const target = expected.options[index]
+    return integratedRecord(option)
+      && option.label === target.label
+      && option.description === target.description
+  })
+}
+
+export function handleDrawioOpenCodeEvent(event: unknown): boolean {
+  if (!integratedRecord(event) || typeof event.type !== "string" || !integratedRecord(event.properties)) {
+    return false
+  }
+  const properties = event.properties
+  const state = getIntegratedBridgeState()
+  prunePatchPreviews()
+
+  if (event.type === "question.asked" || event.type === "question.v2.asked") {
+    if (
+      typeof properties.id !== "string"
+      || typeof properties.sessionID !== "string"
+      || !Array.isArray(properties.questions)
+      || properties.questions.length !== 1
+      || !integratedRecord(properties.tool)
+      || typeof properties.tool.callID !== "string"
+      || typeof properties.tool.messageID !== "string"
+    ) return false
+    const review = [...state.approvalReviews.values()].find((candidate) => (
+      candidate.sessionId === properties.sessionID
+      && (candidate.status === "awaiting_question" || candidate.status === "waiting_for_user")
+      && approvalQuestionMatches(properties.questions[0], candidate.question)
+    ))
+    if (!review) return false
+    if (!review.requestIds.includes(properties.id)) review.requestIds.push(properties.id)
+    review.status = "waiting_for_user"
+    state.questionReviewIds.set(properties.id, review.id)
+    return true
+  }
+
+  if (
+    event.type !== "question.replied"
+    && event.type !== "question.v2.replied"
+    && event.type !== "question.rejected"
+    && event.type !== "question.v2.rejected"
+  ) return false
+  if (typeof properties.requestID !== "string" || typeof properties.sessionID !== "string") return false
+  const reviewId = state.questionReviewIds.get(properties.requestID)
+  const review = reviewId ? state.approvalReviews.get(reviewId) : null
+  if (!review || review.sessionId !== properties.sessionID || review.status !== "waiting_for_user") return false
+
+  review.resolvedAt = new Date().toISOString()
+  clearApprovalQuestionBindings(review)
+  if (event.type.endsWith(".rejected")) {
+    review.status = "cancelled"
+    review.feedback = null
+    return true
+  }
+  const answers = Array.isArray(properties.answers) && Array.isArray(properties.answers[0])
+    ? properties.answers[0].filter((answer): answer is string => typeof answer === "string").map(answer => answer.trim()).filter(Boolean)
+    : []
+  if (answers.length === 1 && answers[0] === APPROVAL_CONFIRM_LABEL) {
+    review.status = "approved"
+    review.feedback = null
+  } else if (answers.length === 0 || (answers.length === 1 && answers[0] === APPROVAL_CANCEL_LABEL)) {
+    review.status = "cancelled"
+    review.feedback = null
+  } else {
+    review.status = "feedback"
+    review.feedback = answers.join("\n")
+  }
+  return true
 }
 
 export function applyDrawioSystemGuidance(output: { system: string[] }): boolean {
@@ -8825,7 +9375,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
 
     drawio_quality: defineTool({
       description:
-        "Score Draw.io layout quality and report actionable issues including node overlaps, edge-node intersections, edge crossings, edge-label collisions, empty labels, and missing arc line jumps.",
+        "Score Draw.io layout quality and report actionable issues including node overlaps, edge-node intersections, edge crossings, collinear edge overlaps, shared-port congestion, edge-label collisions, empty labels, and missing arc line jumps.",
       args: {
         file: tool.schema.string().describe("Workspace-relative .drawio or .xml file"),
         threshold: tool.schema
@@ -8849,7 +9399,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
 
     drawio_patch: defineTool({
       description:
-        "Apply semantic node and edge operations to an opened Draw.io file. A formal non-annotation write creates or reuses the exact canvas preview, opens the approval popup, then revalidates revision and candidate hash before committing. Pass annotation_id and its scoped approval when executing an annotation.",
+        "Apply semantic node and edge operations to an opened Draw.io file. Use dry_run first, then drawio_authorize_preview and the returned OpenCode question flow before committing. Pass annotation_id and its scoped approval when executing an annotation.",
       args: {
         file: tool.schema.string().describe("Workspace-relative .drawio or .xml file"),
         page: tool.schema
@@ -8889,7 +9439,15 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
         approval_plan: tool.schema
           .string()
           .optional()
-          .describe("Concise explanation shown in the automatic approval popup for a formal non-annotation write"),
+          .describe("Concise explanation shown in the OpenCode question review for a formal non-annotation write"),
+        approval_review_id: tool.schema
+          .string()
+          .optional()
+          .describe("Review id returned before invoking OpenCode question; pass it back with approval_answer"),
+        approval_answer: tool.schema
+          .string()
+          .optional()
+          .describe("Exact answer returned by OpenCode question; must be paired with approval_review_id"),
       },
       async execute(args, context) {
         const target = resolveWorkspacePath(context, args.file)
@@ -8963,7 +9521,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
             diff,
             preview: preview ? patchPreviewPayload(preview) : null,
             previewGuidance: preview
-              ? "The exact candidate is visible in the bound Draw.io canvas. Call the same tool with dry_run=false to open the approval popup and apply this candidate."
+              ? "The exact candidate is visible in the bound Draw.io canvas. Call drawio_authorize_preview, submit its returned arguments unchanged to OpenCode question, then retry authorization with the returned reviewId and exact answer."
               : "Bind the file with drawio_open or drawio_finalize to receive an interactive canvas preview.",
             ...report,
           }, null, 2)
@@ -8985,12 +9543,17 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           }
           let previewApprovalToken = args.preview_approval_token || args.approval_token
           if (!annotationGuard && !previewApprovalToken) {
-            previewApprovalToken = await requestPatchPreviewApproval(
-              context,
+            const approval = resolvePatchPreviewApproval(
               activeSession,
               preview,
-              args.approval_plan,
+              {
+                kind: "preview",
+                plan: args.approval_plan?.trim() || defaultPatchPreviewPlan(preview),
+              },
+              { reviewId: args.approval_review_id, answer: args.approval_answer },
             )
+            if (!approval.approved) return JSON.stringify(approval.payload, null, 2)
+            previewApprovalToken = approval.approvalToken
           }
           validatePatchPreviewWrite(
             activeSession,
@@ -9032,7 +9595,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
 
     drawio_polish: defineTool({
       description:
-        "Run a deterministic quality loop over an opened Draw.io file. A formal non-annotation write previews the exact accepted layout, opens the approval popup, then revalidates and commits with backup.",
+        "Run a deterministic quality loop over an opened Draw.io file. Use dry_run first, then approve the exact accepted layout through drawio_authorize_preview and OpenCode question before committing with backup.",
       args: {
         file: tool.schema.string().describe("Workspace-relative .drawio or .xml file"),
         page: tool.schema
@@ -9075,7 +9638,15 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
         approval_plan: tool.schema
           .string()
           .optional()
-          .describe("Concise explanation shown in the automatic approval popup for a formal non-annotation write"),
+          .describe("Concise explanation shown in the OpenCode question review for a formal non-annotation write"),
+        approval_review_id: tool.schema
+          .string()
+          .optional()
+          .describe("Review id returned before invoking OpenCode question; pass it back with approval_answer"),
+        approval_answer: tool.schema
+          .string()
+          .optional()
+          .describe("Exact answer returned by OpenCode question; must be paired with approval_review_id"),
       },
       async execute(args, context) {
         const target = resolveWorkspacePath(context, args.file)
@@ -9158,12 +9729,17 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           }
           let previewApprovalToken = args.preview_approval_token || args.approval_token
           if (!annotationGuard && !previewApprovalToken) {
-            previewApprovalToken = await requestPatchPreviewApproval(
-              context,
+            const approval = resolvePatchPreviewApproval(
               activeSession,
               preview,
-              args.approval_plan,
+              {
+                kind: "preview",
+                plan: args.approval_plan?.trim() || defaultPatchPreviewPlan(preview),
+              },
+              { reviewId: args.approval_review_id, answer: args.approval_answer },
             )
+            if (!approval.approved) return JSON.stringify(approval.payload, null, 2)
+            previewApprovalToken = approval.approvalToken
           }
           validatePatchPreviewWrite(
             activeSession,
@@ -9329,7 +9905,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
 
     drawio_update_state: defineTool({
       description:
-        "Apply an exact complete-XML candidate to the active Draw.io session. For a normal change, the tool creates or reuses its canvas preview, opens the approval popup, and writes only after revision and candidate-hash revalidation. Annotation changes still require their scoped approval.",
+        "Apply an exact complete-XML candidate to the active Draw.io session. Preview it with drawio_preview_state, then use drawio_authorize_preview and OpenCode question; write only after revision and candidate-hash revalidation. Annotation changes still require their scoped approval.",
       args: {
         base_revision: tool.schema.number().int().min(0),
         xml: tool.schema.string().min(1),
@@ -9352,7 +9928,15 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
         approval_plan: tool.schema
           .string()
           .optional()
-          .describe("Concise explanation shown in the automatic approval popup for a formal non-annotation write"),
+          .describe("Concise explanation shown in the OpenCode question review for a formal non-annotation write"),
+        approval_review_id: tool.schema
+          .string()
+          .optional()
+          .describe("Review id returned before invoking OpenCode question; pass it back with approval_answer"),
+        approval_answer: tool.schema
+          .string()
+          .optional()
+          .describe("Exact answer returned by OpenCode question; must be paired with approval_review_id"),
       },
       async execute(args, context) {
         const session = getIntegratedBridgeState().sessions.get(context.sessionID)
@@ -9423,12 +10007,17 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
         }
         let previewApprovalToken = args.preview_approval_token || args.approval_token
         if (!annotationGuard && !previewApprovalToken) {
-          previewApprovalToken = await requestPatchPreviewApproval(
-            context,
+          const approval = resolvePatchPreviewApproval(
             session,
             preview,
-            args.approval_plan,
+            {
+              kind: "preview",
+              plan: args.approval_plan?.trim() || defaultPatchPreviewPlan(preview),
+            },
+            { reviewId: args.approval_review_id, answer: args.approval_answer },
           )
+          if (!approval.approved) return JSON.stringify(approval.payload, null, 2)
+          previewApprovalToken = approval.approvalToken
         }
         validatePatchPreviewWrite(
           session,
@@ -9504,7 +10093,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
 
     drawio_finalize: defineTool({
       description:
-        "Finish a Draw.io task: refresh the latest revision, validate and score it, export an up-to-date PNG, bind the browser session, and report whether a new editor must be opened. Refuses to run while any fresh (requiresConfirmation=false) annotation is still open; returns pendingAnnotations for stale open annotations that still need user confirmation. Resolved and ignored annotations are terminal and do not block finalization.",
+        "Finish a Draw.io task: refresh the latest revision, require validation and layout quality to pass, export an up-to-date PNG, bind the browser session, and report whether a new editor must be opened. Refuses to run while any fresh (requiresConfirmation=false) annotation is still open; returns pendingAnnotations for stale open annotations that still need user confirmation. Resolved and ignored annotations are terminal and do not block finalization.",
       args: {
         file: tool.schema.string().describe("Workspace-relative .drawio or .xml file"),
         output_path: tool.schema
@@ -9535,6 +10124,13 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           throw new Error(`refusing to finalize invalid Draw.io XML: ${JSON.stringify(validation.errors)}`)
         }
         const quality = qualityReport(pages, args.threshold)
+        if (!quality.pass) {
+          throw new Error(
+            `refusing to finalize Draw.io layout that failed the quality gate: `
+            + `score=${quality.score}, threshold=${quality.threshold}, `
+            + `issues=${JSON.stringify(quality.issues)}`,
+          )
+        }
         const bound = await bindIntegratedSession(context, source)
         const openAnnotationTasks = [...getDiagramAnnotations(bound.session).values()]
           .filter((task) => task.status === "open")
@@ -9634,7 +10230,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           count: list.length,
           counts: annotationStatusCounts(entries.map((entry) => entry.state)),
           annotations: list,
-          guidance: "Pending/open include fresh and stale unfinished tasks; resolved and ignored are terminal until the user reopens them. Ask for confirmation before executing any task with requiresConfirmation=true. For each executable task: call drawio_get_annotation and drawio_get_state, dry-run, disclose scope and exact stable IDs with drawio_authorize_annotation_change, and wait for its OpenCode approval popup. Only then pass annotation_id and the one-time approval token to one scoped write, resolve the annotation, and finalize. Never modify first and ask later.",
+          guidance: "Pending/open include fresh and stale unfinished tasks; resolved and ignored are terminal until the user reopens them. Ask for confirmation before executing any task with requiresConfirmation=true. For each executable task: call drawio_get_annotation and drawio_get_state, dry-run, disclose scope and exact stable IDs with drawio_authorize_annotation_change, submit its returned arguments unchanged to OpenCode question, then retry authorization with approval_review_id=reviewId and approval_answer set to the exact returned answer. Only an explicit confirmation can return the one-time token. Never modify first and ask later.",
         }, null, 2)
       },
     }),
@@ -9687,7 +10283,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           guidance: task.status !== "open"
             ? `This annotation is ${task.status} and terminal. Do not process it unless the user reopens it in the annotation panel.`
             : annotationState.requiresConfirmation
-              ? "This annotation is stale but still open. Ask the user whether to execute it. After confirmation, call drawio_get_state, generate a dry-run canvas preview and exact changed-id plan, then call drawio_authorize_annotation_change with the preview id. Wait for the OpenCode approval popup before applying the exact hash-matched candidate; resolve only after the write succeeds."
+              ? "This annotation is stale but still open. Ask the user whether to execute it. After confirmation, call drawio_get_state, generate a dry-run canvas preview and exact changed-id plan, then call drawio_authorize_annotation_change with the preview id. Complete the returned OpenCode question flow before applying the exact hash-matched candidate; resolve only after the write succeeds."
               : "Call drawio_get_state, generate a dry-run canvas preview and exact changed-id plan, then call drawio_authorize_annotation_change with the preview id. After approval, apply the exact hash-matched candidate and resolve the annotation.",
         }, null, 2)
       },
@@ -9695,11 +10291,19 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
 
     drawio_authorize_preview: defineTool({
       description:
-        "Request approval for the exact candidate visible in the Draw.io canvas and apply it immediately when the user allows the popup. Use after drawio_patch/drawio_polish dry-run or drawio_preview_state, and only for changes that are not driven by an annotation task.",
+        "Request human approval for the exact candidate visible in the Draw.io canvas. The first call returns exact OpenCode question arguments and never writes. After question returns, retry with approval_review_id and the exact approval_answer; confirmation applies the hash-matched candidate. Cancel, close, or custom feedback never authorizes a write.",
       args: {
         file: tool.schema.string().optional().describe("Workspace-relative diagram file; defaults to the active file"),
         preview_id: tool.schema.string().describe("Preview id returned by drawio_patch/drawio_polish dry-run or drawio_preview_state"),
         plan: tool.schema.string().min(1).describe("Concise explanation of the visible candidate change"),
+        approval_review_id: tool.schema
+          .string()
+          .optional()
+          .describe("Review id returned by the first call; pass it back after OpenCode question returns"),
+        approval_answer: tool.schema
+          .string()
+          .optional()
+          .describe("Exact answer returned by OpenCode question; must be paired with approval_review_id"),
       },
       async execute(args, context) {
         const session = annotationSessionFor(context, args.file)
@@ -9716,15 +10320,27 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           throw new Error("patch preview not found for this session and diagram")
         }
         currentPatchPreview(session)
+        if (preview.status === "applied") {
+          return JSON.stringify({
+            ok: true,
+            applied: true,
+            alreadyApplied: true,
+            ...integratedDocumentPayload(session),
+            preview: patchPreviewPayload(preview),
+            guidance: "This exact preview was already applied. Do not request another approval or write it again.",
+          }, null, 2)
+        }
         if (preview.status !== "pending") {
           throw new Error(`patch preview is ${preview.status}; generate a fresh dry-run preview`)
         }
-        const approvalToken = await requestPatchPreviewApproval(
-          context,
+        const approval = resolvePatchPreviewApproval(
           session,
           preview,
-          args.plan,
+          { kind: "preview", plan: args.plan },
+          { reviewId: args.approval_review_id, answer: args.approval_answer },
         )
+        if (!approval.approved) return JSON.stringify(approval.payload, null, 2)
+        const approvalToken = approval.approvalToken
         validatePatchPreviewWrite(
           session,
           preview.id,
@@ -9771,7 +10387,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
 
     drawio_authorize_annotation_change: defineTool({
       description:
-        "Request the user's pre-change approval for one annotation plan. OpenCode must show its permission popup before this tool runs. If approved, returns a one-time token bound to the current revision, declared stable IDs and requested scope. Never call after modifying the diagram.",
+        "Request the user's pre-change approval for one annotation plan. The first call returns an exact OpenCode question request and no token. After question returns, retry with approval_review_id and the exact approval_answer; confirmation returns a one-time token bound to the current revision, preview hash, declared stable IDs and requested scope. Cancel, close, or custom feedback never authorizes a write.",
       args: {
         file: tool.schema.string().optional().describe("Workspace-relative diagram file; defaults to the active file"),
         id: tool.schema.string().describe("Annotation id returned by drawio_get_annotation"),
@@ -9794,6 +10410,14 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           .string()
           .optional()
           .describe("Preview id returned by the immediately preceding drawio_patch dry-run; defaults to the active preview"),
+        approval_review_id: tool.schema
+          .string()
+          .optional()
+          .describe("Review id returned by the first call; pass it back after OpenCode question returns"),
+        approval_answer: tool.schema
+          .string()
+          .optional()
+          .describe("Exact answer returned by OpenCode question; must be paired with approval_review_id"),
       },
       async execute(args, context) {
         const session = annotationSessionFor(context, args.file)
@@ -9816,97 +10440,98 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
         if (proposedChangedIds.length === 0) {
           throw new Error("proposed_changed_ids must contain at least one stable id")
         }
-        const scope = annotationScopeContext(session, task, requestedScope)
+        const existingAuthorization = session.annotationAuthorizations.get(task.id)
+        if (
+          existingAuthorization
+          && !existingAuthorization.consumedAt
+          && existingAuthorization.sessionId === session.sessionId
+          && existingAuthorization.diagramKey === integratedDiagramKey(session.file)
+          && existingAuthorization.baseRevision === session.revision
+          && existingAuthorization.scope === requestedScope
+          && (args.preview_id || existingAuthorization.previewId) === existingAuthorization.previewId
+        ) {
+          const existingIds = new Set(existingAuthorization.proposedChangedIds)
+          if (
+            existingIds.size === proposedChangedIds.length
+            && proposedChangedIds.every((id) => existingIds.has(id))
+          ) {
+            return JSON.stringify(
+              annotationAuthorizationPayload(session, task, existingAuthorization, true),
+              null,
+              2,
+            )
+          }
+        }
         const preview = args.preview_id
           ? getIntegratedBridgeState().patchPreviews.get(args.preview_id)
           : currentPatchPreview(session)
-        if (preview) {
-          if (preview.sessionId !== session.sessionId
-            || preview.diagramKey !== integratedDiagramKey(session.file)) {
-            throw new Error("patch preview belongs to a different session or diagram")
-          }
-          currentPatchPreview(session)
-          if (preview.status !== "pending") {
-            throw new Error(`patch preview is ${preview.status}; generate a fresh dry-run preview`)
-          }
-          const previewChangedIds = requestedScope === "diagram_wide"
-            ? new Set(preview.changedQualifiedIds)
-            : new Set(preview.changedIds)
-          const proposedForPreview = new Set(proposedChangedIds)
-          if (
-            previewChangedIds.size !== proposedForPreview.size
-            || [...previewChangedIds].some((id) => !proposedForPreview.has(id))
-          ) {
-            throw new Error("proposed_changed_ids must exactly match the stable IDs shown in the active preview")
-          }
+        if (!preview) {
+          throw new Error("annotation approval requires the active dry-run preview; generate it before requesting approval")
         }
-        const diagramFile = path.relative(session.workspace, session.file).split(path.sep).join("/")
-        const approvalPattern = [
-          "annotation",
-          integratedHash(integratedDiagramKey(session.file)).slice(0, 12),
-          task.id,
-          `revision-${session.revision}`,
-          requestedScope,
-          proposedChangedIds.toSorted().join(","),
-        ].join(":")
-        await context.ask({
-          permission: "drawio_authorize_annotation_change",
-          patterns: [approvalPattern],
-          always: [approvalPattern],
-          metadata: {
+        if (preview.sessionId !== session.sessionId
+          || preview.diagramKey !== integratedDiagramKey(session.file)) {
+          throw new Error("patch preview belongs to a different session or diagram")
+        }
+        currentPatchPreview(session)
+        if (preview.status !== "pending") {
+          throw new Error(`patch preview is ${preview.status}; generate a fresh dry-run preview`)
+        }
+        const previewChangedIds = requestedScope === "diagram_wide"
+          ? new Set(preview.changedQualifiedIds)
+          : new Set(preview.changedIds)
+        const proposedForPreview = new Set(proposedChangedIds)
+        if (
+          previewChangedIds.size !== proposedForPreview.size
+          || [...previewChangedIds].some((id) => !proposedForPreview.has(id))
+        ) {
+          throw new Error("proposed_changed_ids must exactly match the stable IDs shown in the active preview")
+        }
+        const approval = resolvePatchPreviewApproval(
+          session,
+          preview,
+          {
+            kind: "annotation",
+            plan: args.plan,
             annotationId: task.id,
-            file: diagramFile,
-            plan: args.plan.trim(),
-            proposedChangedIds,
             requestedScope,
-            requestedScopeLabel: annotationScopeLabel(requestedScope),
-            originalScope: task.scope,
-            originalScopeLabel: annotationScopeLabel(task.scope),
+            proposedChangedIds,
             escalationReason,
-            baseRevision: session.revision,
-            previewId: preview?.id || null,
-            candidateHash: preview?.candidateHash || null,
           },
-        })
+          { reviewId: args.approval_review_id, answer: args.approval_answer },
+        )
+        if (!approval.approved) return JSON.stringify(approval.payload, null, 2)
         await refreshIntegratedSession(session)
+        validatePatchPreviewWrite(
+          session,
+          preview.id,
+          approval.approvalToken,
+          preview.baseRevision,
+          preview.candidateXml,
+        )
         const now = new Date().toISOString()
+        const approvedScope = approval.review.requestedScope || requestedScope
+        const approvedChangedIds = approval.review.proposedChangedIds.length > 0
+          ? approval.review.proposedChangedIds
+          : proposedChangedIds
         const authorization: AnnotationAuthorization = {
-          token: randomBytes(24).toString("base64url"),
+          approvalToken: approval.approvalToken,
           sessionId: session.sessionId,
           diagramKey: integratedDiagramKey(session.file),
-          scope: requestedScope,
-          plan: args.plan.trim(),
-          proposedChangedIds,
-          escalationReason,
-          baseRevision: session.revision,
+          scope: approvedScope,
+          plan: approval.review.plan,
+          proposedChangedIds: approvedChangedIds,
+          escalationReason: approval.review.escalationReason,
+          baseRevision: preview.baseRevision,
           approvedAt: now,
           consumedAt: null,
-          previewId: preview?.id || null,
+          previewId: preview.id,
         }
         session.annotationAuthorizations.set(task.id, authorization)
-        if (preview) authorizePatchPreview(session, preview, authorization.token)
         task.updatedAt = now
         session.activeAnnotationId = task.id
         await persistStoredAnnotations(session)
         broadcastAnnotation(session, task, "authorization-approved")
-        return JSON.stringify({
-          ok: true,
-          annotationId: task.id,
-          approvalToken: authorization.token,
-          previewId: preview?.id || null,
-          baseRevision: authorization.baseRevision,
-          requestedScope,
-          requestedScopeLabel: annotationScopeLabel(requestedScope),
-          originalScope: task.scope,
-          originalScopeLabel: annotationScopeLabel(task.scope),
-          escalationReason,
-          proposedChangedIds,
-          allowedExistingIds: requestedScope === "diagram_wide"
-            ? [...scope.allowedQualifiedIds]
-            : [...scope.allowedIds],
-          guidance:
-            "Approval is valid for one formal write at this exact revision. Pass annotation_id and approval_token to drawio_patch or drawio_update_state. Any undeclared or out-of-scope stable ID is rejected.",
-        }, null, 2)
+        return JSON.stringify(annotationAuthorizationPayload(session, task, authorization), null, 2)
       },
     }),
 

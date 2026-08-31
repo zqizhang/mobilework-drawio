@@ -14,7 +14,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 3. 如果任务依赖项目内容，先读取相关工作区文件再设计或修改图表。
 4. 每次修改前立即调用`drawio_get_state`，取得最新XML和revision。
 5. 以最新XML中的图元、标签、几何和样式为起点，根据当前任务判断哪些内容需要保留、调整、删除或重构。
-6. 普通任务调用`drawio_patch(dry_run=false)`、`drawio_polish(dry_run=false)`或`drawio_update_state`正式修改时，工具会在同一次调用中生成或复用同画布差异预览、弹出OpenCode审批，并仅在批准后写入。`dry_run=true`和`drawio_preview_state`可用于提前看图，但看完后必须继续调用对应正式工具触发审批，不能停在预览结果。字体、填充色、文字色、边框色、透明度等常用视觉属性用`operations[].style_updates`；页面背景或高级样式使用完整XML。注释任务继续调用`drawio_authorize_annotation_change`并按其范围授权流程写入。
+6. 普通任务先用`drawio_patch(dry_run=true)`、`drawio_polish(dry_run=true)`或`drawio_preview_state`生成同画布差异预览，再调用`drawio_authorize_preview`。该工具第一次只返回与候选绑定的OpenCode `question`参数；必须原样调用内置`question`。内置`question`把结果返回给Agent后，Agent必须再次调用同一授权工具，并显式传入返回的`reviewId`作为`approval_review_id`、把用户原始答案作为`approval_answer`，授权工具校验后才会写入。取消或关闭不写入，自定义文字视为修改反馈，必须基于最新revision重新生成预览。字体、填充色、文字色、边框色、透明度等常用视觉属性用`operations[].style_updates`；页面背景或高级样式使用完整XML。注释任务继续调用`drawio_authorize_annotation_change`并按其范围授权流程写入。
 7. 收到`revision_conflict`时，重新读取最新状态，在新XML上重新执行当前任务所需的变更，再以新revision重试。禁止原样重发旧XML。
 8. 更新成功后，简要说明结构变化、当前revision以及是否合并了人工修改。
 
@@ -36,7 +36,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 - `drawio_preview_state(base_revision=..., xml=..., annotation_id?)`：为完整XML候选生成只读同画布预览，不写文件、不增加revision；返回属性级样式差异、页面背景差异、完整稳定ID和候选哈希。
 - `drawio_update_state(base_revision=..., xml=..., preview_id?, approval_plan?, ...)`：普通任务会自动创建或复用完整XML预览并弹出审批，批准后只提交哈希完全一致的候选；注释任务仍需范围审批。
 - `drawio_patch(dry_run=true)` / `drawio_polish(dry_run=true)`：除返回结构化diff外，还会把临时预览XML推送到同一画布；预览栏可切换修改前/修改后并查看属性前后值。绿色为新增、黄色为修改、红色为删除或原位置、蓝色为变更连线。预览不写入源文件，连线高亮也不会覆盖候选线条颜色。
-- `drawio_authorize_preview(preview_id, plan)`：保留的兼容入口；可对已有普通预览弹窗审批并立即提交。新流程直接调用对应正式patch、polish或update工具即可，不应依赖Agent额外调用该入口。
+- `drawio_authorize_preview(preview_id, plan, approval_review_id?, approval_answer?)`：普通候选的人工审批入口。第一次调用返回`status=question_required`及必须原样传给内置`question`的参数；用户作答后，第二次调用必须携带返回的`reviewId`和Question原始答案，确认时直接提交候选。`question_pending`表示同一问题已打开但授权工具尚未收到显式转交的答案，禁止再次调用`question`；Agent已有答案时应立即用上述两个字段重试。已提交的同一preview重试返回`alreadyApplied=true`。取消、关闭或自定义文字均不产生token、不写入。
 - 这些工具根据运行时上下文识别session，不需要用户手动传入session ID。
 - 浏览器保存发生409时，运行时会以稳定页面/图元ID进行保守三方合并；不重叠修改自动合并并落盘，但不强制刷新仍可能处于输入状态的画布；重叠修改则保留本地画布、逐字段展示差异，并让用户选择保留用户版或AI版的冲突字段。
 - 自动合并只用于浏览器保存；Agent工具遇到`revision_conflict`时仍必须重新读取、重新执行增量修改并提交，不得把旧XML换用新revision重发。
@@ -57,7 +57,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 | `surrounding_layout`（允许调整周边布局） | 选区附近、一跳关联节点及它们之间的连线；新增节点必须落在运行时计算的周边区域内 | 更远节点、其它页面或未披露的稳定 ID |
 | `diagram_wide`（允许修改整个图表） | 当前 `.drawio` 文件的所有页面、节点、连线和布局；可修改计划中披露的新增/删除图元 | 工作区其它文件或未披露的 `pageId:cellId` |
 
-范围是上限，不是自动修改许可。选择`diagram_wide`时浏览器先显示高风险确认；无论选择哪一种，Agent在正式写入前都必须再次展示具体计划并触发OpenCode审批弹窗。运行时按图表、session、稳定ID、范围、revision和一次性token强制校验。`diagram_wide`的稳定ID必须写成`pageId:cellId`。
+范围是上限，不是自动修改许可。选择`diagram_wide`时浏览器先显示高风险确认；无论选择哪一种，Agent在正式写入前都必须再次展示具体计划，并完成OpenCode `question`人工审批。运行时按图表、session、稳定ID、范围、revision、候选哈希、真实question回复和一次性token强制校验。`diagram_wide`的稳定ID必须写成`pageId:cellId`。
 
 ### 每轮同时关注注释与手动编辑（重要）
 
@@ -95,7 +95,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 
 - `drawio_list_annotations(file, status="pending")`：列出全部待处理注释，包括 `freshness=fresh` 和 `freshness=stale`。每轮第一句对话必调一次。`status="open"` 是兼容别名；精确筛选可用 `"fresh"`、`"stale"`、`"resolved"`、`"ignored"`，也可用 `"all"`。
 - `drawio_get_annotation(file?, id)`：取注释详情，含选中id、region、范围、freshness、过时标记和最新图元快照；只有open任务会成为当前session的活动注释，resolved/ignored必须先由用户重新打开。
-- `drawio_authorize_annotation_change(file?, id, plan, proposed_changed_ids, requested_scope, escalation_reason?, preview_id?)`：必须在正式写入前调用；它可绑定当前画布预览，并校验披露的稳定ID与预览一致。该工具权限固定为`ask`，OpenCode先弹窗，用户批准后才返回绑定当前图表、session、revision、候选哈希和计划ID的一次性token。请求比用户原选项更宽的范围时，`escalation_reason`必填。
+- `drawio_authorize_annotation_change(file?, id, plan, proposed_changed_ids, requested_scope, escalation_reason?, preview_id?, approval_review_id?, approval_answer?)`：必须在正式写入前调用并绑定当前画布预览，同时校验披露的稳定ID与预览一致。第一次调用只返回`question_required`及精确问题参数；Agent必须原样调用内置`question`，随后把返回的`reviewId`和Question原始答案显式传入第二次调用，用户确认时才返回绑定当前图表、session、revision、候选哈希和原始审批计划的一次性token。`question_pending`时不得重复提问；Agent已有答案时直接转交；同一未消费授权的重试复用原token。请求比用户原选项更宽的范围时，`escalation_reason`必填。
 - `drawio_resolve_annotation(file?, id, summary, changed_ids?)`：标记已解决并记录 summary；只改任务状态，不改图。
 
 ### 处理一条注释的标准闭环
@@ -104,10 +104,11 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 2. `drawio_get_state` 取最新 XML 与 revision——这一步拿到的 XML 已经包含用户全部手动编辑（用户保存即 bump revision，agent 拿到的是最新版），patch 在这个基线上完成增量修改；
 3. 若`requiresConfirmation=true`，先说明图元变化并询问用户；未确认不得继续。fresh注释跳过本步；
 4. 用`drawio_patch(annotation_id=id, dry_run=true)`、`drawio_polish(dry_run=true)`，或在语义工具无法表达时用`drawio_preview_state(annotation_id=id, base_revision=..., xml=...)`形成精确计划并把差异预览推送到画布，列出所有会改变的稳定ID和所需范围；非全图范围由运行时强制使用注释绑定的`pageId`，`diagram_wide`使用`pageId:cellId`，页面级属性使用`pageId:@page`，此时不得写入；
-5. 调`drawio_authorize_annotation_change`并传入dry-run返回的`preview_id`。OpenCode弹窗出现前，Agent先用`plan`说明将改什么；用户应先看画布高亮，再决定是否批准。拒绝或关闭弹窗则立即停止，不得改图；
-6. 用户批准后，把返回的`approvalToken`、`previewId`、`annotation_id`和同一`base_revision`传给一次正式`drawio_patch`或`drawio_polish`；完整XML候选则传给一次`drawio_update_state`。运行时会核对候选哈希；token仅能使用一次，不能跨session使用，revision变化后必须重新规划、预览和审批；
-7. 写入成功后调用`drawio_resolve_annotation(id, summary, changed_ids)`；
-8. 重新列出pending注释：继续处理下一条fresh注释；遇到stale注释则询问；全部可执行注释处理完后统一调用一次`drawio_finalize`刷新PNG与浏览器。
+5. 调`drawio_authorize_annotation_change`并传入dry-run返回的`preview_id`。收到`question_required`后，把返回的`question.arguments`原样传给OpenCode内置`question`，不得自行回答、改写问题或跳过弹窗；
+6. Question返回后再次调用`drawio_authorize_annotation_change`，必须保持同一`id`、`preview_id`、范围和稳定ID清单，并传入`approval_review_id=<第一次返回的reviewId>`、`approval_answer=<Question返回的原始答案>`；运行时按preview上的唯一review复用原始审批合同，不因Agent重新措辞`plan`而生成第二次审批。答案为“确认修改”时返回`approvalToken`；“取消修改”、关闭弹窗或自定义文字都不得写入，自定义文字必须作为反馈重新规划和预览；
+7. 把获批的`approvalToken`、`previewId`、`annotation_id`和同一`base_revision`传给一次正式`drawio_patch`或`drawio_polish`；完整XML候选则传给一次`drawio_update_state`。运行时会核对候选哈希；token仅能使用一次，不能跨session使用，revision变化后必须重新规划、预览和审批；
+8. 写入成功后调用`drawio_resolve_annotation(id, summary, changed_ids)`；
+9. 重新列出pending注释：继续处理下一条fresh注释；遇到stale注释则询问；全部可执行注释处理完后统一调用一次`drawio_finalize`刷新PNG与浏览器。
 
 正式`drawio_polish`会重排整页，活动注释期间只有取得`diagram_wide`审批并携带`annotation_id`与`approval_token`才能使用。完整XML写入也会进行跨页稳定ID差异校验；新增图元优先使用带明确operation的`drawio_patch`。
 
@@ -119,8 +120,10 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 
 1. 说明具体受阻点、必须越界的稳定ID以及不越界会造成什么问题；
 2. 选择所需的更宽`requested_scope`，把原因写入`escalation_reason`；
-3. 再调用`drawio_authorize_annotation_change`触发新的审批弹窗；
-4. 只有用户批准后才使用新token写入；拒绝则保持原图不变。
+3. 再调用`drawio_authorize_annotation_change`取得新的question参数，原样调用内置`question`；
+4. Question返回后，Agent把同一review编号及原始答案显式传给第二次授权调用；只有答案为“确认修改”才取得新token并写入，取消、关闭或文字反馈都保持原图不变。
+
+OpenCode自定义工具本身不能直接读取内置`question`的返回值，因此这里采用Agent显式转交。插件事件桥只作为兼容和审计辅助，正常授权不依赖它；运行时仍严格绑定review、session、图表、revision、preview和候选哈希，但无法把Agent转交的答案声明为独立于Agent的不可伪造证明。
 
 禁止先改完再让用户检查，也禁止用普通`write`、`edit`、脚本或省略`annotation_id`绕过范围守卫。
 
@@ -135,7 +138,7 @@ Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图�
 恢复发生后 agent 必须按以下规则行动：
 
 - 重新调用 `drawio_get_state` 读取最新 XML 和 revision，把恢复后的内容作为新基线；禁止继续沿用恢复前的旧 XML。
-- 所有未完成注释仍然存在，但它们的 `freshness` 会基于恢复后的 XML 重新计算，旧版本上的审批授权与关联预览已被显式清空，`activeAnnotationId` 也会被清除。恢复后旧的 `approval_token` 和 `preview_id` 一律失效；必须重新 `drawio_get_annotation`、重新 dry-run、重新调用 `drawio_authorize_annotation_change` 并等待新的审批弹窗，才能再次正式写入。
+- 所有未完成注释仍然存在，但它们的 `freshness` 会基于恢复后的 XML 重新计算，旧版本上的审批授权与关联预览已被显式清空，`activeAnnotationId` 也会被清除。恢复后旧的 `approval_token` 和 `preview_id` 一律失效；必须重新 `drawio_get_annotation`、重新 dry-run、重新调用 `drawio_authorize_annotation_change`，并在新的 OpenCode `question` 弹窗中确认，才能再次正式写入。
 - 已解决注释不会因恢复自动重新打开。
 - 恢复只更新 `.drawio` XML；同名 PNG 等派生文件可能暂时落后，直到下一次 `drawio_finalize` 刷新，不得宣称这些导出文件也已恢复。
 

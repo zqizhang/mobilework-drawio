@@ -33,9 +33,9 @@
 - 明确受众、图表类型、范围、方向、页面和输出格式；信息充分时直接执行。
 - 新建图先建立语义模型，再选择drawio_create、原生XML或Skill数据驱动脚本。
 - 修改已绑定的图前立即调用drawio_get_state，把最新XML作为修改基线，并携带准确base_revision提交；人工编辑不是只读内容，当前任务需要时可以调整，但禁止用旧快照或普通write、edit、脚本覆盖整个文件。
-- 已绑定图表的普通patch、polish和完整XML正式修改会在工具内部创建或复用同画布预览、弹出审批，并在批准后校验revision与候选哈希再写入；dry-run和drawio_preview_state仅用于提前看图，看完必须继续调用对应正式工具。常用字体、颜色和透明度使用style_updates，完整XML用于页面背景或高级样式。drawio_authorize_preview只作旧流程兼容。
-- 处理按图表文件持久化的框选注释时只读取pending任务并跳过resolved和ignored；pending中的fresh任务直接进入计划和审批，stale任务先询问，随后都必须dry-run并公开计划、稳定ID和范围，再把preview_id传给drawio_authorize_annotation_change触发当前session的写前审批；用户未看图并批准前不得修改，禁止先改后问。
-- 注释修改不得越过用户选择的范围；diagram_wide只覆盖当前图表并使用pageId:cellId；确需越界时先说明原因并通过审批弹窗申请更宽范围，未批准则停止。
+- 已绑定图表的普通patch、polish和完整XML修改必须先生成同画布预览，再进入OpenCode question人工审批：授权或正式写入工具第一次返回绑定候选的question参数和reviewId，Agent必须原样调用内置question；Question返回后，重试同一工具并显式传入approval_review_id=reviewId和approval_answer=用户原始答案，只有确认修改才会校验revision与候选哈希并写入。同一preview只允许一个review，重试时plan措辞变化不得再次提问；question_pending时禁止重发question，Agent已有答案时直接显式转交。取消或关闭不写入，自定义文字作为修改反馈并要求重新生成预览。常用字体、颜色和透明度使用style_updates，完整XML用于页面背景或高级样式。
+- 处理按图表文件持久化的框选注释时只读取pending任务并跳过resolved和ignored；pending中的fresh任务直接进入计划和审批，stale任务先询问，随后都必须dry-run并公开计划、稳定ID和范围，再把preview_id传给drawio_authorize_annotation_change；该工具第一次只返回question参数和reviewId，Agent原样调用内置question，再把reviewId和Question原始答案作为approval_review_id、approval_answer传入第二次授权调用，只有确认修改才返回一次性token。插件事件桥只作兼容和审计辅助，不是正常授权的前置条件。同一未消费授权重试时必须复用原token，禁止重新提问。用户未看图并批准前不得修改，禁止先改后问。
+- 注释修改不得越过用户选择的范围；diagram_wide只覆盖当前图表并使用pageId:cellId；确需越界时先说明原因并通过question人工审批申请更宽范围，未批准则停止。
 - 正式写入前再次调用drawio_get_state核对revision；最终交付前再次调用drawio_list_annotations(file=当前文件,status="pending")核对未完成注释。若本轮期间出现新revision或注释变化，立即以最新状态重新规划，旧preview_id、approval_token、稳定ID清单和上一轮结论不得继续使用。
 - 本轮全部可执行生成或修改（包括fresh注释）完成后必须统一调用drawio_finalize，自动校验、评分、导出同名PNG并返回openUrl。
 - 需要自动优化时先dry-run调用drawio_polish；通过质量门禁后正式写入并保留备份。
@@ -119,7 +119,7 @@ Skill、custom tool 或 Plugin。
 - `.opencode/tools/drawio_health_check.js`：检查导出服务、浏览器Bridge和运行配置是否可用。；使用角色 `drawio-expert`
 - `.opencode/tools/drawio_create.js`：根据结构化节点和连线创建新的Draw.io文件。；使用角色 `drawio-expert`
 - `.opencode/tools/drawio_inspect.js`：读取图表页面、图元、稳定ID、几何和结构信息。；使用角色 `drawio-expert`
-- `.opencode/tools/drawio_quality.js`：计算布局、重叠、连线和标签等质量评分。；使用角色 `drawio-expert`
+- `.opencode/tools/drawio_quality.js`：计算节点、连线共线重叠、共享端口拥堵、穿越和标签等质量评分。；使用角色 `drawio-expert`
 - `.opencode/tools/drawio_patch.js`：基于稳定ID和revision执行可预览的增量修改。；使用角色 `drawio-expert`
 - `.opencode/tools/drawio_polish.js`：对布局、路由和样式执行带质量门禁的自动优化。；使用角色 `drawio-expert`
 - `.opencode/tools/drawio_compare.js`：比较两个Draw.io版本并返回稳定ID差异。；使用角色 `drawio-expert`

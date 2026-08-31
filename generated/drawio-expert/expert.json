@@ -59,7 +59,7 @@
       },
       {
         "name": "drawio-open",
-        "template": "加载drawio-session-editing。优先调用drawio_finalize自动校验并更新同名PNG；仅当shouldOpenBrowser=true时调用MobileWork工具openwork_browser_open_url，传入url=openUrl、provider=\"builtin\"。后续每次Agent修改前立即调用drawio_get_state；携带准确base_revision提交，发生revision_conflict时重新读取、合并人工改动并重试。打开后调用drawio_list_annotations(status=pending)读取按图表文件持久化的未完成任务并逐条处理；pending包含fresh与stale任务，resolved和ignored必须跳过，只有用户重新打开后才能处理。requiresConfirmation=true时先询问，fresh任务直接进入处理闭环。每条任务先drawio_get_annotation取详情、drawio_get_state取最新基线、dry-run并列出计划修改的稳定ID，再调用drawio_authorize_annotation_change触发OpenCode写前审批；批准后才把annotation_id和当前session的一次性token传给drawio_patch/drawio_update_state。diagram_wide覆盖当前图表全部页面并使用pageId:cellId；drawio_polish只有取得diagram_wide审批后才能正式运行。不得修改所选范围外内容；确需越界时先在escalation_reason说明原因并申请更宽范围。写入成功后drawio_resolve_annotation；本轮全部可执行任务完成后统一drawio_finalize刷新预览。",
+        "template": "加载drawio-session-editing。优先调用drawio_finalize自动校验并更新同名PNG；仅当shouldOpenBrowser=true时调用MobileWork工具openwork_browser_open_url，传入url=openUrl、provider=\"builtin\"。后续每次Agent修改前立即调用drawio_get_state；携带准确base_revision提交，发生revision_conflict时重新读取、合并人工改动并重试。打开后调用drawio_list_annotations(status=pending)读取按图表文件持久化的未完成任务并逐条处理；pending包含fresh与stale任务，resolved和ignored必须跳过，只有用户重新打开后才能处理。requiresConfirmation=true时先询问，fresh任务直接进入处理闭环。每条任务先drawio_get_annotation取详情、drawio_get_state取最新基线、dry-run并列出计划修改的稳定ID，再调用drawio_authorize_annotation_change触发OpenCode写前审批；Question返回后必须把第一次授权调用返回的reviewId和Question原始答案作为approval_review_id、approval_answer显式传给第二次授权调用，批准后才把annotation_id和当前session的一次性token传给drawio_patch/drawio_update_state。diagram_wide覆盖当前图表全部页面并使用pageId:cellId；drawio_polish只有取得diagram_wide审批后才能正式运行。不得修改所选范围外内容；确需越界时先在escalation_reason说明原因并申请更宽范围。写入成功后drawio_resolve_annotation；本轮全部可执行任务完成后统一drawio_finalize刷新预览。",
         "description": "在MobileWork现有内置浏览器中打开并协同编辑Draw.io。",
         "agent": "drawio-expert",
         "subtask": true
@@ -94,7 +94,7 @@
       {
         "path": "drawio_quality.js",
         "content": "import { tool } from \"@opencode-ai/plugin\"\nimport path from \"node:path\"\nimport { fileURLToPath, pathToFileURL } from \"node:url\"\n\nfunction resolveRuntimePath() {\n  const managedSkills = process.env.MOBILEWORK_SKILLS_DIR?.trim()\n\n  if (managedSkills) {\n    return path.join(\n      managedSkills,\n      \"drawio-expert-common\",\n      \"scripts\",\n      \"drawio-runtime-core.mjs\",\n    )\n  }\n\n  // 兼容直接把专家包作为普通OpenCode项目运行：\n  // 适配器位于 <package>/.opencode/tools/，共享核心位于\n  // <package>/.opencode/skills/ 下。\n  const opencodeRoot = path.dirname(\n    path.dirname(fileURLToPath(import.meta.url)),\n  )\n\n  return path.join(\n    opencodeRoot,\n    \"skills\",\n    \"drawio-expert-common\",\n    \"scripts\",\n    \"drawio-runtime-core.mjs\",\n  )\n}\n\nconst runtimeUrl = pathToFileURL(resolveRuntimePath()).href\nconst { createDrawioTool } = await import(runtimeUrl)\n\nexport default createDrawioTool(\"drawio_quality\", tool)\n",
-        "purpose": "计算布局、重叠、连线和标签等质量评分。"
+        "purpose": "计算节点、连线共线重叠、共享端口拥堵、穿越和标签等质量评分。"
       },
       {
         "path": "drawio_patch.js",
@@ -167,7 +167,7 @@
       "local": [
         {
           "path": "drawio-hooks.js",
-          "content": "// @bun\nimport q from\"path\";import{fileURLToPath as A,pathToFileURL as B}from\"url\";function D(){let b=process.env.MOBILEWORK_SKILLS_DIR?.trim();if(b)return q.join(b,\"drawio-expert-common\",\"scripts\",\"drawio-runtime-core.mjs\");let j=q.dirname(q.dirname(A(import.meta.url)));return q.join(j,\"skills\",\"drawio-expert-common\",\"scripts\",\"drawio-runtime-core.mjs\")}async function E(){return await import(B(D()).href)}var I=async(b)=>{let j=await E();return await j.initializeDrawioWorkspace(b.directory),{\"experimental.chat.system.transform\":async(z,y)=>{j.applyDrawioSystemGuidance(y)},\"tool.execute.before\":async(z,y)=>{j.enforceDrawioWriteGuard(z,y)}}};export{I as DrawioHooksPlugin};\n"
+          "content": "// @bun\nimport y from\"path\";import{fileURLToPath as A,pathToFileURL as B}from\"url\";function D(){let j=process.env.MOBILEWORK_SKILLS_DIR?.trim();if(j)return y.join(j,\"drawio-expert-common\",\"scripts\",\"drawio-runtime-core.mjs\");let b=y.dirname(y.dirname(A(import.meta.url)));return y.join(b,\"skills\",\"drawio-expert-common\",\"scripts\",\"drawio-runtime-core.mjs\")}async function E(){return await import(B(D()).href)}var I=async(j)=>{let b=await E();return await b.initializeDrawioWorkspace(j.directory),{event:async({event:q})=>{b.handleDrawioOpenCodeEvent(q)},\"experimental.chat.system.transform\":async(q,z)=>{b.applyDrawioSystemGuidance(z)},\"tool.execute.before\":async(q,z)=>{b.enforceDrawioWriteGuard(q,z)}}};export{I as DrawioHooksPlugin};\n"
         }
       ],
       "package_json": {}
@@ -219,9 +219,9 @@
       "明确受众、图表类型、范围、方向、页面和输出格式；信息充分时直接执行。",
       "新建图先建立语义模型，再选择drawio_create、原生XML或Skill数据驱动脚本。",
       "修改已绑定的图前立即调用drawio_get_state，把最新XML作为修改基线，并携带准确base_revision提交；人工编辑不是只读内容，当前任务需要时可以调整，但禁止用旧快照或普通write、edit、脚本覆盖整个文件。",
-      "已绑定图表的普通patch、polish和完整XML正式修改会在工具内部创建或复用同画布预览、弹出审批，并在批准后校验revision与候选哈希再写入；dry-run和drawio_preview_state仅用于提前看图，看完必须继续调用对应正式工具。常用字体、颜色和透明度使用style_updates，完整XML用于页面背景或高级样式。drawio_authorize_preview只作旧流程兼容。",
-      "处理按图表文件持久化的框选注释时只读取pending任务并跳过resolved和ignored；pending中的fresh任务直接进入计划和审批，stale任务先询问，随后都必须dry-run并公开计划、稳定ID和范围，再把preview_id传给drawio_authorize_annotation_change触发当前session的写前审批；用户未看图并批准前不得修改，禁止先改后问。",
-      "注释修改不得越过用户选择的范围；diagram_wide只覆盖当前图表并使用pageId:cellId；确需越界时先说明原因并通过审批弹窗申请更宽范围，未批准则停止。",
+      "已绑定图表的普通patch、polish和完整XML修改必须先生成同画布预览，再进入OpenCode question人工审批：授权或正式写入工具第一次返回绑定候选的question参数和reviewId，Agent必须原样调用内置question；Question返回后，重试同一工具并显式传入approval_review_id=reviewId和approval_answer=用户原始答案，只有确认修改才会校验revision与候选哈希并写入。同一preview只允许一个review，重试时plan措辞变化不得再次提问；question_pending时禁止重发question，Agent已有答案时直接显式转交。取消或关闭不写入，自定义文字作为修改反馈并要求重新生成预览。常用字体、颜色和透明度使用style_updates，完整XML用于页面背景或高级样式。",
+      "处理按图表文件持久化的框选注释时只读取pending任务并跳过resolved和ignored；pending中的fresh任务直接进入计划和审批，stale任务先询问，随后都必须dry-run并公开计划、稳定ID和范围，再把preview_id传给drawio_authorize_annotation_change；该工具第一次只返回question参数和reviewId，Agent原样调用内置question，再把reviewId和Question原始答案作为approval_review_id、approval_answer传入第二次授权调用，只有确认修改才返回一次性token。插件事件桥只作兼容和审计辅助，不是正常授权的前置条件。同一未消费授权重试时必须复用原token，禁止重新提问。用户未看图并批准前不得修改，禁止先改后问。",
+      "注释修改不得越过用户选择的范围；diagram_wide只覆盖当前图表并使用pageId:cellId；确需越界时先说明原因并通过question人工审批申请更宽范围，未批准则停止。",
       "正式写入前再次调用drawio_get_state核对revision；最终交付前再次调用drawio_list_annotations(file=当前文件,status=\"pending\")核对未完成注释。若本轮期间出现新revision或注释变化，立即以最新状态重新规划，旧preview_id、approval_token、稳定ID清单和上一轮结论不得继续使用。",
       "本轮全部可执行生成或修改（包括fresh注释）完成后必须统一调用drawio_finalize，自动校验、评分、导出同名PNG并返回openUrl。",
       "需要自动优化时先dry-run调用drawio_polish；通过质量门禁后正式写入并保留备份。",
@@ -235,7 +235,7 @@
       "创建或修改后的文件必须通过drawio_validate。",
       "已绑定图表的增量修改、自动优化和完整XML候选都先生成同画布临时预览；预览XML不得写入源文件，正式候选必须与获批预览哈希一致，并产生可恢复备份。",
       "不得出现无法解释的稳定ID新增、删除或语义修改。",
-      "默认质量阈值为90；节点不得重叠，连线不得穿过非端点节点，连线标签不得与节点、容器标题或其他连线标签重叠。",
+      "默认质量阈值为90；节点不得重叠，连线不得穿过非端点节点，多条连线不得共用同一出入口或共线堆叠，连线标签不得与节点、容器标题或其他连线标签重叠。",
       "七种导出格式必须非空且类型有效；PNG、JPEG、可编辑PNG、SVG和可编辑SVG的all_pages=true必须返回与页面数一致的outputs，PDF和HTML必须返回一个多页文件；失败或缺页不得报告为成功。",
       "不得把SVG或可编辑SVG的all_pages请求描述为运行时不支持，也不得用逐个page_id作为默认绕过方案；必须以drawio_export的实际返回结果为准。",
       "每次创建或修改成功后必须产生同名PNG；仅当drawio_finalize返回shouldOpenBrowser=true时才调用MobileWork工具openwork_browser_open_url，传入url=openUrl、provider=\"builtin\"。",
@@ -245,6 +245,7 @@
       "批注的持久化状态为open、resolved或ignored；stale是动态freshness。resolved或ignored后，所有session中的旧授权立即失效，只有用户重新打开后才能再次处理。",
       "diagram_wide仅允许修改当前图表的全部页面，稳定ID使用pageId:cellId；运行时仍拒绝未披露ID、其它文件、过期revision或跨session token。",
       "drawio_polish处理活动批注时必须先dry-run，并取得diagram_wide审批后才能正式写入。",
+      "任何预览授权都必须绑定OpenCode真实question事件；授权工具在未收到确认、收到取消、关闭、自定义文字、过期回复或重放回复时不得返回token。",
       "不得因为本轮未加载drawio-skill或drawio-session-editing而跳过轮次开始时的revision与全部注释同步，也不得因为上一轮刚检查过就复用旧状态。"
     ],
     "handoff_contract": [
@@ -257,9 +258,7 @@
       "drawio-session-editing"
     ],
     "permission": {
-      "webfetch": "ask",
-      "drawio_authorize_annotation_change": "ask",
-      "drawio_authorize_preview": "ask"
+      "webfetch": "ask"
     },
     "autonomy": "bounded",
     "custom_tools": [
@@ -286,7 +285,7 @@
     "references": [
       "drawio-intranet"
     ],
-    "permission_reason": "bounded 基线：edit/read/bash 按矩阵派生；webfetch 与两个审批工具收紧为 ask；openwork_browser_open_url 与 python 脚本 bash allow 超出当前权限合同表达范围，留待权限专项处理。",
+    "permission_reason": "bounded 基线：edit/read/bash 与自定义工具权限按专家管理器矩阵派生；授权token不依赖permission ask。OpenCode question结果返回给Agent后，由Agent把reviewId和原始答案显式转交授权工具；插件事件桥只作兼容和审计辅助。运行时继续校验session、图表、revision、preview、候选哈希和范围，取消、文字反馈和未回复均不授权；openwork_browser_open_url 与 python 脚本 bash allow 超出当前权限合同表达范围，留待权限专项处理。",
     "steps": 80
   },
   "skills": [
@@ -315,7 +314,7 @@
     {
       "path": ".opencode/skills/drawio-expert-common/scripts/drawio-runtime-core.mjs",
       "kind": "text",
-      "sha256": "67b88b36d65a29023e468540920f740501fdbc73be7d8d5d6758458216e2a120"
+      "sha256": "d1414b0edcf1a5ec6df602de2abe1b8b0ea520a7b3f782a3bb943bda4472258d"
     },
     {
       "path": ".opencode/skills/drawio-expert-common/SKILL.md",
@@ -325,7 +324,7 @@
     {
       "path": ".opencode/skills/drawio-expert-drawio-expert/SKILL.md",
       "kind": "text",
-      "sha256": "748e8860435a37958df5012be9b6eb3bdd5c8709ba15e2f6391c34688b9ae7d6"
+      "sha256": "5ee02c7edaeab43466aa7fc9a006a90c54024e571a48d775f373bd2cdef9e5af"
     },
     {
       "path": ".opencode/skills/drawio-session-editing/agents/openai.yaml",
@@ -335,7 +334,7 @@
     {
       "path": ".opencode/skills/drawio-session-editing/references/protocol.md",
       "kind": "text",
-      "sha256": "3e7f729dbdf17b01bf60b5ba255b6e3397d0bdb30200e9e2c13c8370b091f21e"
+      "sha256": "6f198952bcac5ac516c803f9fea821112b9501c58526ed49b2f297f5604ab480"
     },
     {
       "path": ".opencode/skills/drawio-session-editing/references/xml-patterns.md",
@@ -345,7 +344,7 @@
     {
       "path": ".opencode/skills/drawio-session-editing/SKILL.md",
       "kind": "text",
-      "sha256": "0d5e0dd2f9a84467247e53eb725067063cdbdd29c2f88d30ff2f7bc7f6944d75"
+      "sha256": "15e1ae0308ccd984aa0ece0a0b2e43c7864f8a0dfda4e95264dd9bba4e4b1d47"
     },
     {
       "path": ".opencode/skills/drawio-skill/data/lobe-icons.json",
@@ -425,7 +424,7 @@
     {
       "path": ".opencode/skills/drawio-skill/references/xml-authoring.md",
       "kind": "text",
-      "sha256": "18a84bc98c9d071fb987ef003f622aadedfb6cb92eb2fb12c3ec18e590460fce"
+      "sha256": "36982cbb3fe3189dd481bcabb44e21ff66d354cf5a027d95eb92623517e15fc6"
     },
     {
       "path": ".opencode/skills/drawio-skill/scripts/aiicons.py",

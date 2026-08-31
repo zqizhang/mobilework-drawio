@@ -8,7 +8,7 @@ Read this **before hand-writing any `.drawio` XML** (workflow step 3). Skip it w
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <mxfile host="drawio" version="26.0.0">
-  <diagram name="Page-1">
+  <diagram id="page-1" name="Page-1">
     <mxGraphModel>
       <root>
         <mxCell id="0" />

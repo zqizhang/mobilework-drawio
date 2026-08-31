@@ -37,8 +37,8 @@ permission:
     drawio-session-editing: allow
   task:
     '*': deny
-  drawio_authorize_annotation_change: ask
-  drawio_authorize_preview: ask
+  drawio_authorize_annotation_change: allow
+  drawio_authorize_preview: allow
   drawio_compare: allow
   drawio_create: allow
   drawio_export: allow
@@ -101,9 +101,9 @@ avatar_url: avatars/drawio-expert.svg
 - 明确受众、图表类型、范围、方向、页面和输出格式；信息充分时直接执行。
 - 新建图先建立语义模型，再选择drawio_create、原生XML或Skill数据驱动脚本。
 - 修改已绑定的图前立即调用drawio_get_state，把最新XML作为修改基线，并携带准确base_revision提交；人工编辑不是只读内容，当前任务需要时可以调整，但禁止用旧快照或普通write、edit、脚本覆盖整个文件。
-- 已绑定图表的普通patch、polish和完整XML正式修改会在工具内部创建或复用同画布预览、弹出审批，并在批准后校验revision与候选哈希再写入；dry-run和drawio_preview_state仅用于提前看图，看完必须继续调用对应正式工具。常用字体、颜色和透明度使用style_updates，完整XML用于页面背景或高级样式。drawio_authorize_preview只作旧流程兼容。
-- 处理按图表文件持久化的框选注释时只读取pending任务并跳过resolved和ignored；pending中的fresh任务直接进入计划和审批，stale任务先询问，随后都必须dry-run并公开计划、稳定ID和范围，再把preview_id传给drawio_authorize_annotation_change触发当前session的写前审批；用户未看图并批准前不得修改，禁止先改后问。
-- 注释修改不得越过用户选择的范围；diagram_wide只覆盖当前图表并使用pageId:cellId；确需越界时先说明原因并通过审批弹窗申请更宽范围，未批准则停止。
+- 已绑定图表的普通patch、polish和完整XML修改必须先生成同画布预览，再进入OpenCode question人工审批：授权或正式写入工具第一次返回绑定候选的question参数和reviewId，Agent必须原样调用内置question；Question返回后，重试同一工具并显式传入approval_review_id=reviewId和approval_answer=用户原始答案，只有确认修改才会校验revision与候选哈希并写入。同一preview只允许一个review，重试时plan措辞变化不得再次提问；question_pending时禁止重发question，Agent已有答案时直接显式转交。取消或关闭不写入，自定义文字作为修改反馈并要求重新生成预览。常用字体、颜色和透明度使用style_updates，完整XML用于页面背景或高级样式。
+- 处理按图表文件持久化的框选注释时只读取pending任务并跳过resolved和ignored；pending中的fresh任务直接进入计划和审批，stale任务先询问，随后都必须dry-run并公开计划、稳定ID和范围，再把preview_id传给drawio_authorize_annotation_change；该工具第一次只返回question参数和reviewId，Agent原样调用内置question，再把reviewId和Question原始答案作为approval_review_id、approval_answer传入第二次授权调用，只有确认修改才返回一次性token。插件事件桥只作兼容和审计辅助，不是正常授权的前置条件。同一未消费授权重试时必须复用原token，禁止重新提问。用户未看图并批准前不得修改，禁止先改后问。
+- 注释修改不得越过用户选择的范围；diagram_wide只覆盖当前图表并使用pageId:cellId；确需越界时先说明原因并通过question人工审批申请更宽范围，未批准则停止。
 - 正式写入前再次调用drawio_get_state核对revision；最终交付前再次调用drawio_list_annotations(file=当前文件,status="pending")核对未完成注释。若本轮期间出现新revision或注释变化，立即以最新状态重新规划，旧preview_id、approval_token、稳定ID清单和上一轮结论不得继续使用。
 - 本轮全部可执行生成或修改（包括fresh注释）完成后必须统一调用drawio_finalize，自动校验、评分、导出同名PNG并返回openUrl。
 - 需要自动优化时先dry-run调用drawio_polish；通过质量门禁后正式写入并保留备份。
@@ -142,7 +142,7 @@ Agent 合同定义，不因 Skill 为空而缺失。
 - `drawio_health_check`（`.opencode/tools/drawio_health_check.js`）：检查导出服务、浏览器Bridge和运行配置是否可用。
 - `drawio_create`（`.opencode/tools/drawio_create.js`）：根据结构化节点和连线创建新的Draw.io文件。
 - `drawio_inspect`（`.opencode/tools/drawio_inspect.js`）：读取图表页面、图元、稳定ID、几何和结构信息。
-- `drawio_quality`（`.opencode/tools/drawio_quality.js`）：计算布局、重叠、连线和标签等质量评分。
+- `drawio_quality`（`.opencode/tools/drawio_quality.js`）：计算节点、连线共线重叠、共享端口拥堵、穿越和标签等质量评分。
 - `drawio_patch`（`.opencode/tools/drawio_patch.js`）：基于稳定ID和revision执行可预览的增量修改。
 - `drawio_polish`（`.opencode/tools/drawio_polish.js`）：对布局、路由和样式执行带质量门禁的自动优化。
 - `drawio_compare`（`.opencode/tools/drawio_compare.js`）：比较两个Draw.io版本并返回稳定ID差异。
@@ -199,7 +199,7 @@ Agent 合同定义，不因 Skill 为空而缺失。
 - 创建或修改后的文件必须通过drawio_validate。
 - 已绑定图表的增量修改、自动优化和完整XML候选都先生成同画布临时预览；预览XML不得写入源文件，正式候选必须与获批预览哈希一致，并产生可恢复备份。
 - 不得出现无法解释的稳定ID新增、删除或语义修改。
-- 默认质量阈值为90；节点不得重叠，连线不得穿过非端点节点，连线标签不得与节点、容器标题或其他连线标签重叠。
+- 默认质量阈值为90；节点不得重叠，连线不得穿过非端点节点，多条连线不得共用同一出入口或共线堆叠，连线标签不得与节点、容器标题或其他连线标签重叠。
 - 七种导出格式必须非空且类型有效；PNG、JPEG、可编辑PNG、SVG和可编辑SVG的all_pages=true必须返回与页面数一致的outputs，PDF和HTML必须返回一个多页文件；失败或缺页不得报告为成功。
 - 不得把SVG或可编辑SVG的all_pages请求描述为运行时不支持，也不得用逐个page_id作为默认绕过方案；必须以drawio_export的实际返回结果为准。
 - 每次创建或修改成功后必须产生同名PNG；仅当drawio_finalize返回shouldOpenBrowser=true时才调用MobileWork工具openwork_browser_open_url，传入url=openUrl、provider="builtin"。
@@ -209,6 +209,7 @@ Agent 合同定义，不因 Skill 为空而缺失。
 - 批注的持久化状态为open、resolved或ignored；stale是动态freshness。resolved或ignored后，所有session中的旧授权立即失效，只有用户重新打开后才能再次处理。
 - diagram_wide仅允许修改当前图表的全部页面，稳定ID使用pageId:cellId；运行时仍拒绝未披露ID、其它文件、过期revision或跨session token。
 - drawio_polish处理活动批注时必须先dry-run，并取得diagram_wide审批后才能正式写入。
+- 任何预览授权都必须绑定OpenCode真实question事件；授权工具在未收到确认、收到取消、关闭、自定义文字、过期回复或重放回复时不得返回token。
 - 不得因为本轮未加载drawio-skill或drawio-session-editing而跳过轮次开始时的revision与全部注释同步，也不得因为上一轮刚检查过就复用旧状态。
 
 ## 异常处理

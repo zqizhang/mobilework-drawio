@@ -153,6 +153,8 @@ try {
   )).href
   const { DrawioHooksPlugin } = await import(hooksUrl)
   const hooks = await DrawioHooksPlugin({ directory: workspace })
+  assert.equal(typeof hooks.event, "function")
+  await hooks.event({ event: { type: "unrelated.event", properties: {} } })
   const generatedAgentPrompt = await fs.readFile(
     path.join(packageDirectory, ".opencode", "agents", "drawio-expert.md"),
     "utf8",

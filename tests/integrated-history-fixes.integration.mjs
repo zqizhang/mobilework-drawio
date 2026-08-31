@@ -6,7 +6,7 @@ import os from "node:os"
 import path from "node:path"
 import vm from "node:vm"
 
-import { createDrawioToolset, initializeDrawioWorkspace } from "../generated/drawio-expert/.opencode/skills/drawio-expert-common/scripts/drawio-runtime-core.mjs"
+import { createDrawioToolset, handleDrawioOpenCodeEvent, initializeDrawioWorkspace } from "../generated/drawio-expert/.opencode/skills/drawio-expert-common/scripts/drawio-runtime-core.mjs"
 import { tool } from "@opencode-ai/plugin"
 
 const DRAWIO_ENVIRONMENT_KEYS = [
@@ -67,6 +67,32 @@ const context = {
   async ask() {},
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+let questionSequence = 0
+
+function approveQuestion(result, ctx) {
+  const requestID = `history-fix-question-${++questionSequence}`
+  const questions = result.question.arguments.questions
+  assert.equal(handleDrawioOpenCodeEvent({
+    type: "question.asked",
+    properties: {
+      id: requestID,
+      sessionID: ctx.sessionID,
+      questions,
+      tool: { messageID: `message-${questionSequence}`, callID: `call-${questionSequence}` },
+    },
+  }), true)
+  assert.equal(handleDrawioOpenCodeEvent({
+    type: "question.replied",
+    properties: { sessionID: ctx.sessionID, requestID, answers: [["确认修改"]] },
+  }), true)
+}
+
+async function executeApproved(execute, args, ctx) {
+  const first = JSON.parse(await execute(args, ctx))
+  assert.equal(first.status, "question_required")
+  approveQuestion(first, ctx)
+  return JSON.parse(await execute(args, ctx))
+}
 
 function apiBase(openResult, pathname) {
   const url = new URL(openResult.openUrl)
@@ -106,11 +132,11 @@ async function agentCommit(plugin, ctx, openResult, file, label) {
     base_revision: diagram.revision,
     xml,
   }, ctx))
-  const result = JSON.parse(await plugin.tool.drawio_authorize_preview.execute({
+  const result = await executeApproved(plugin.tool.drawio_authorize_preview.execute, {
     file,
     preview_id: preview.preview.id,
     plan: `history fix checkpoint ${label}`,
-  }, ctx))
+  }, ctx)
   assert.equal(result.ok, true)
   return result
 }
@@ -403,12 +429,22 @@ try {
     }).then((response) => response.json())
     assert.equal(annotationResult.ok, true)
     const annotationId = annotationResult.annotation.id
-    const authorization = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
+    await plugin.tool.drawio_get_annotation.execute({ id: annotationId }, session.ctx)
+    const annotationState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, session.ctx))
+    const annotationPreview = JSON.parse(await plugin.tool.drawio_patch.execute({
+      file: "ann.drawio",
+      annotation_id: annotationId,
+      operations: [{ type: "update-node", id: "node", label: "Pending Approval" }],
+      dry_run: true,
+      base_revision: annotationState.revision,
+    }, session.ctx))
+    const authorization = await executeApproved(plugin.tool.drawio_authorize_annotation_change.execute, {
       id: annotationId,
       plan: "仅改名 node",
       proposed_changed_ids: ["node"],
       requested_scope: "selection_only",
-    }, session.ctx))
+      preview_id: annotationPreview.preview.id,
+    }, session.ctx)
     assert.equal(authorization.ok, true)
 
     globalThis.__drawioHistoryFaults = { annotationsFile: true }

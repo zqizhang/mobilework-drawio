@@ -36,8 +36,8 @@
         "task": {
           "*": "deny"
         },
-        "drawio_authorize_annotation_change": "ask",
-        "drawio_authorize_preview": "ask",
+        "drawio_authorize_annotation_change": "allow",
+        "drawio_authorize_preview": "allow",
         "drawio_compare": "allow",
         "drawio_create": "allow",
         "drawio_export": "allow",

@@ -113,14 +113,27 @@ Returns `201` with `{ ok, annotation }`. The `region` and `baseRevision` are
 filled in by the bridge.
 
 Before an Agent write, it must perform a dry-run and call
-`drawio_authorize_annotation_change`. That custom tool is configured with
-OpenCode permission `ask`, so the host shows an approval popup before execution.
-Approval creates a one-time token bound to the diagram, current session,
+`drawio_authorize_annotation_change`. Its first call returns an exact OpenCode
+`question` request bound to the preview hash. The Agent must submit that request
+unchanged through the built-in `question` tool. Because a custom tool cannot read
+the built-in question result directly, the Agent must retry authorization with
+`approval_review_id=<returned reviewId>` and
+`approval_answer=<exact question answer>`. Only the explicit `确认修改` answer
+creates a one-time token bound to the diagram, current session,
 annotation, current revision, requested scope and complete proposed stable-ID
 list. Formal `drawio_patch`, `drawio_update_state`, or diagram-wide
 `drawio_polish` calls must pass both `annotation_id` and `approval_token`.
+Each preview owns exactly one review. A retry with reworded plan text reuses the
+original review instead of opening another question. `question_pending` never
+contains another question request: it means the question is still open or the
+Agent has not yet forwarded its answer. Plugin question events remain an optional
+compatibility and audit path, not a requirement for authorization. This handoff
+trusts the Agent to forward the returned answer faithfully; candidate safety still
+comes from binding the review to session, diagram, revision, preview and hash. An
+unconsumed annotation authorization returns the same token on an idempotent retry.
 The runtime rejects missing, expired, reused, undeclared or out-of-scope changes.
-Scope escalation requires a non-empty reason and a new approval popup.
+Cancel, close, custom feedback, stale answers, or replayed answers never produce
+a token. Scope escalation requires a non-empty reason and a new question review.
 
 ```http
 GET /api/annotations/{id}?sessionId=...

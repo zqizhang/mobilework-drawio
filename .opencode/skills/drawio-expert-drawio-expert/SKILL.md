@@ -48,7 +48,7 @@ description: Draw.io 绘图专家 中 Draw.io 绘图专家 的角色工作指引
 - 创建或修改后的文件必须通过drawio_validate。
 - 已绑定图表的增量修改、自动优化和完整XML候选都先生成同画布临时预览；预览XML不得写入源文件，正式候选必须与获批预览哈希一致，并产生可恢复备份。
 - 不得出现无法解释的稳定ID新增、删除或语义修改。
-- 默认质量阈值为90；节点不得重叠，连线不得穿过非端点节点，连线标签不得与节点、容器标题或其他连线标签重叠。
+- 默认质量阈值为90；节点不得重叠，连线不得穿过非端点节点，多条连线不得共用同一出入口或共线堆叠，连线标签不得与节点、容器标题或其他连线标签重叠。
 - 七种导出格式必须非空且类型有效；PNG、JPEG、可编辑PNG、SVG和可编辑SVG的all_pages=true必须返回与页面数一致的outputs，PDF和HTML必须返回一个多页文件；失败或缺页不得报告为成功。
 - 不得把SVG或可编辑SVG的all_pages请求描述为运行时不支持，也不得用逐个page_id作为默认绕过方案；必须以drawio_export的实际返回结果为准。
 - 每次创建或修改成功后必须产生同名PNG；仅当drawio_finalize返回shouldOpenBrowser=true时才调用MobileWork工具openwork_browser_open_url，传入url=openUrl、provider="builtin"。

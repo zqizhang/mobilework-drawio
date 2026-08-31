@@ -41,6 +41,9 @@ export const DrawioHooksPlugin: Plugin = async (input) => {
   await core.initializeDrawioWorkspace(input.directory)
 
   return {
+    event: async ({ event }) => {
+      core.handleDrawioOpenCodeEvent(event)
+    },
     "experimental.chat.system.transform": async (_input, output) => {
       core.applyDrawioSystemGuidance(output)
     },

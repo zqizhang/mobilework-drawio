@@ -31,7 +31,7 @@
     {
       "name": "drawio_quality",
       "path": "drawio_quality.js",
-      "purpose": "计算布局、重叠、连线和标签等质量评分。"
+      "purpose": "计算节点、连线共线重叠、共享端口拥堵、穿越和标签等质量评分。"
     },
     {
       "name": "drawio_patch",

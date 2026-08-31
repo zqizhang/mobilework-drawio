@@ -86,6 +86,7 @@ await new Promise((resolve) => exportServer.listen(0, "127.0.0.1", resolve))
 const exportAddress = exportServer.address()
 
 const XML = '<mxfile host="test"><diagram id="p1" name="Page-1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="node" value="MobileWork" vertex="1" parent="1"><mxGeometry x="20" y="20" width="120" height="60" as="geometry"/></mxCell><mxCell id="neighbor" value="Neighbor" vertex="1" parent="1"><mxGeometry x="300" y="20" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram><diagram id="p2" name="Page-2"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="remote" value="Remote" vertex="1" parent="1"><mxGeometry x="40" y="40" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>'
+const MISSING_PAGE_ID_XML = '<mxfile host="test"><diagram name="Page-1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="compat-node" value="Compat" vertex="1" parent="1"><mxGeometry x="20" y="20" width="120" height="60" as="geometry"/></mxCell><mxCell id="compat-neighbor" value="Neighbor" vertex="1" parent="1"><mxGeometry x="280" y="20" width="120" height="60" as="geometry"/></mxCell><mxCell id="compat-edge" value="Flow" edge="1" parent="1" source="compat-node" target="compat-neighbor"><mxGeometry relative="1" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>'
 const NESTED_XML = `<mxfile host="test"><diagram id="nested" name="Nested containers"><mxGraphModel><root>
   <mxCell id="0"/><mxCell id="1" parent="0"/>
   <mxCell id="user" value="User" vertex="1" parent="1"><mxGeometry x="390" y="60" width="160" height="60" as="geometry"/></mxCell>
@@ -113,6 +114,20 @@ const LABEL_CLEAR_XML = LABEL_OVERLAP_XML.replace(
   '<mxGeometry relative="1" as="geometry"><Array',
   '<mxGeometry relative="1" as="geometry"><mxPoint x="0" y="-50" as="offset"/><Array',
 )
+const SHARED_PORT_XML = `<mxfile host="test"><diagram id="shared-port" name="Shared port"><mxGraphModel><root>
+  <mxCell id="0"/><mxCell id="1" parent="0"/>
+  <mxCell id="client" value="Client" vertex="1" parent="1"><mxGeometry x="320" y="190" width="170" height="70" as="geometry"/></mxCell>
+  <mxCell id="server-a" value="Server A" vertex="1" parent="1"><mxGeometry x="580" y="50" width="160" height="70" as="geometry"/></mxCell>
+  <mxCell id="server-b" value="Server B" vertex="1" parent="1"><mxGeometry x="580" y="190" width="160" height="70" as="geometry"/></mxCell>
+  <mxCell id="server-c" value="Server C" vertex="1" parent="1"><mxGeometry x="580" y="330" width="160" height="70" as="geometry"/></mxCell>
+  <mxCell id="rpc-a" value="" style="edgeStyle=orthogonalEdgeStyle;jumpStyle=arc;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="client" target="server-a"><mxGeometry relative="1" as="geometry"/></mxCell>
+  <mxCell id="rpc-b" value="" style="edgeStyle=orthogonalEdgeStyle;jumpStyle=arc;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="client" target="server-b"><mxGeometry relative="1" as="geometry"/></mxCell>
+  <mxCell id="rpc-c" value="" style="edgeStyle=orthogonalEdgeStyle;jumpStyle=arc;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="client" target="server-c"><mxGeometry relative="1" as="geometry"/></mxCell>
+</root></mxGraphModel></diagram></mxfile>`
+const EDGE_OVERLAP_XML = SHARED_PORT_XML
+  .replace('<mxGeometry relative="1" as="geometry"/></mxCell>\n  <mxCell id="rpc-b"', '<mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="535" y="225"/><mxPoint x="535" y="85"/></Array></mxGeometry></mxCell>\n  <mxCell id="rpc-b"')
+  .replace('<mxGeometry relative="1" as="geometry"/></mxCell>\n  <mxCell id="rpc-c"', '<mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="535" y="225"/></Array></mxGeometry></mxCell>\n  <mxCell id="rpc-c"')
+  .replace('<mxGeometry relative="1" as="geometry"/></mxCell>\n</root>', '<mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="535" y="225"/><mxPoint x="535" y="365"/></Array></mxGeometry></mxCell>\n</root>')
 
 const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-integrated-"))
 const approvalRequests = []
@@ -138,6 +153,57 @@ const context = {
   abort: new AbortController().signal,
   metadata() {},
   async ask(input) { approvalRequests.push(input) },
+}
+
+let approvalQuestionSequence = 0
+function answerApprovalQuestion(result, sessionID, answer = "确认修改", mirrorV2 = false) {
+  assert.equal(result.status, "question_required")
+  assert.equal(result.approvalRequired, true)
+  assert.equal(result.question.tool, "question")
+  const questions = result.question.arguments.questions
+  assert.equal(questions.length, 1)
+  const requestID = `question-${++approvalQuestionSequence}`
+  assert.equal(runtime.handleDrawioOpenCodeEvent({
+    type: "question.asked",
+    properties: {
+      id: requestID,
+      sessionID,
+      questions,
+      tool: { messageID: `message-${approvalQuestionSequence}`, callID: `call-${approvalQuestionSequence}` },
+    },
+  }), true)
+  const replyRequestID = mirrorV2 ? `${requestID}-v2` : requestID
+  if (mirrorV2) {
+    assert.equal(runtime.handleDrawioOpenCodeEvent({
+      type: "question.v2.asked",
+      properties: {
+        id: replyRequestID,
+        sessionID,
+        questions,
+        tool: { messageID: `message-${approvalQuestionSequence}-v2`, callID: `call-${approvalQuestionSequence}-v2` },
+      },
+    }), true)
+  }
+  const event = answer === null
+    ? { type: "question.rejected", properties: { sessionID, requestID: replyRequestID } }
+    : { type: "question.replied", properties: { sessionID, requestID: replyRequestID, answers: [[answer]] } }
+  assert.equal(runtime.handleDrawioOpenCodeEvent(event), true)
+  return { requestID, event }
+}
+
+async function executeWithApprovalQuestion(execute, args, toolContext = context, answer = "确认修改") {
+  const first = JSON.parse(await execute(args, toolContext))
+  assert.equal(first.status, "question_required")
+  assert.equal(first.question.tool, "question")
+  // The built-in question result is returned to the Agent, not to a custom
+  // Draw.io tool. Exercise the real handoff: the Agent must forward the
+  // review id and exact answer on the second call. No plugin event is emitted.
+  const second = JSON.parse(await execute({
+    ...args,
+    approval_review_id: first.reviewId,
+    approval_answer: answer,
+  }, toolContext))
+  return { first, second }
 }
 
 try {
@@ -202,11 +268,15 @@ try {
   ))
   assert.equal(
     generatedOpenCodeConfig.agent["drawio-expert"].permission.drawio_authorize_annotation_change,
-    "ask",
+    "allow",
   )
   assert.equal(
     generatedOpenCodeConfig.agent["drawio-expert"].permission.drawio_authorize_preview,
-    "ask",
+    "allow",
+  )
+  assert.equal(
+    generatedOpenCodeConfig.agent["drawio-expert"].permission.question,
+    undefined,
   )
   assert.equal(
     generatedOpenCodeConfig.agent["drawio-expert"].permission.drawio_open,
@@ -316,6 +386,69 @@ try {
   assert.equal(labelClearQuality.pass, true)
   assert.equal(labelClearQuality.metrics.labelOverlaps, 0)
 
+  await fs.writeFile(path.join(workspace, "shared-port.drawio"), SHARED_PORT_XML, "utf8")
+  const sharedPortQuality = JSON.parse(await plugin.tool.drawio_quality.execute({
+    file: "shared-port.drawio",
+    threshold: 90,
+  }, context))
+  assert.equal(sharedPortQuality.pass, false)
+  assert.equal(sharedPortQuality.metrics.sharedPortCongestions, 1)
+  assert.equal(
+    sharedPortQuality.issues.some((issue) =>
+      issue.code === "shared-port-congestion"
+      && issue.cells.join(",") === "client,rpc-a,rpc-b,rpc-c"),
+    true,
+  )
+  await assert.rejects(
+    plugin.tool.drawio_finalize.execute({
+      file: "shared-port.drawio",
+      threshold: 90,
+    }, context),
+    /refusing to finalize Draw\.io layout that failed the quality gate/,
+  )
+
+  await fs.writeFile(path.join(workspace, "edge-overlap.drawio"), EDGE_OVERLAP_XML, "utf8")
+  const edgeOverlapQuality = JSON.parse(await plugin.tool.drawio_quality.execute({
+    file: "edge-overlap.drawio",
+    threshold: 90,
+  }, context))
+  assert.equal(edgeOverlapQuality.pass, false)
+  assert.equal(edgeOverlapQuality.metrics.edgeOverlaps, 3)
+  assert.deepEqual(
+    edgeOverlapQuality.issues
+      .filter((issue) => issue.code === "edge-overlap")
+      .map((issue) => issue.cells.join(","))
+      .sort(),
+    ["rpc-a,rpc-b", "rpc-a,rpc-c", "rpc-b,rpc-c"],
+  )
+
+  const fanoutCreate = JSON.parse(await plugin.tool.drawio_create.execute({
+    file: "fanout.drawio",
+    title: "Fanout",
+    nodes: [
+      { id: "client", label: "Client" },
+      { id: "server-a", label: "Server A" },
+      { id: "server-b", label: "Server B" },
+      { id: "server-c", label: "Server C" },
+    ],
+    edges: [
+      { id: "rpc-a", source: "client", target: "server-a" },
+      { id: "rpc-b", source: "client", target: "server-b" },
+      { id: "rpc-c", source: "client", target: "server-c" },
+    ],
+    direction: "left-to-right",
+    compressed: false,
+    overwrite: false,
+  }, context))
+  assert.equal(fanoutCreate.valid, true)
+  const fanoutQuality = JSON.parse(await plugin.tool.drawio_quality.execute({
+    file: "fanout.drawio",
+    threshold: 90,
+  }, context))
+  assert.equal(fanoutQuality.pass, true, JSON.stringify(fanoutQuality, null, 2))
+  assert.equal(fanoutQuality.metrics.sharedPortCongestions, 0)
+  assert.equal(fanoutQuality.metrics.edgeOverlaps, 0)
+
   const openResult = JSON.parse(await plugin.tool.drawio_open.execute({
     file: "architecture.drawio",
   }, context))
@@ -416,17 +549,71 @@ try {
   assert.equal(stale.manualChanges.available, true)
 
   const beforeRejectedApproval = await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8")
-  await assert.rejects(
-    plugin.tool.drawio_update_state.execute({
-      base_revision: 1,
-      xml: manualXml.replace("MobileWork Manual", "No Preview"),
-      approval_plan: "Reject this complete XML candidate",
-    }, {
-      ...context,
-      async ask() { throw new Error("approval declined") },
-    }),
-    /approval declined/,
+  const rejectedArgs = {
+    base_revision: 1,
+    xml: manualXml.replace("MobileWork Manual", "No Preview"),
+    approval_plan: "Reject this complete XML candidate",
+  }
+  const pendingRejection = JSON.parse(await plugin.tool.drawio_update_state.execute(rejectedArgs, context))
+  const bypassAttempt = JSON.parse(await plugin.tool.drawio_update_state.execute(rejectedArgs, context))
+  assert.equal(bypassAttempt.status, "question_required")
+  assert.equal(bypassAttempt.reviewId, pendingRejection.reviewId)
+  assert.equal(bypassAttempt.approvalToken, undefined)
+  const forgedQuestions = structuredClone(pendingRejection.question.arguments.questions)
+  forgedQuestions[0].question += "（伪造）"
+  assert.equal(runtime.handleDrawioOpenCodeEvent({
+    type: "question.asked",
+    properties: {
+      id: "forged-question",
+      sessionID: context.sessionID,
+      questions: forgedQuestions,
+      tool: { messageID: "forged-message", callID: "forged-call" },
+    },
+  }), false)
+  const pendingRequestID = "pending-question-before-reply"
+  assert.equal(runtime.handleDrawioOpenCodeEvent({
+    type: "question.asked",
+    properties: {
+      id: pendingRequestID,
+      sessionID: context.sessionID,
+      questions: pendingRejection.question.arguments.questions,
+      tool: { messageID: "pending-message", callID: "pending-call" },
+    },
+  }), true)
+  const waitingForReply = JSON.parse(await plugin.tool.drawio_update_state.execute({
+    ...rejectedArgs,
+    approval_plan: "Changed wording must not create a second question",
+  }, context))
+  assert.equal(waitingForReply.status, "question_pending")
+  assert.equal(waitingForReply.reviewId, pendingRejection.reviewId)
+  assert.equal(waitingForReply.question, undefined)
+  const cancelledEvent = {
+    type: "question.replied",
+    properties: { sessionID: context.sessionID, requestID: pendingRequestID, answers: [["取消修改"]] },
+  }
+  assert.equal(runtime.handleDrawioOpenCodeEvent(cancelledEvent), true)
+  assert.equal(runtime.handleDrawioOpenCodeEvent(cancelledEvent), false)
+  const rejectedApproval = JSON.parse(await plugin.tool.drawio_update_state.execute(rejectedArgs, context))
+  assert.equal(rejectedApproval.status, "cancelled")
+  assert.equal(rejectedApproval.approvalToken, undefined)
+  assert.equal(
+    await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"),
+    beforeRejectedApproval,
   )
+  const feedbackArgs = {
+    base_revision: 1,
+    xml: manualXml.replace("MobileWork Manual", "Needs Feedback"),
+    approval_plan: "Candidate that needs user feedback",
+  }
+  const pendingFeedback = JSON.parse(await plugin.tool.drawio_update_state.execute(feedbackArgs, context))
+  const feedbackResult = JSON.parse(await plugin.tool.drawio_update_state.execute({
+    ...feedbackArgs,
+    approval_review_id: pendingFeedback.reviewId,
+    approval_answer: "请把节点改成蓝色，并保留原来的文字",
+  }, context))
+  assert.equal(feedbackResult.status, "feedback_received")
+  assert.equal(feedbackResult.userFeedback, "请把节点改成蓝色，并保留原来的文字")
+  assert.equal(feedbackResult.approvalToken, undefined)
   assert.equal(
     await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"),
     beforeRejectedApproval,
@@ -659,14 +846,17 @@ try {
     base_revision: beforeExplicitTask.revision,
   }, context))
   assert.equal(explicitTaskPreview.diff.summary.added, 1)
-  const explicitPreviewRequests = []
-  const explicitTask = JSON.parse(await plugin.tool.drawio_authorize_preview.execute({
+  const explicitTaskArgs = {
     file: "architecture.drawio",
     preview_id: explicitTaskPreview.preview.id,
     plan: "新增 Explicit Task 节点",
-  }, { ...context, async ask(input) { explicitPreviewRequests.push(input) } }))
+  }
+  const { first: explicitApprovalPrompt, second: explicitTask } = await executeWithApprovalQuestion(
+    plugin.tool.drawio_authorize_preview.execute,
+    explicitTaskArgs,
+  )
   assert.equal(explicitTask.applied, true)
-  assert.equal(explicitPreviewRequests[0].permission, "drawio_authorize_preview")
+  assert.match(explicitApprovalPrompt.question.arguments.questions[0].question, /审批编号/)
 
   const freshAfterExplicitTask = JSON.parse(await plugin.tool.drawio_list_annotations.execute({
     file: "architecture.drawio",
@@ -749,22 +939,22 @@ try {
     }, context),
     /requires an explicit reason/,
   )
-  const authorization = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
+  const annotationApprovalArgs = {
     id: submitted.annotation.id,
     plan: "仅把选中节点 node 改名为 Draw.io",
     proposed_changed_ids: ["node"],
     requested_scope: "selection_only",
-  }, context))
+  }
+  const { first: annotationApprovalPrompt, second: authorization } = await executeWithApprovalQuestion(
+    plugin.tool.drawio_authorize_annotation_change.execute,
+    annotationApprovalArgs,
+  )
   assert.equal(authorization.ok, true)
   assert.equal(authorization.baseRevision, beforePatch.revision)
   assert.equal(authorization.requestedScope, "selection_only")
   assert.equal(authorization.previewId, dryRun.preview.id)
-  assert.equal(approvalRequests.length, 1)
-  assert.equal(approvalRequests[0].permission, "drawio_authorize_annotation_change")
-  assert.deepEqual(approvalRequests[0].metadata.proposedChangedIds, ["node"])
-  assert.equal(approvalRequests[0].metadata.plan, "仅把选中节点 node 改名为 Draw.io")
-  assert.equal(approvalRequests[0].metadata.previewId, dryRun.preview.id)
-  assert.match(approvalRequests[0].patterns[0], /annotation:.*:revision-/)
+  assert.match(annotationApprovalPrompt.question.arguments.questions[0].question, /仅把选中节点 node 改名为 Draw\.io/)
+  assert.match(annotationApprovalPrompt.question.arguments.questions[0].question, /变更 ID：node/)
   await assert.rejects(
     plugin.tool.drawio_patch.execute({
       file: "architecture.drawio",
@@ -830,20 +1020,19 @@ try {
   assert.match(await nextPreviewEvent(), /^: connected/)
 
   const generalPreviewState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
-  const previewApprovalRequests = []
-  const previewContext = {
-    ...context,
-    async ask(input) { previewApprovalRequests.push(input) },
-  }
-  const generalPreviewAuthorization = JSON.parse(await plugin.tool.drawio_patch.execute({
+  const previewContext = { ...context }
+  const generalPatchArgs = {
     file: "architecture.drawio",
     operations: [{ type: "update-node", id: "neighbor", label: "Neighbor Preview" }],
     dry_run: false,
     base_revision: generalPreviewState.revision,
     approval_plan: "将 Neighbor 节点改名为 Neighbor Preview",
-  }, previewContext))
-  assert.equal(previewApprovalRequests.length, 1)
-  assert.equal(previewApprovalRequests[0].permission, "drawio_authorize_preview")
+  }
+  const { second: generalPreviewAuthorization } = await executeWithApprovalQuestion(
+    plugin.tool.drawio_patch.execute,
+    generalPatchArgs,
+    previewContext,
+  )
   assert.equal(generalPreviewAuthorization.revision, generalPreviewState.revision + 1)
   const createdPreviewEvent = await nextMatchingSseFrame(nextPreviewEvent, /"kind":"created"/)
   assert.match(createdPreviewEvent, /^event: preview\ndata: /)
@@ -947,11 +1136,15 @@ try {
   })
   assert.equal(undecoratedPreviewSave.status, 409)
   assert.equal((await undecoratedPreviewSave.json()).error, "preview_candidate")
-  const fullXmlApplied = JSON.parse(await plugin.tool.drawio_authorize_preview.execute({
+  const { second: fullXmlApplied } = await executeWithApprovalQuestion(
+    plugin.tool.drawio_authorize_preview.execute,
+    {
     file: "architecture.drawio",
     preview_id: fullXmlPreview.preview.id,
     plan: "将节点字体调大并修改填充色，同时调整第一页背景色",
-  }, previewContext))
+    },
+    previewContext,
+  )
   assert.equal(fullXmlApplied.applied, true)
   assert.match(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /fontSize=26/)
   assert.doesNotMatch(await fs.readFile(path.join(workspace, "architecture.drawio"), "utf8"), /preview-edge/)
@@ -1009,12 +1202,23 @@ try {
   }).then((response) => response.json())
   await plugin.tool.drawio_get_annotation.execute({ id: ignoredAnn.annotation.id }, context)
   const ignoredBase = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
-  const ignoredAuthorization = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
+  const ignoredPreview = JSON.parse(await plugin.tool.drawio_patch.execute({
+    file: "architecture.drawio",
+    annotation_id: ignoredAnn.annotation.id,
+    operations: [{ type: "update-node", id: "node", label: "Ignored Candidate" }],
+    dry_run: true,
+    base_revision: ignoredBase.revision,
+  }, context))
+  const { second: ignoredAuthorization } = await executeWithApprovalQuestion(
+    plugin.tool.drawio_authorize_annotation_change.execute,
+    {
     id: ignoredAnn.annotation.id,
     plan: "准备修改后由用户决定忽略",
     proposed_changed_ids: ["node"],
     requested_scope: "selection_only",
-  }, context))
+    preview_id: ignoredPreview.preview.id,
+    },
+  )
   const ignoredStatusUrl = new URL(annotationsUrl)
   ignoredStatusUrl.pathname = `${annotationsUrl.pathname}/${encodeURIComponent(ignoredAnn.annotation.id)}`
   const ignoredResult = await fetch(ignoredStatusUrl, {
@@ -1129,12 +1333,10 @@ try {
     "utf8",
   )
   globalThis.__drawioIntegratedBridge.annotationsByDiagram.clear()
-  const secondApprovalRequests = []
   const secondContext = {
     ...context,
     sessionID: "integrated-session-2",
     messageID: "integrated-message-2",
-    async ask(input) { secondApprovalRequests.push(input) },
   }
   const secondOpen = JSON.parse(await plugin.tool.drawio_open.execute({
     file: "architecture.drawio",
@@ -1161,16 +1363,18 @@ try {
     base_revision: secondState.revision,
   }, secondContext))
   assert.equal(globalDryRun.preview.status, "pending")
-  const globalAuthorization = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
+  const { second: globalAuthorization } = await executeWithApprovalQuestion(
+    plugin.tool.drawio_authorize_annotation_change.execute,
+    {
     file: "architecture.drawio",
     id: globalAnn.annotation.id,
     plan: "修改第二页的 remote 节点",
     proposed_changed_ids: ["p2:remote"],
     requested_scope: "diagram_wide",
     preview_id: globalDryRun.preview.id,
-  }, secondContext))
-  assert.equal(secondApprovalRequests.length, 1)
-  assert.equal(secondApprovalRequests[0].metadata.file, "architecture.drawio")
+    },
+    secondContext,
+  )
   assert.equal(globalAuthorization.previewId, globalDryRun.preview.id)
   assert.equal(globalAuthorization.allowedExistingIds.includes("p2:remote"), true)
 
@@ -1234,12 +1438,16 @@ try {
     base_revision: beforePolish.revision,
   }, context))
   assert.ok(polishDryRun.changedIds.length > 0)
-  const polishAuthorization = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
+  const { second: polishAuthorization } = await executeWithApprovalQuestion(
+    plugin.tool.drawio_authorize_annotation_change.execute,
+    {
     id: polishAnn.annotation.id,
     plan: "重新布局第一页中的全部节点和连线",
     proposed_changed_ids: polishDryRun.changedIds.map((id) => `p1:${id}`),
     requested_scope: "diagram_wide",
-  }, context))
+    preview_id: polishDryRun.preview.id,
+    },
+  )
   const polished = JSON.parse(await plugin.tool.drawio_polish.execute({
     file: "architecture.drawio",
     page: "p1",
@@ -1320,12 +1528,16 @@ try {
     base_revision: confirmedState.revision,
   }, context))
   assert.equal(confirmedDryRun.dryRun, true)
-  const staleAuthorization = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
+  const { second: staleAuthorization } = await executeWithApprovalQuestion(
+    plugin.tool.drawio_authorize_annotation_change.execute,
+    {
     id: staleAnn.annotation.id,
     plan: "用户确认后把选中节点 node 改名为 Draw.io Confirmed",
     proposed_changed_ids: ["node"],
     requested_scope: "selection_only",
-  }, context))
+    preview_id: confirmedDryRun.preview.id,
+    },
+  )
   const confirmedPatch = JSON.parse(await plugin.tool.drawio_patch.execute({
     file: "architecture.drawio",
     annotation_id: staleAnn.annotation.id,
@@ -1422,12 +1634,27 @@ try {
     base_revision: blockingState.revision,
   }, context))
   assert.equal(blockingPatchDryRun.dryRun, true)
-  const blockingApproval = JSON.parse(await plugin.tool.drawio_authorize_annotation_change.execute({
+  const { second: blockingApproval } = await executeWithApprovalQuestion(
+    plugin.tool.drawio_authorize_annotation_change.execute,
+    {
     id: blockingAnn.annotation.id,
     plan: "用户确认后把选中节点门禁注释对应的改名执行完成",
     proposed_changed_ids: ["node"],
     requested_scope: "selection_only",
-  }, context))
+    preview_id: blockingPatchDryRun.preview.id,
+    },
+  )
+  const repeatedBlockingApproval = JSON.parse(
+    await plugin.tool.drawio_authorize_annotation_change.execute({
+      id: blockingAnn.annotation.id,
+      plan: "把门禁注释对应的节点改名写入图表",
+      proposed_changed_ids: ["node"],
+      requested_scope: "selection_only",
+      preview_id: blockingPatchDryRun.preview.id,
+    }, context),
+  )
+  assert.equal(repeatedBlockingApproval.alreadyAuthorized, true)
+  assert.equal(repeatedBlockingApproval.approvalToken, blockingApproval.approvalToken)
   const blockingPatch = JSON.parse(await plugin.tool.drawio_patch.execute({
     file: "architecture.drawio",
     annotation_id: blockingAnn.annotation.id,
@@ -1501,12 +1728,27 @@ try {
     base_revision: guardState.revision,
   }, context))
   assert.equal(guardEdgePreview.diff.summary.added, 1)
-  const guardEdge = JSON.parse(await plugin.tool.drawio_authorize_preview.execute({
+  const guardApprovalArgs = {
     file: "architecture.drawio",
     preview_id: guardEdgePreview.preview.id,
     plan: "新增 Guard 连线",
-  }, { ...context, async ask() {} }))
+  }
+  const pendingGuardApproval = JSON.parse(await plugin.tool.drawio_authorize_preview.execute(
+    guardApprovalArgs,
+    context,
+  ))
+  answerApprovalQuestion(pendingGuardApproval, context.sessionID, "确认修改", true)
+  const guardEdge = JSON.parse(await plugin.tool.drawio_authorize_preview.execute({
+    ...guardApprovalArgs,
+    plan: "把新增的 Guard 连线写入图表",
+  }, context))
   assert.equal(guardEdge.applied, true)
+  const repeatedGuardApproval = JSON.parse(await plugin.tool.drawio_authorize_preview.execute(
+    guardApprovalArgs,
+    context,
+  ))
+  assert.equal(repeatedGuardApproval.applied, true)
+  assert.equal(repeatedGuardApproval.alreadyApplied, true)
   const invalidPage = await fetch(annotationsUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -1519,6 +1761,48 @@ try {
   })
   assert.equal(invalidPage.status, 400)
   assert.match((await invalidPage.json()).error, /page "missing-page" not found/)
+  await fs.writeFile(path.join(workspace, "missing-page-id.drawio"), MISSING_PAGE_ID_XML, "utf8")
+  const pageIdCompatContext = {
+    ...context,
+    sessionID: "page-id-compat-session",
+    messageID: "page-id-compat-message",
+  }
+  const pageIdCompatOpen = JSON.parse(await plugin.tool.drawio_open.execute({
+    file: "missing-page-id.drawio",
+  }, pageIdCompatContext))
+  const pageIdCompatUrl = new URL(pageIdCompatOpen.openUrl)
+  pageIdCompatUrl.pathname = "/api/annotations"
+  const compatibleNumericPage = await fetch(pageIdCompatUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "兼容 Draw.io 为缺失页面 ID 补出的数字索引",
+      scope: "selection_and_edges",
+      pageId: "0",
+      pageName: "Page-1",
+      cells: [
+        { id: "compat-node", kind: "node", label: "Compat" },
+        { id: "compat-edge", kind: "edge", label: "Flow", source: "compat-node", target: "compat-neighbor" },
+      ],
+    }),
+  })
+  assert.equal(compatibleNumericPage.status, 201)
+  const compatibleNumericAnnotation = await compatibleNumericPage.json()
+  assert.equal(compatibleNumericAnnotation.annotation.page.id, "page-1")
+  assert.equal(compatibleNumericAnnotation.annotation.page.name, "Page-1")
+  const mismatchedNumericPage = await fetch(pageIdCompatUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      instruction: "错误页面名称不得按索引绑定",
+      scope: "selection_only",
+      pageId: "0",
+      pageName: "Wrong Page",
+      cells: [{ id: "compat-node", kind: "node", label: "Compat" }],
+    }),
+  })
+  assert.equal(mismatchedNumericPage.status, 400)
+  assert.match((await mismatchedNumericPage.json()).error, /page "0" not found/)
   const invalidCell = await fetch(annotationsUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -1978,12 +2262,10 @@ try {
   assert.equal(pageHtml.page_name, "Page-2")
   await svgEventsReader.cancel()
 
-  const automaticApprovalRequests = []
   const automaticContext = {
     ...context,
     sessionID: "automatic-approval-session",
     messageID: "automatic-approval-message",
-    async ask(input) { automaticApprovalRequests.push(input) },
   }
   await plugin.tool.drawio_create.execute({
     file: "automatic-approval.drawio",
@@ -2001,29 +2283,36 @@ try {
   const automaticState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, automaticContext))
   const automaticXml = automaticState.xml.replace('value="A"', 'value="A updated"')
   assert.notEqual(automaticXml, automaticState.xml)
-  const automaticUpdate = JSON.parse(await plugin.tool.drawio_update_state.execute({
+  const automaticUpdateArgs = {
     base_revision: automaticState.revision,
     xml: automaticXml,
     approval_plan: "Rename node A",
-  }, automaticContext))
+  }
+  const { first: automaticUpdatePrompt, second: automaticUpdate } = await executeWithApprovalQuestion(
+    plugin.tool.drawio_update_state.execute,
+    automaticUpdateArgs,
+    automaticContext,
+  )
   assert.equal(automaticUpdate.revision, automaticState.revision + 1)
-  assert.equal(automaticApprovalRequests.length, 1)
-  assert.equal(automaticApprovalRequests[0].permission, "drawio_authorize_preview")
-  assert.equal(automaticApprovalRequests[0].metadata.plan, "Rename node A")
+  assert.match(automaticUpdatePrompt.question.arguments.questions[0].question, /Rename node A/)
 
-  const automaticPolish = JSON.parse(await plugin.tool.drawio_polish.execute({
+  const automaticPolishArgs = {
     file: "automatic-approval.drawio",
     direction: "left-to-right",
     threshold: 0,
     dry_run: false,
     base_revision: automaticUpdate.revision,
     approval_plan: "Apply automatic layout",
-  }, automaticContext))
+  }
+  const { first: automaticPolishPrompt, second: automaticPolish } = await executeWithApprovalQuestion(
+    plugin.tool.drawio_polish.execute,
+    automaticPolishArgs,
+    automaticContext,
+  )
   assert.equal(automaticPolish.dryRun, false)
-  assert.equal(automaticApprovalRequests.length, 2)
-  assert.equal(automaticApprovalRequests[1].permission, "drawio_authorize_preview")
-  assert.equal(automaticApprovalRequests[1].metadata.plan, "Apply automatic layout")
+  assert.match(automaticPolishPrompt.question.arguments.questions[0].question, /Apply automatic layout/)
 
+  assert.equal(approvalRequests.length, 0)
   console.log(JSON.stringify({
     ok: true,
     openUrl: true,
@@ -2048,6 +2337,10 @@ try {
     nestedContainerQuality: true,
     genuineIntersectionDetection: true,
     edgeLabelCollisionDetection: true,
+    edgeOverlapDetection: true,
+    sharedPortCongestionDetection: true,
+    distributedFanoutRouting: true,
+    finalizeQualityGate: true,
     automaticPng: true,
     browserOpenUrl: true,
     exportOwnedByTypeScript: true,
@@ -2072,9 +2365,10 @@ try {
     patchPreviewCancelWithoutWrite: true,
     patchPreviewBrowserActions: true,
     patchPreviewOneClickApply: true,
-    automaticPatchApproval: true,
-    automaticXmlApproval: true,
-    automaticPolishApproval: true,
+    questionPatchApproval: true,
+    questionXmlApproval: true,
+    questionPolishApproval: true,
+    permissionAskNotUsedForApproval: true,
     rejectedApprovalDoesNotWrite: true,
     unboundFormalWriteRejected: true,
     unicodePageIdExport: true,
