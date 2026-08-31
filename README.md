@@ -44,32 +44,31 @@ flowchart LR
 
 ### 1. 启动自包含 Draw.io Docker 服务
 
-使用 jGraph 官方 [self-contained/docker-compose.yml](https://github.com/jgraph/docker-drawio/blob/dev/self-contained/docker-compose.yml)，将两个服务的端口改为：
+仓库已包含基于 jGraph 官方 [self-contained/docker-compose.yml](https://github.com/jgraph/docker-drawio/blob/dev/self-contained/docker-compose.yml) 的本地配置：
 
-```yaml
-services:
-  image-export:
-    ports:
-      - "18765:8000"
-
-  drawio:
-    ports:
-      - "8443:8443"
-      - "18080:8080"
+```text
+docker/
+├── docker-compose.yml
+└── .env.example
 ```
 
-在 `docker-compose.yml` 同目录创建 `.env`：
-
-```dotenv
-DRAWIO_SERVER_URL=http://127.0.0.1:18080/
-DRAWIO_BASE_URL=http://127.0.0.1:18080
-```
+确认 Docker Desktop 已启动，然后在仓库根目录执行一键部署脚本：
 
 ```powershell
-docker compose pull
-docker compose up -d
-docker compose ps
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy-drawio.ps1
 ```
+
+脚本会检查 Docker Compose、首次运行时将 `docker/.env.example` 复制为被 Git 忽略的
+`docker/.env`、拉取 `jgraph/drawio` 和 `jgraph/export-server` 镜像、启动两个服务、显示容器状态，
+并等待 `http://127.0.0.1:18080/` 可访问。已有 `docker/.env` 不会被覆盖。
+
+Compose 端口映射如下：
+
+| Compose 服务 | 宿主机端口 | 容器端口 | 用途 |
+|---|---:|---:|---|
+| `drawio` | `18080` | `8080` | HTTP Web 编辑器 |
+| `drawio` | `8443` | `8443` | HTTPS Web 编辑器 |
+| `image-export` | `18765` | `8000` | PNG、JPEG、PDF 和可编辑 PNG 导出 |
 
 ### 2. 配置工作区环境变量
 
@@ -85,14 +84,14 @@ DRAWIO_MAX_INPUT_SIZE_MB=20
 DRAWIO_MAX_OUTPUT_SIZE_MB=100
 ```
 
-端口对应关系：
+工作区变量与 Compose 端口对应关系：
 
-| 工作区变量 | Compose 服务 | 端口映射 |
-|---|---|---|
-| `DRAWIO_WEB_URL` | `drawio` | `18080:8080` |
-| `DRAWIO_EXPORT_URL` | `image-export` | `18765:8000` |
+| 工作区变量 | Compose 服务 | 访问的宿主机端口 | Compose 映射 |
+|---|---|---:|---|
+| `DRAWIO_WEB_URL=http://127.0.0.1:18080` | `drawio` | `18080` | `18080:8080`，容器内 Web 端口为 `8080` |
+| `DRAWIO_EXPORT_URL=http://127.0.0.1:18765/ImageExport4/export` | `image-export` | `18765` | `18765:8000`，容器内导出端口为 `8000` |
 
-其余变量用于 Bridge 监听、请求超时和文件大小限制。修改 `.env` 后重启 MobileWork / OpenWork。
+`DRAWIO_BRIDGE_HOST` 和 `DRAWIO_BRIDGE_PORT` 属于本机 Bridge，不对应 Compose 容器端口；其余变量用于请求超时和文件大小限制。修改工作区 `.env` 后重启 MobileWork / OpenWork。
 
 ### 3. 构建专家包
 
