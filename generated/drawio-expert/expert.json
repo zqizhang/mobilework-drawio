@@ -314,12 +314,12 @@
     {
       "path": ".opencode/skills/drawio-expert-common/scripts/drawio-runtime-core.mjs",
       "kind": "text",
-      "sha256": "d1414b0edcf1a5ec6df602de2abe1b8b0ea520a7b3f782a3bb943bda4472258d"
+      "sha256": "15421b1b1813e606a0b2ea87e70759e06b2c811f44a69ed013934fb5559affe1"
     },
     {
       "path": ".opencode/skills/drawio-expert-common/SKILL.md",
       "kind": "text",
-      "sha256": "5baca8f784ccb6b3bfde500897f813b8b92c748b54609e7d2742bf5938c420e4"
+      "sha256": "fa50028f7dbf086d905be209c85beab46874600bbad2095a8ba345112bbbd1eb"
     },
     {
       "path": ".opencode/skills/drawio-expert-drawio-expert/SKILL.md",
@@ -334,7 +334,7 @@
     {
       "path": ".opencode/skills/drawio-session-editing/references/protocol.md",
       "kind": "text",
-      "sha256": "6f198952bcac5ac516c803f9fea821112b9501c58526ed49b2f297f5604ab480"
+      "sha256": "196a16dcf115be19f7e056b27b2aefa6cd82ffd2908f6802a8418d07a7d4b699"
     },
     {
       "path": ".opencode/skills/drawio-session-editing/references/xml-patterns.md",
@@ -344,7 +344,7 @@
     {
       "path": ".opencode/skills/drawio-session-editing/SKILL.md",
       "kind": "text",
-      "sha256": "15e1ae0308ccd984aa0ece0a0b2e43c7864f8a0dfda4e95264dd9bba4e4b1d47"
+      "sha256": "66de55b70e9823abc42f490f844a7021982550a925433f4b669b952611d166ff"
     },
     {
       "path": ".opencode/skills/drawio-skill/data/lobe-icons.json",

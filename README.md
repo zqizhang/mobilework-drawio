@@ -18,6 +18,7 @@
 - 通过自托管的 `jgraph/drawio` + `jgraph/export-server` 导出 PNG、JPEG、PDF 和可编辑 PNG；通过内置浏览器编辑器导出 SVG、可编辑 SVG 和 HTML。
 - 创建或修改结束后自动导出同名 PNG，并在 MobileWork / OpenWork 内置浏览器中打开。
 - 用户在浏览器保存后，将最新 XML 和 revision 作为 Agent 下一次修改的基线。
+- revision 按工作区内的图表路径持久化到 `.mobilework/drawio-state/v1/`，同一图表切换会话或重启运行时后继续递增；预览和审批授权仍与当前 session 绑定，不能跨会话复用。
 - 已绑定图表的增量修改和自动布局会先在同一 Draw.io 画布加载临时只读差异预览：绿色标识新增、黄色标识修改、红色标识删除或移动前位置、蓝色标识变更连线；退出预览不会写入源文件，正式提交必须匹配预览候选哈希与基线 revision。
 - 用户可对选区提交按图表文件持久化的注释，并选择“只修改选区”“允许调整关联连线”“允许调整周边布局”或“允许修改整个图表”；全图范围会额外确认，Agent正式写入前仍必须通过OpenCode审批弹窗取得当前session的一次性授权。
 - 通过 revision 冲突检查避免旧快照覆盖最新内容；人工编辑本身仍可按当前任务要求继续调整。
@@ -289,7 +290,7 @@ mobilework-drawio/
 │   └── drawio-runtime.ts               # TypeScript 工具、评分器、Bridge 和导出客户端
 ├── skill-sources/
 │   ├── drawio-skill/                   # 绘图工作流、参考资料、样式和可选脚本
-│   └── drawio-session-editing/         # revision 会话协议
+│   └── drawio-session-editing/         # 图表级 revision 与会话绑定协议
 ├── scripts/
 │   ├── sync-expert-source.mjs          # 打包插件并同步 manifest
 │   └── build-expert.mjs                # 生成和校验专家包

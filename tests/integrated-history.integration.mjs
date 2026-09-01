@@ -101,6 +101,19 @@ function apiBase(openResult, pathname) {
   return url.toString()
 }
 
+function revisionStatePath(relativeFile) {
+  const normalized = relativeFile.split(path.sep).join("/")
+  const pathHash = createHash("sha256").update(normalized, "utf8").digest("hex").slice(0, 12)
+  return path.join(
+    workspace,
+    ".mobilework",
+    "drawio-state",
+    "v1",
+    `${path.basename(relativeFile)}--${pathHash}`,
+    "state.json",
+  )
+}
+
 async function getDiagram(openResult) {
   return fetch(apiBase(openResult, "/api/diagram")).then((response) => response.json())
 }
@@ -346,6 +359,8 @@ try {
     file: "architecture.drawio",
   }, secondContext))
   assert.equal(reopen.ok, true)
+  assert.equal(reopen.revision, restore2.body.revision, "diagram revision must survive a new session binding")
+  assert.equal(reopen.revisionScope, "diagram")
   const reopenedHistory = await getHistory(reopen)
   assert.ok(reopenedHistory.count >= 20, "history must survive a new session binding")
   assert.equal(reopenedHistory.entries[0].source, "restore")
@@ -376,10 +391,96 @@ try {
   const reopenAfterChange = JSON.parse(await plugin.tool.drawio_open.execute({
     file: "architecture.drawio",
   }, fourthContext))
+  assert.equal(
+    reopenAfterChange.revision,
+    reopen.revision + 1,
+    "an external change while the runtime is down must advance the diagram revision exactly once",
+  )
   const reboundHistory = await getHistory(reopenAfterChange)
   assert.equal(reboundHistory.entries[0].source, "external", "re-bind must rediscover an external change")
   assert.equal(reboundHistory.entries[0].isCurrent, true)
   assert.equal(reboundHistory.count, 20, "rediscovery must still respect the 20-entry cap")
+
+  const fifthContext = { ...context, sessionID: "history-session-5" }
+  const reopenWithoutChange = JSON.parse(await plugin.tool.drawio_open.execute({
+    file: "architecture.drawio",
+  }, fifthContext))
+  assert.equal(
+    reopenWithoutChange.revision,
+    reopenAfterChange.revision,
+    "opening the unchanged diagram again must not advance its revision",
+  )
+
+  // ---- a crash after the diagram file write but before revision finalization
+  // is recovered from the durable pending transition without resetting or
+  // double-incrementing the diagram revision ----
+  await fs.writeFile(path.join(workspace, "recovery.drawio"), BASE_XML, "utf8")
+  const recoveryContext = { ...context, sessionID: "history-session-recovery-before" }
+  const recoveryOpen = JSON.parse(await plugin.tool.drawio_open.execute({
+    file: "recovery.drawio",
+  }, recoveryContext))
+  assert.equal(recoveryOpen.revision, 0)
+  const ledgerPath = revisionStatePath("recovery.drawio")
+  const ledger = JSON.parse(await fs.readFile(ledgerPath, "utf8"))
+  const recoveredXml = BASE_XML.replace('value="MobileWork"', 'value="Recovered Commit"')
+  const recoveredHash = createHash("sha256").update(recoveredXml, "utf8").digest("hex")
+  const pendingUpdatedAt = new Date().toISOString()
+  ledger.pendingTransition = {
+    fromRevision: ledger.revision,
+    revision: ledger.revision + 1,
+    contentHash: recoveredHash,
+    updatedBy: "agent",
+    updatedAt: pendingUpdatedAt,
+  }
+  await fs.writeFile(ledgerPath, JSON.stringify(ledger, null, 2), "utf8")
+  await fs.writeFile(path.join(workspace, "recovery.drawio"), recoveredXml, "utf8")
+  globalThis.__drawioIntegratedBridge.sessions.delete(recoveryContext.sessionID)
+
+  const recoveredContext = { ...context, sessionID: "history-session-recovery-after" }
+  const recoveredOpen = JSON.parse(await plugin.tool.drawio_open.execute({
+    file: "recovery.drawio",
+  }, recoveredContext))
+  assert.equal(recoveredOpen.revision, 1)
+  const recoveredDiagram = await getDiagram(recoveredOpen)
+  assert.equal(recoveredDiagram.revision, 1)
+  assert.match(recoveredDiagram.xml, /Recovered Commit/)
+  const finalizedLedger = JSON.parse(await fs.readFile(ledgerPath, "utf8"))
+  assert.equal(finalizedLedger.revision, 1)
+  assert.equal(finalizedLedger.contentHash, recoveredHash)
+  assert.equal(finalizedLedger.pendingTransition, null)
+
+  // ---- sessions bound to the same file share one optimistic-concurrency
+  // sequence: a commit in one session makes the other session's old base stale.
+  await fs.writeFile(path.join(workspace, "shared-revision.drawio"), BASE_XML, "utf8")
+  const sharedContextA = { ...context, sessionID: "history-session-shared-a" }
+  const sharedContextB = { ...context, sessionID: "history-session-shared-b" }
+  const sharedOpenA = JSON.parse(await plugin.tool.drawio_open.execute({
+    file: "shared-revision.drawio",
+  }, sharedContextA))
+  const sharedOpenB = JSON.parse(await plugin.tool.drawio_open.execute({
+    file: "shared-revision.drawio",
+  }, sharedContextB))
+  assert.equal(sharedOpenA.revision, sharedOpenB.revision)
+  const sharedCandidate = BASE_XML.replace('value="MobileWork"', 'value="Shared Revision"')
+  const sharedPreview = JSON.parse(await plugin.tool.drawio_preview_state.execute({
+    base_revision: sharedOpenA.revision,
+    xml: sharedCandidate,
+  }, sharedContextA))
+  const sharedCommit = await executeApproved(plugin.tool.drawio_authorize_preview.execute, {
+    file: "shared-revision.drawio",
+    preview_id: sharedPreview.preview.id,
+    plan: "advance the shared diagram revision",
+  }, sharedContextA)
+  assert.equal(sharedCommit.ok, true)
+  const sharedStateB = JSON.parse(await plugin.tool.drawio_get_state.execute({}, sharedContextB))
+  assert.equal(sharedStateB.revision, sharedCommit.revision)
+  assert.match(sharedStateB.xml, /Shared Revision/)
+  const staleSharedPreview = JSON.parse(await plugin.tool.drawio_preview_state.execute({
+    base_revision: sharedOpenB.revision,
+    xml: BASE_XML.replace('value="MobileWork"', 'value="Stale Session"'),
+  }, sharedContextB))
+  assert.equal(staleSharedPreview.error, "revision_conflict")
+  assert.equal(staleSharedPreview.current.revision, sharedCommit.revision)
 
   // ---- multi-page snapshots preview per page and restore the whole file ----
   const MULTI_XML = '<mxfile host="test"><diagram id="page-1" name="First"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="0" y="0" width="80" height="40" as="geometry"/></mxCell></root></mxGraphModel></diagram><diagram id="page-2" name="Second"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="b" value="B" vertex="1" parent="1"><mxGeometry x="0" y="0" width="80" height="40" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>'
@@ -417,6 +518,8 @@ try {
     historySurvivesRestart: true,
     relativePathIsolation: true,
     bindRediscovery: true,
+    pendingRevisionRecovery: true,
+    sharedRevisionAcrossSessions: true,
     multiPagePreview: true,
   }, null, 2))
 } finally {

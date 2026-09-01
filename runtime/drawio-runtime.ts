@@ -149,6 +149,7 @@ const HISTORY_PREVIEW_CONCURRENCY = 2
 const HISTORY_THUMB_SCALE = 0.25
 const HISTORY_PREVIEW_MAX_BYTES = 8 * 1024 * 1024
 const HISTORY_SCHEMA_VERSION = 1
+const DIAGRAM_REVISION_SCHEMA_VERSION = 1
 const HISTORY_SNAPSHOT_ID_RE = /^h_[A-Za-z0-9_-]+_[A-Fa-f0-9]{8,}$/
 const SAFE_ID = /^[A-Za-z0-9_.:-]+$/
 const DRAWIO_ENVIRONMENT_KEYS = [
@@ -3182,10 +3183,12 @@ function safeScriptJson(value: unknown): string {
 }
 
 
+type DiagramUpdateSource = "editor" | "agent" | "external" | "initial" | "restore"
+
 type IntegratedSessionHistory = {
   revision: number
   xml: string
-  updatedBy: "editor" | "agent" | "external" | "initial" | "restore"
+  updatedBy: DiagramUpdateSource
   updatedAt: string
 }
 
@@ -3198,7 +3201,7 @@ type IntegratedSession = {
   revision: number
   xml: string
   fileHash: string
-  updatedBy: "editor" | "agent" | "external" | "initial" | "restore"
+  updatedBy: DiagramUpdateSource
   updatedAt: string
   history: IntegratedSessionHistory[]
   backupFile: string | null
@@ -3206,6 +3209,7 @@ type IntegratedSession = {
   activePreviewId: string | null
   annotationAuthorizations: Map<string, AnnotationAuthorization>
   historyWarning: string | null
+  revisionWarning: string | null
 }
 
 type HistorySource = "initial" | "editor" | "agent" | "external" | "restore"
@@ -3287,6 +3291,24 @@ type AnnotationAuthorization = {
   approvedAt: string
   consumedAt: string | null
   previewId: string | null
+}
+
+type DiagramRevisionTransition = {
+  fromRevision: number
+  revision: number
+  contentHash: string
+  updatedBy: DiagramUpdateSource
+  updatedAt: string
+}
+
+type DiagramRevisionLedger = {
+  schemaVersion: 1
+  file: { relativePath: string; pathKey: string }
+  revision: number
+  contentHash: string
+  updatedBy: DiagramUpdateSource
+  updatedAt: string
+  pendingTransition: DiagramRevisionTransition | null
 }
 
 type PatchPreviewStatus = "pending" | "authorized" | "cancelled" | "applied" | "stale"
@@ -3543,23 +3565,31 @@ function integratedManualChanges(session: IntegratedSession, baseRevision: numbe
 async function refreshIntegratedSession(session: IntegratedSession) {
   const diskXml = await readDiagramFile(session.file)
   const diskHash = integratedHash(diskXml)
-  if (diskHash === session.fileHash) return session
-
-  const pages = parseDrawio(diskXml)
-  const report = validationReport(pages)
-  if (!report.valid) {
-    throw new Error(`workspace file changed to invalid Draw.io XML: ${JSON.stringify(report.errors)}`)
+  if (diskHash !== session.fileHash) {
+    const pages = parseDrawio(diskXml)
+    const report = validationReport(pages)
+    if (!report.valid) {
+      throw new Error(`workspace file changed to invalid Draw.io XML: ${JSON.stringify(report.errors)}`)
+    }
   }
 
-  integratedHistoryPush(session)
-  session.revision += 1
+  const previousHash = session.fileHash
+  const previousRevision = session.revision
+  const reconciled = await reconcileDiagramRevisionLedger(session, diskHash)
+  if (diskHash === previousHash && reconciled.ledger.revision === previousRevision) return session
+
+  if (diskHash !== previousHash) integratedHistoryPush(session)
+  session.revision = reconciled.ledger.revision
   session.xml = diskXml
   session.fileHash = diskHash
-  session.updatedBy = "external"
-  session.updatedAt = new Date().toISOString()
+  session.updatedBy = reconciled.ledger.updatedBy
+  session.updatedAt = reconciled.ledger.updatedAt
+  session.revisionWarning = null
   finishPatchPreviewsForCommit(session.file, null)
   broadcastIntegratedRevision(session)
-  await createHistorySnapshot(session, { source: "external", xml: diskXml, sessionRevision: session.revision })
+  if (reconciled.advancedExternally) {
+    await createHistorySnapshot(session, { source: "external", xml: diskXml, sessionRevision: session.revision })
+  }
   return session
 }
 
@@ -3658,19 +3688,42 @@ async function integratedCommit(
       return { invalid: true as const, report }
     }
 
+    const candidateHash = integratedHash(candidateXml)
+    const transition = await prepareDiagramRevisionTransition(session, candidateHash, source)
     integratedHistoryPush(session)
-    if (!session.backupFile) {
-      const write = await atomicWrite(session.file, candidateXml, true)
-      session.backupFile = write.backup
-    } else {
-      await replaceDiagramWithoutBackup(session.file, candidateXml)
+    try {
+      if (!session.backupFile) {
+        const write = await atomicWrite(session.file, candidateXml, true)
+        session.backupFile = write.backup
+      } else {
+        await replaceDiagramWithoutBackup(session.file, candidateXml)
+      }
+    } catch (error) {
+      // A failed file replacement leaves the prepared transition recoverable.
+      // Reconcile immediately when possible so the next caller is not blocked.
+      try {
+        const currentXml = await readDiagramFile(session.file)
+        await reconcileDiagramRevisionLedger(session, integratedHash(currentXml))
+      } catch (recoveryError) {
+        console.warn(`diagram revision recovery failed for ${session.file}: ${(recoveryError as Error).message}`)
+      }
+      throw error
     }
 
-    session.revision += 1
+    session.revision = transition.revision
     session.xml = candidateXml
-    session.fileHash = integratedHash(candidateXml)
+    session.fileHash = candidateHash
     session.updatedBy = source
-    session.updatedAt = new Date().toISOString()
+    session.updatedAt = transition.updatedAt
+    session.revisionWarning = null
+    try {
+      await finalizeDiagramRevisionTransition(session, transition)
+    } catch (error) {
+      // The pending transition was durably written before the diagram file.
+      // A later bind/read can therefore finalize the same revision safely.
+      session.revisionWarning = `diagram revision finalization pending: ${(error as Error).message}`
+      console.warn(`${session.revisionWarning} for ${session.file}`)
+    }
     finishPatchPreviewsForCommit(session.file, options.appliedPreviewId || null)
     broadcastIntegratedRevision(session, clientId)
     if (source === "agent") {
@@ -3744,6 +3797,8 @@ function integratedDocumentPayload(session: IntegratedSession) {
     xml: session.xml,
     updatedBy: session.updatedBy,
     updatedAt: session.updatedAt,
+    revisionScope: "diagram",
+    revisionWarning: session.revisionWarning,
     backup: session.backupFile
       ? path.relative(session.workspace, session.backupFile).split(path.sep).join("/")
       : null,
@@ -3758,8 +3813,12 @@ function broadcastIntegratedRevision(session: IntegratedSession, clientId: strin
     clientId,
   })}\n\n`
   const diagramKey = integratedDiagramKey(session.file)
-  for (const client of getIntegratedBridgeState().eventClients.get(session.sessionId) || []) {
-    if (client.diagramKey === diagramKey) client.response.write(payload)
+  const state = getIntegratedBridgeState()
+  for (const candidate of state.sessions.values()) {
+    if (integratedDiagramKey(candidate.file) !== diagramKey) continue
+    for (const client of state.eventClients.get(candidate.sessionId) || []) {
+      if (client.diagramKey === diagramKey) client.response.write(payload)
+    }
   }
 }
 
@@ -3802,6 +3861,205 @@ function historyPathHash(relativePath: string): string {
 function historyFileKey(session: IntegratedSession): string {
   const relative = path.relative(session.workspace, session.file).split(path.sep).join("/")
   return `${path.basename(session.file)}--${historyPathHash(relative)}`
+}
+
+function diagramRevisionRoot(workspace: string): string {
+  return path.join(workspace, ".mobilework", "drawio-state", "v1")
+}
+
+function diagramRevisionStatePath(session: IntegratedSession): string {
+  return assertHistoryContained(
+    diagramRevisionRoot(session.workspace),
+    path.join(diagramRevisionRoot(session.workspace), historyFileKey(session), "state.json"),
+  )
+}
+
+function isDiagramUpdateSource(value: unknown): value is DiagramUpdateSource {
+  return ["editor", "agent", "external", "initial", "restore"].includes(String(value))
+}
+
+function isDiagramRevisionTransition(value: unknown): value is DiagramRevisionTransition {
+  return integratedRecord(value)
+    && Number.isInteger(value.fromRevision) && (value.fromRevision as number) >= 0
+    && Number.isInteger(value.revision) && (value.revision as number) > (value.fromRevision as number)
+    && typeof value.contentHash === "string" && /^[a-f0-9]{64}$/.test(value.contentHash)
+    && isDiagramUpdateSource(value.updatedBy)
+    && typeof value.updatedAt === "string"
+}
+
+function isDiagramRevisionLedger(value: unknown): value is DiagramRevisionLedger {
+  if (!integratedRecord(value) || value.schemaVersion !== DIAGRAM_REVISION_SCHEMA_VERSION) return false
+  if (!integratedRecord(value.file)) return false
+  if (typeof value.file.relativePath !== "string" || typeof value.file.pathKey !== "string") return false
+  if (!Number.isInteger(value.revision) || (value.revision as number) < 0) return false
+  if (typeof value.contentHash !== "string" || !/^[a-f0-9]{64}$/.test(value.contentHash)) return false
+  if (!isDiagramUpdateSource(value.updatedBy) || typeof value.updatedAt !== "string") return false
+  return value.pendingTransition === null || isDiagramRevisionTransition(value.pendingTransition)
+}
+
+async function readDiagramRevisionLedger(session: IntegratedSession): Promise<DiagramRevisionLedger | null> {
+  const target = diagramRevisionStatePath(session)
+  let raw: string
+  try {
+    raw = await fs.readFile(target, "utf8")
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null
+    throw error
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    throw new Error(`diagram revision state for ${historyFileKey(session)} is corrupted: ${(error as Error).message}`)
+  }
+  if (!isDiagramRevisionLedger(parsed)) {
+    throw new Error(`diagram revision state for ${historyFileKey(session)} failed schema validation`)
+  }
+  const relativePath = path.relative(session.workspace, session.file).split(path.sep).join("/")
+  if (parsed.file.relativePath !== relativePath || parsed.file.pathKey !== historyFileKey(session)) {
+    throw new Error(`diagram revision state for ${historyFileKey(session)} is bound to another diagram`)
+  }
+  return parsed
+}
+
+async function writeDiagramRevisionLedger(
+  session: IntegratedSession,
+  ledger: DiagramRevisionLedger,
+): Promise<void> {
+  const target = diagramRevisionStatePath(session)
+  await fs.mkdir(path.dirname(target), { recursive: true })
+  const temporary = `${target}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`
+  await fs.writeFile(temporary, JSON.stringify(ledger, null, 2), "utf8")
+  await fs.rename(temporary, target)
+}
+
+async function legacyDiagramRevisionBase(session: IntegratedSession): Promise<number> {
+  try {
+    const manifest = await readHistoryManifest(session)
+    if (!manifest) return 0
+    return manifest.entries.reduce(
+      (maximum, entry) => Math.max(maximum, entry.sequence, entry.sessionRevision),
+      0,
+    )
+  } catch {
+    // Persistent history is auxiliary and may be unavailable. A new dedicated
+    // revision ledger is still safe to establish from the current file.
+    return 0
+  }
+}
+
+async function reconcileDiagramRevisionLedger(
+  session: IntegratedSession,
+  diskHash: string,
+): Promise<{ ledger: DiagramRevisionLedger; advancedExternally: boolean }> {
+  let ledger = await readDiagramRevisionLedger(session)
+  if (!ledger) {
+    const now = new Date().toISOString()
+    ledger = {
+      schemaVersion: DIAGRAM_REVISION_SCHEMA_VERSION,
+      file: {
+        relativePath: path.relative(session.workspace, session.file).split(path.sep).join("/"),
+        pathKey: historyFileKey(session),
+      },
+      revision: await legacyDiagramRevisionBase(session),
+      contentHash: diskHash,
+      updatedBy: "initial",
+      updatedAt: now,
+      pendingTransition: null,
+    }
+    await writeDiagramRevisionLedger(session, ledger)
+    return { ledger, advancedExternally: false }
+  }
+
+  if (ledger.pendingTransition) {
+    const pending = ledger.pendingTransition
+    if (diskHash === pending.contentHash) {
+      ledger = {
+        ...ledger,
+        revision: pending.revision,
+        contentHash: pending.contentHash,
+        updatedBy: pending.updatedBy,
+        updatedAt: pending.updatedAt,
+        pendingTransition: null,
+      }
+      await writeDiagramRevisionLedger(session, ledger)
+      return { ledger, advancedExternally: false }
+    }
+    if (diskHash === ledger.contentHash) {
+      ledger = { ...ledger, pendingTransition: null }
+      await writeDiagramRevisionLedger(session, ledger)
+      return { ledger, advancedExternally: false }
+    }
+    const now = new Date().toISOString()
+    ledger = {
+      ...ledger,
+      revision: Math.max(ledger.revision, pending.revision) + 1,
+      contentHash: diskHash,
+      updatedBy: "external",
+      updatedAt: now,
+      pendingTransition: null,
+    }
+    await writeDiagramRevisionLedger(session, ledger)
+    return { ledger, advancedExternally: true }
+  }
+
+  if (ledger.contentHash !== diskHash) {
+    ledger = {
+      ...ledger,
+      revision: ledger.revision + 1,
+      contentHash: diskHash,
+      updatedBy: "external",
+      updatedAt: new Date().toISOString(),
+    }
+    await writeDiagramRevisionLedger(session, ledger)
+    return { ledger, advancedExternally: true }
+  }
+  return { ledger, advancedExternally: false }
+}
+
+async function prepareDiagramRevisionTransition(
+  session: IntegratedSession,
+  contentHash: string,
+  updatedBy: DiagramUpdateSource,
+): Promise<DiagramRevisionTransition> {
+  const current = await readDiagramRevisionLedger(session)
+  if (!current) throw new Error("diagram revision state is missing; re-open the diagram")
+  if (current.pendingTransition) {
+    throw new Error("diagram revision state has an unfinished transition; re-read the diagram state")
+  }
+  if (current.revision !== session.revision || current.contentHash !== session.fileHash) {
+    throw new Error("diagram revision state changed; re-read the diagram state")
+  }
+  const transition: DiagramRevisionTransition = {
+    fromRevision: current.revision,
+    revision: current.revision + 1,
+    contentHash,
+    updatedBy,
+    updatedAt: new Date().toISOString(),
+  }
+  await writeDiagramRevisionLedger(session, { ...current, pendingTransition: transition })
+  return transition
+}
+
+async function finalizeDiagramRevisionTransition(
+  session: IntegratedSession,
+  transition: DiagramRevisionTransition,
+): Promise<void> {
+  const current = await readDiagramRevisionLedger(session)
+  if (!current?.pendingTransition
+    || current.pendingTransition.fromRevision !== transition.fromRevision
+    || current.pendingTransition.revision !== transition.revision
+    || current.pendingTransition.contentHash !== transition.contentHash) {
+    throw new Error("diagram revision transition no longer matches the prepared write")
+  }
+  await writeDiagramRevisionLedger(session, {
+    ...current,
+    revision: transition.revision,
+    contentHash: transition.contentHash,
+    updatedBy: transition.updatedBy,
+    updatedAt: transition.updatedAt,
+    pendingTransition: null,
+  })
 }
 
 function assertHistoryContained(root: string, target: string): string {
@@ -4391,14 +4649,35 @@ async function restoreHistorySnapshot(
       return { invalid: true as const, error: "current_snapshot" }
     }
 
-    // 3. Write the restored XML as a new current revision.
-    await replaceDiagramWithoutBackup(session.file, snapshotXml)
+    // 3. Write the restored XML as a new current diagram revision. The
+    // transition is persisted before the file replacement so a runtime restart
+    // can recover the exact revision instead of resetting or double-incrementing.
+    const snapshotHash = integratedHash(snapshotXml)
+    const transition = await prepareDiagramRevisionTransition(session, snapshotHash, "restore")
+    try {
+      await replaceDiagramWithoutBackup(session.file, snapshotXml)
+    } catch (error) {
+      try {
+        const currentXml = await readDiagramFile(session.file)
+        await reconcileDiagramRevisionLedger(session, integratedHash(currentXml))
+      } catch (recoveryError) {
+        console.warn(`diagram revision recovery failed for ${session.file}: ${(recoveryError as Error).message}`)
+      }
+      throw error
+    }
     integratedHistoryPush(session)
-    session.revision += 1
+    session.revision = transition.revision
     session.xml = snapshotXml
-    session.fileHash = integratedHash(snapshotXml)
+    session.fileHash = snapshotHash
     session.updatedBy = "restore"
-    session.updatedAt = new Date().toISOString()
+    session.updatedAt = transition.updatedAt
+    session.revisionWarning = null
+    try {
+      await finalizeDiagramRevisionTransition(session, transition)
+    } catch (error) {
+      session.revisionWarning = `diagram revision finalization pending: ${(error as Error).message}`
+      console.warn(`${session.revisionWarning} for ${session.file}`)
+    }
     finishPatchPreviewsForCommit(session.file, null)
 
     // 4. Invalidate unconsumed annotation authorizations and the active task.
@@ -8733,9 +9012,11 @@ async function bindIntegratedSession(
 
   const state = getIntegratedBridgeState()
   const existing = state.sessions.get(context.sessionID)
-  const session = existing && path.resolve(existing.file) === path.resolve(target)
-    ? await refreshIntegratedSession(existing)
-    : {
+  let session: IntegratedSession
+  if (existing && path.resolve(existing.file) === path.resolve(target)) {
+    session = await refreshIntegratedSession(existing)
+  } else {
+    session = {
       sessionId: context.sessionID,
       bindingId: randomBytes(16).toString("base64url"),
       workspace,
@@ -8756,12 +9037,25 @@ async function bindIntegratedSession(
       activePreviewId: null,
       annotationAuthorizations: new Map(),
       historyWarning: null,
+      revisionWarning: null,
     }
+    const reconciled = await reconcileDiagramRevisionLedger(session, session.fileHash)
+    session.revision = reconciled.ledger.revision
+    session.updatedBy = reconciled.ledger.updatedBy
+    session.updatedAt = reconciled.ledger.updatedAt
+    session.history = [{
+      revision: session.revision,
+      xml: session.xml,
+      updatedBy: session.updatedBy,
+      updatedAt: session.updatedAt,
+    }]
+  }
   state.sessions.set(context.sessionID, session)
   session.bindingId ??= randomBytes(16).toString("base64url")
   session.activeAnnotationId ??= null
   session.activePreviewId ??= null
   session.annotationAuthorizations ??= new Map()
+  session.revisionWarning ??= null
   await loadStoredAnnotations(session)
   await bindHistoryCheckpoint(session)
   const bridge = await ensureIntegratedBridgeStarted()
@@ -9804,7 +10098,7 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
 
     drawio_get_state: defineTool({
       description:
-        "Read the latest XML and revision for the current session's active Draw.io file. Use this before changing a user-edited diagram.",
+        "Read the latest XML and diagram-scoped persistent revision for the current session's active Draw.io file. Use this before changing a user-edited diagram.",
       args: {
         since_revision: tool.schema
           .number()
@@ -10078,6 +10372,8 @@ export function createDrawioToolset(toolApi: DrawioToolFactory): DrawioToolset {
           file: workspaceRelative(context, source).split(path.sep).join("/"),
           sessionId: context.sessionID,
           revision: bound.session.revision,
+          revisionScope: "diagram",
+          revisionWarning: bound.session.revisionWarning,
           openUrl: openUrl.toString(),
           editorUrl: editorUrl.toString(),
           editorConnected,

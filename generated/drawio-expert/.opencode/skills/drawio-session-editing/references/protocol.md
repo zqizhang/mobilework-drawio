@@ -154,9 +154,10 @@ UI can resolve, ignore and reopen; the Agent resolves through
 
 ## Version history
 
-User-visible history is separate from the per-revision session window. A
+User-visible history is separate from the short in-memory revision window. A
 `snapshot sequence` only advances when a meaningful checkpoint is formed; a
-`session revision` advances on every successful write. Every snapshot gets a
+diagram-scoped persistent `revision` advances on every successful write and is
+stored independently under `<workspace>/.mobilework/drawio-state/v1/`. Every snapshot gets a
 stable `snapshot id` and restore must use that id (never an array index).
 
 Checkpoints are stored under `<workspace>/.mobilework/drawio-history/v1/`

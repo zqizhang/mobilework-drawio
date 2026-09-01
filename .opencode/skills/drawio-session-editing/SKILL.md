@@ -1,11 +1,13 @@
 ---
 name: drawio-session-editing
-description: 当用户需要在MobileWork内置浏览器中手动编辑Draw.io工作区文件，或Agent需要在人工编辑后继续修改时使用。负责读取最新会话revision、把用户保存版本作为新的修改基线、以乐观并发方式提交XML，并在revision_conflict时重新读取和重试，避免旧快照造成内容丢失。已绑定图表的patch和polish先在同一画布展示临时只读差异预览，再通过OpenCode审批绑定候选哈希后写入。同时覆盖按图表文件持久化的框选注释任务流程和稳定ID范围守卫；仅stale注释需先确认，所有正式写入都禁止先修改后确认。
+description: 当用户需要在MobileWork内置浏览器中手动编辑Draw.io工作区文件，或Agent需要在人工编辑后继续修改时使用。负责读取图表级持久化revision、把用户保存版本作为新的修改基线、以乐观并发方式提交XML，并在revision_conflict时重新读取和重试，避免旧快照造成内容丢失。已绑定图表的patch和polish先在同一画布展示临时只读差异预览，再通过OpenCode审批绑定候选哈希后写入。同时覆盖按图表文件持久化的框选注释任务流程和稳定ID范围守卫；仅stale注释需先确认，所有正式写入都禁止先修改后确认。
 ---
 
 # Draw.io 会话同步与并发控制
 
 Draw.io会话中的最新XML是后续修改的基线。用户人工编辑的图元不是只读内容；Agent可以按当前任务要求继续移动、改名、删除或重构它们，但必须先读取用户最新保存的版本，不能用旧快照覆盖整个文件。
+
+revision属于图表文件而不是对话会话：同一工作区相对路径绑定同一套单调递增revision，并持久化在`.mobilework/drawio-state/v1/`。新会话或运行时重启后继续使用该revision；preview、审批和一次性token仍绑定当前session与bindingId，不能跨会话复用。
 
 ## 标准流程
 

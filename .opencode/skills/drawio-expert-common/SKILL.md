@@ -49,6 +49,6 @@ description: Draw.io 绘图专家 的通用工作指引。
 本技能目录同时承载全部 `drawio_*` 自定义工具共享的运行时核心：
 
 - `scripts/drawio-runtime-core.mjs`：单文件 ESM 运行时，内置 XML 解析、质量评分、revision Bridge、注释持久化、历史快照和 Docker/浏览器导出客户端。
-- 所有 `.opencode/tools/drawio_*.js` 适配器都通过同一份核心加载工具定义；session、revision、注释审批 token 和历史状态都保存在该核心的共享全局状态中，跨工具有效。
+- 所有 `.opencode/tools/drawio_*.js` 适配器都通过同一份核心加载工具定义；session、注释审批 token 和预览状态保存在共享全局状态中，跨工具有效；revision 按图表文件持久化到工作区 `.mobilework/drawio-state/v1/`，切换会话或重启运行时后仍延续。
 - 适配器优先从 `MOBILEWORK_SKILLS_DIR/drawio-expert-common/scripts/drawio-runtime-core.mjs` 解析核心；直接把专家包作为普通 OpenCode 项目运行时，回退到包内 `.opencode/skills/` 路径。
 - 不要移动、重命名或复制该文件；也不要在其它技能中打包第二份运行时。

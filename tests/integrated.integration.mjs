@@ -538,7 +538,20 @@ try {
 
   const state = JSON.parse(await plugin.tool.drawio_get_state.execute({}, context))
   assert.equal(state.revision, 1)
+  assert.equal(state.revisionScope, "diagram")
   assert.match(state.xml, /MobileWork Manual/)
+
+  // A new conversation binding to the same diagram must observe the diagram's
+  // durable revision instead of starting its own revision counter at zero.
+  const peerContext = { ...context, sessionID: "integrated-session-peer" }
+  const peerOpen = JSON.parse(await plugin.tool.drawio_open.execute({
+    file: "architecture.drawio",
+  }, peerContext))
+  assert.equal(peerOpen.revision, state.revision)
+  assert.equal(peerOpen.revisionScope, "diagram")
+  const peerState = JSON.parse(await plugin.tool.drawio_get_state.execute({}, peerContext))
+  assert.equal(peerState.revision, state.revision)
+  assert.match(peerState.xml, /MobileWork Manual/)
 
   const stale = JSON.parse(await plugin.tool.drawio_update_state.execute({
     base_revision: 0,
